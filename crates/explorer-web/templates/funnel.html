@@ -2,9 +2,8 @@
    narrow, and the stylesheet shows one. #}
     <svg class="funnel {{ t.class }}" viewBox="0 0 {{ t.width }} {{ t.height }}"
          role="img" aria-label="Curve tree of {{ t.leaves }} outputs in {{ t.layers }} layer{% if t.layers != 1 %}s{% endif %}, the root at the top">
-      <defs><pattern id="grain-{{ t.class }}" width="{{ crate::html::FUNNEL_CUT_GAP }}" height="{{ crate::html::FUNNEL_BAR }}" patternUnits="userSpaceOnUse"><line class="grain" x1="1" y1="0" x2="1" y2="{{ crate::html::FUNNEL_BAR }}"/></pattern></defs>
       {% for w in t.webs %}<polygon class="web" points="{{ w }}"/>{% endfor %}
-      {% for r in t.rows %}<rect class="bar {{ r.class }}" x="{{ r.x }}" y="{{ r.y }}" rx="3" width="{{ r.width }}" height="{{ crate::html::FUNNEL_BAR }}"/>{% if r.grain %}<rect x="{{ r.x }}" y="{{ r.y }}" rx="3" width="{{ r.width }}" height="{{ crate::html::FUNNEL_BAR }}" fill="url(#grain-{{ t.class }})"/>{% endif %}{% for c in r.cuts %}<line class="cut" x1="{{ c }}" y1="{{ r.y }}" x2="{{ c }}" y2="{{ r.y + crate::html::FUNNEL_BAR }}"/>{% endfor %}
+      {% for r in t.rows %}{% for b in r.blocks %}<rect class="bar {{ r.class }}" x="{{ b.x }}" y="{{ r.y }}" rx="3" width="{{ b.width }}" height="{{ crate::html::FUNNEL_BAR }}"><title>{{ r.holds(b) }}</title></rect>{% endfor %}
       <text class="label" x="0" y="{{ r.label_y }}">{{ r.name }}{% if let Some(curve) = r.curve %}<tspan class="curve"> · {{ curve }}</tspan>{% endif %}</text>
       {% if let Some(count) = r.count %}<text class="count" x="{{ t.count_x }}" y="{{ r.label_y }}" text-anchor="{{ t.count_anchor }}">{{ count }}</text>{% endif %}
       {% endfor %}

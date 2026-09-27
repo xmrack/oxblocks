@@ -353,13 +353,16 @@ fn age_label(blocks: u64) -> String {
 }
 
 /// The curve tree an FCMP++ spend proved against, drawn as a funnel: one bar
-/// per layer, the root at the top and the outputs at the bottom.
+/// per layer, the root at the top and the outputs at the bottom. Below the
+/// root, every bar is split into the root's children's subtrees, one column
+/// for each, joined by its own band to the column above.
 struct TreeFunnel {
     class: &'static str,
     width: u32,
     height: u32,
     rows: Vec<FunnelRow>,
-    /// The band joining each bar to the one below it, as polygon points.
+    /// The bands joining each bar's blocks to the ones below them, as
+    /// polygon points.
     webs: Vec<String>,
     /// The root the proof was checked against, abbreviated.
     root: Option<String>,
@@ -383,11 +386,31 @@ struct FunnelRow {
     y: u32,
     label_y: u32,
     width: u32,
-    /// Boundaries between nodes, drawn where a layer is narrow enough to count.
-    cuts: Vec<u32>,
-    /// Too many nodes to draw their boundaries: the bar is textured at the
-    /// closest spacing a boundary would have instead.
-    grain: bool,
+    /// The bar's part of each of the root's children's subtrees, left to
+    /// right; the root's bar is one block.
+    blocks: Vec<FunnelBlock>,
+}
+
+struct FunnelBlock {
+    x: String,
+    width: String,
+    /// How many of the layer's nodes the block holds.
+    nodes: u64,
+}
+
+impl FunnelRow {
+    /// A block's tooltip: what it holds.
+    fn holds(&self, b: &FunnelBlock) -> String {
+        let (one, many) = match self.class {
+            "leaf" => ("output", "outputs"),
+            _ => ("node", "nodes"),
+        };
+        format!(
+            "{} {}",
+            grouped(b.nodes),
+            if b.nodes == 1 { one } else { many }
+        )
+    }
 }
 
 /// Labels take the left of the strip's width and counts the right.
@@ -397,9 +420,10 @@ const FUNNEL_TOP: u32 = 14;
 const FUNNEL_ROW: u32 = 30;
 const FUNNEL_BAR: u32 = 14;
 const FUNNEL_MIN_BAR: u32 = 10;
-/// The closest two node boundaries are drawn, and the spacing of the texture
-/// on a layer with more nodes than that allows.
-const FUNNEL_CUT_GAP: u32 = 4;
+/// The space between two blocks of a bar, at most, and at most this share of
+/// the bar in all.
+const FUNNEL_GAP: f64 = 3.0;
+const FUNNEL_GAP_SHARE: f64 = 0.25;
 
 /// Where a funnel's labels, counts and bars go.
 struct FunnelLayout {
@@ -459,6 +483,12 @@ fn tree_funnel(leaves: u64, root: Option<&str>, layout: &FunnelLayout) -> Option
     let span = layout.width - layout.left - layout.right;
     let centre = layout.left + span / 2;
 
+    // Nodes of each row under one child of the root: 1 in the root's
+    // children's own row, and each row below holds its group width times the
+    // row above.
+    let branches = layers.iter().rev().nth(1).copied().unwrap_or(leaves);
+    let mut per_branch = 0u64;
+
     let rows: Vec<FunnelRow> = counts
         .zip(0u32..)
         .map(|(count, i)| {
@@ -473,12 +503,19 @@ fn tree_funnel(leaves: u64, root: Option<&str>, layout: &FunnelLayout) -> Option
                 _ if layer == 0 => ("Outputs".to_owned(), "leaf"),
                 _ => (format!("Layer {layer}"), "node"),
             };
-            let countable = u32::try_from(count)
-                .ok()
-                .filter(|&n| n <= width / FUNNEL_CUT_GAP);
-            let cuts = match countable {
-                Some(n) => (1..n).map(|k| x + width * k / n).collect(),
-                None => Vec::new(),
+            per_branch = match i {
+                0 => 0,
+                1 => 1,
+                _ => per_branch.saturating_mul(explorer_core::curve_tree::group_width(layer)),
+            };
+            let blocks = if i == 0 {
+                vec![FunnelBlock {
+                    x: x.to_string(),
+                    width: width.to_string(),
+                    nodes: count,
+                }]
+            } else {
+                funnel_blocks(count, branches, per_branch, x, width)
             };
             FunnelRow {
                 name,
@@ -489,16 +526,17 @@ fn tree_funnel(leaves: u64, root: Option<&str>, layout: &FunnelLayout) -> Option
                 y,
                 label_y: if layout.above { y - 8 } else { y + 12 },
                 width,
-                cuts,
-                grain: countable.is_none(),
+                blocks,
             }
         })
         .collect();
 
+    // The root's band fans out to the whole bar below it; each band below
+    // that joins a branch's block to the same branch's block beneath.
     let webs = rows
         .windows(2)
-        .filter_map(|w| match w {
-            [a, b] => Some(format!(
+        .flat_map(|w| match w {
+            [a, b] if a.blocks.len() == 1 => vec![format!(
                 "{},{top} {},{top} {},{} {},{}",
                 a.x,
                 a.x + a.width,
@@ -507,8 +545,25 @@ fn tree_funnel(leaves: u64, root: Option<&str>, layout: &FunnelLayout) -> Option
                 b.x,
                 b.y,
                 top = a.y + FUNNEL_BAR,
-            )),
-            _ => None,
+            )],
+            [a, b] => a
+                .blocks
+                .iter()
+                .zip(&b.blocks)
+                .map(|(p, q)| {
+                    format!(
+                        "{},{top} {},{top} {},{} {},{}",
+                        p.x,
+                        block_end(p),
+                        block_end(q),
+                        b.y,
+                        q.x,
+                        b.y,
+                        top = a.y + FUNNEL_BAR,
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
         })
         .collect();
 
@@ -526,6 +581,55 @@ fn tree_funnel(leaves: u64, root: Option<&str>, layout: &FunnelLayout) -> Option
         leaves: grouped(leaves),
         layers: depth,
     })
+}
+
+/// A bar of `count` nodes, `width` wide from `x`, split into `branches`
+/// blocks of `per_branch` nodes each but the last, which holds the rest.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a chart coordinate, not chain arithmetic"
+)]
+fn funnel_blocks(
+    count: u64,
+    branches: u64,
+    per_branch: u64,
+    x: u32,
+    width: u32,
+) -> Vec<FunnelBlock> {
+    let w = f64::from(width);
+    let gap = if branches > 1 {
+        FUNNEL_GAP.min(FUNNEL_GAP_SHARE * w / (branches - 1) as f64)
+    } else {
+        0.0
+    };
+    let room = w - gap * branches.saturating_sub(1) as f64;
+    let mut at = f64::from(x);
+    (0..branches)
+        .map(|j| {
+            let nodes = count
+                .saturating_sub(j.saturating_mul(per_branch))
+                .min(per_branch);
+            let bw = room * nodes as f64 / count.max(1) as f64;
+            let block = FunnelBlock {
+                x: coord(at),
+                width: coord(bw.max(1.0)),
+                nodes,
+            };
+            at += bw + gap;
+            block
+        })
+        .collect()
+}
+
+fn block_end(b: &FunnelBlock) -> String {
+    let (x, w) = (b.x.parse().unwrap_or(0.0), b.width.parse().unwrap_or(0.0));
+    coord(x + w)
+}
+
+/// A drawing coordinate to a tenth of a pixel, written short.
+fn coord(v: f64) -> String {
+    let s = format!("{v:.1}");
+    s.strip_suffix(".0").map_or(s.clone(), str::to_owned)
 }
 
 /// A bar's width: the log of its node count against the log of the outputs',
@@ -3766,10 +3870,33 @@ mod tests {
             assert_eq!(r.x + r.width / 2, FUNNEL_CENTRE, "row {i} is centred");
             assert_eq!(r.y, FUNNEL_TOP + FUNNEL_ROW * i as u32);
         }
-        // Only the nine-node layer is narrow enough to show its nodes.
-        let cut: Vec<_> = t.rows.iter().map(|r| r.cuts.len()).collect();
-        assert_eq!(cut, [0, 8, 0, 0, 0, 0, 0]);
-        assert_eq!(t.rows[1].cuts.first(), Some(&(367 + 67 / 9)));
+        // Below the root, a column for each of its nine children: all but
+        // the last full, so 38 of layer 4's nodes each, 38 × 18 of layer
+        // 3's, and the rest in the last.
+        let nodes = |i: usize| -> Vec<u64> { t.rows[i].blocks.iter().map(|b| b.nodes).collect() };
+        assert_eq!(nodes(0), [1]);
+        assert_eq!(nodes(1), [1; 9]);
+        assert_eq!(nodes(2), [38, 38, 38, 38, 38, 38, 38, 38, 21]);
+        assert_eq!(&nodes(3)[..2], [684, 684]);
+        assert_eq!(nodes(3)[8], 5_848 - 8 * 684);
+        for (i, r) in t.rows.iter().enumerate().skip(1) {
+            assert_eq!(
+                nodes(i).iter().sum::<u64>(),
+                r.count
+                    .as_deref()
+                    .map_or(0, |c| c.replace(',', "").parse().unwrap())
+            );
+            let first = r.blocks.first().expect("a block");
+            let last = r.blocks.last().expect("a block");
+            assert_eq!(first.x, r.x.to_string(), "row {i} starts at its bar");
+            assert_eq!(
+                block_end(last),
+                (r.x + r.width).to_string(),
+                "and ends there"
+            );
+        }
+        // One band from the root to layer 5, then one for each column.
+        assert_eq!(t.webs.len(), 1 + 5 * 9);
     }
 
     /// A tree small enough for one Selene root, as on a young chain.
@@ -3781,16 +3908,24 @@ mod tests {
         assert_eq!(t.rows[0].curve, Some("Selene"));
         let leaves = &t.rows[1];
         assert_eq!((leaves.x, leaves.width), (150, 500));
-        assert_eq!(leaves.cuts.len(), 21);
-        assert_eq!(leaves.cuts.first(), Some(&(150 + 500 / 22)));
-        assert_eq!(leaves.cuts.last(), Some(&(150 + 500 * 21 / 22)));
+        // The outputs are the root's children: a block each, 3 apart.
+        assert_eq!(leaves.blocks.len(), 22);
+        assert!(
+            leaves
+                .blocks
+                .iter()
+                .all(|b| b.nodes == 1 && b.width == "19.9")
+        );
+        assert_eq!(leaves.blocks[1].x, "172.9");
         assert_eq!(t.webs, ["395,28 405,28 650,44 150,44"]);
         assert_eq!(t.height, 64);
         assert_eq!(t.root.as_deref(), Some("2348cda97f56d374…"));
 
-        // 200 outputs on 500 pixels would be cut every 2.5: a solid bar.
-        let dense = tree_funnel(200, None, &WIDE_FUNNEL).expect("a tree");
-        assert!(dense.rows.last().expect("outputs").cuts.is_empty());
+        // 200 outputs: 6 Selene nodes under the root, 38 outputs each but
+        // the last 10.
+        let t = tree_funnel(200, None, &WIDE_FUNNEL).expect("a tree");
+        let outputs: Vec<u64> = t.rows[2].blocks.iter().map(|b| b.nodes).collect();
+        assert_eq!(outputs, [38, 38, 38, 38, 38, 10]);
         assert!(
             tree_funnel(22, None, &WIDE_FUNNEL)
                 .expect("a tree")
@@ -3825,7 +3960,7 @@ mod tests {
             "the counts go over the bars, and the root's hash takes the root's"
         );
         assert_eq!(t.rows[0].count, None, "the hash stands in for the root's 1");
-        assert_eq!(t.rows[1].cuts.first(), Some(&(320 / 22)));
+        assert_eq!(t.rows[1].blocks[0].x, "0");
 
         let wide = tree_funnel(22, None, &WIDE_FUNNEL).expect("a tree");
         assert_eq!(
@@ -3883,36 +4018,41 @@ mod tests {
         assert!(!tx_page().render().expect("renders").contains("curve-tree"));
     }
 
-    /// A mainnet-sized tree stays one bar per layer. A layer too dense to
-    /// divide into its nodes is striped instead, so no bar draws more than
-    /// its width allows however many outputs the tree holds.
+    /// However many outputs, a bar is split only into the root's children's
+    /// branches, so a mainnet-sized tree draws as few blocks as a small one
+    /// with as many branches, and every gap stays visible on a phone.
     #[test]
-    fn a_mainnet_sized_tree_stripes_the_layers_too_dense_to_divide() {
+    fn a_mainnet_sized_tree_draws_only_its_branches() {
         let [wide, narrow] = tree_picture(152_318_407, None).expect("a tree");
         for t in [&wide, &narrow] {
             assert_eq!(t.rows.len(), 7, "six layers and the outputs");
-            let root = t.rows.first().expect("a root");
-            assert!(root.cuts.is_empty() && !root.grain);
-            let layer5 = t.rows.get(1).expect("layer 5");
-            assert_eq!((layer5.cuts.len(), layer5.grain), (8, false), "9 nodes fit");
-            for r in t.rows.iter().skip(2) {
-                assert!(r.cuts.is_empty() && r.grain, "{} is striped", r.name);
+            let blocks: Vec<_> = t.rows.iter().map(|r| r.blocks.len()).collect();
+            assert_eq!(blocks, [1, 9, 9, 9, 9, 9, 9]);
+            for r in &t.rows[1..] {
+                let ends: Vec<f64> = r
+                    .blocks
+                    .iter()
+                    .flat_map(|b| [b.x.parse::<f64>().unwrap(), block_end(b).parse().unwrap()])
+                    .collect();
+                assert!(
+                    ends.windows(2)
+                        .skip(1)
+                        .step_by(2)
+                        .all(|w| w[1] - w[0] >= 0.9),
+                    "{} {}: blocks stay apart",
+                    t.class,
+                    r.name
+                );
             }
         }
 
         let mut page = fcmp_tx_page();
         page.tree = Some([wide, narrow]);
         let html = page.render().expect("renders");
-        assert!(html.contains(r#"<pattern id="grain-wide" width="4" height="14""#));
-        assert!(html.contains(r#"fill="url(#grain-narrow)"/>"#));
-        assert!(
-            html.matches(r#"<line class="cut""#).count() <= 2 * 8,
-            "only layer 5 is divided"
-        );
-
-        // A small tree is divided node by node, with no stripes.
-        let [small, _] = tree_picture(55, None).expect("a tree");
-        assert!(small.rows.iter().all(|r| !r.grain));
+        assert_eq!(html.matches(r#"<rect class="bar"#).count(), 2 * (1 + 6 * 9));
+        assert!(!html.contains("<pattern") && !html.contains(r#"class="cut""#));
+        assert!(html.contains("<title>38 nodes</title>"));
+        assert!(html.contains("<title>1 node</title>"));
     }
 
     /// The walkthrough is linked from the head of the tree it explains, or on
