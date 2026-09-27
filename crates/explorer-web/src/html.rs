@@ -102,6 +102,9 @@ struct BlockTxRow {
     hash: String,
     coinbase: bool,
     p2pool: bool,
+    /// Its spends: a coinbase's one input creates coins, and is shown as
+    /// none.
+    inputs: usize,
     outputs: usize,
     fee: String,
     fee_atomic: u64,
@@ -207,6 +210,12 @@ struct AgeMark {
 struct AgeTick {
     x: u32,
     label: String,
+}
+
+/// A transaction's inputs that spend an output: all of them but a coinbase's
+/// one, which creates coins instead.
+fn spends(tx: &TxJson) -> usize {
+    tx.vin.iter().filter(|v| v.as_key().is_some()).count()
 }
 
 /// Whether a coinbase was paid out by p2pool.
@@ -1272,6 +1281,7 @@ pub async fn block(
                     tx.vout.len(),
                     f.extra.merge_mining_tag().is_some(),
                 ),
+                inputs: spends(&tx),
                 outputs: tx.vout.len(),
                 fee: xmr_aligned(f.fee),
                 fee_atomic: f.fee,
@@ -3371,6 +3381,7 @@ mod tests {
             hash: if coinbase { "c" } else { "d" }.repeat(64),
             coinbase,
             p2pool: is_p2pool(coinbase, 2, coinbase),
+            inputs: if coinbase { 0 } else { 3 },
             outputs: 2,
             fee: if coinbase { "0.0" } else { "0.00071136" }.to_owned(),
             fee_atomic: if coinbase { 0 } else { 711_360_000 },
@@ -4445,6 +4456,34 @@ mod tests {
         assert!(after.contains("<dt>Curve tree</dt>"));
         assert!(after.contains(&"9".repeat(64)));
         assert!(after.contains("5 layers"));
+    }
+
+    /// Each row counts its inputs, and a coinbase, which spends nothing,
+    /// shows a dash as it does for its ring.
+    #[test]
+    fn the_block_table_counts_each_transactions_inputs() {
+        let html = block_page().render().expect("renders");
+        assert!(html.contains(
+            r#"<th class="num">Inputs</th>
+      <th class="num">Outputs</th>"#
+        ));
+        assert_eq!(html.matches(r#"<td class="num">3</td>"#).count(), 2);
+        let coinbase = &html[..html.find("d".repeat(64).as_str()).expect("a spend")];
+        assert!(
+            coinbase.contains(
+                r#"<td class="num">&mdash;</td>
+      <td class="num">2</td>"#
+            ),
+            "{html}"
+        );
+
+        let (_, tx) = fcmp_fixture("full").remove(0);
+        assert_eq!(spends(&tx), 2);
+        let coinbase: TxJson = serde_json::from_str(
+            r#"{"version":2,"unlock_time":60,"vin":[{"gen":{"height":5}}],"vout":[],"extra":[],"rct_signatures":{"type":0}}"#,
+        )
+        .expect("a coinbase");
+        assert_eq!(spends(&coinbase), 0);
     }
 
     /// An FCMP++ row's ring column reads "all", never the 0 its ring size is.

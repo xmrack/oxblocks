@@ -49,6 +49,7 @@
   <thead>
     <tr>
       <th>Hash</th>
+      <th class="num">Inputs</th>
       <th class="num">Outputs</th>
       <th class="num">{% call sort::header("Fee", fee_sort) %}{% endcall %}</th>
       <th class="num">Ring</th>
@@ -63,6 +64,7 @@
         {% if t.coinbase %}<span class="tag coinbase">coinbase</span>{% endif %}
         {% if t.p2pool %}<span class="tag coinbase">p2pool</span>{% endif %}
       </td>
+      <td class="num">{% if t.coinbase %}&mdash;{% else %}{{ t.inputs }}{% endif %}</td>
       <td class="num">{{ t.outputs }}</td>
       <td class="num">{{ t.fee }}</td>
       <td class="num">{% if t.coinbase %}&mdash;{% else if t.full_chain %}<span title="FCMP++: every output in the curve tree the proof names">all</span>{% else %}{{ t.ring }}{% endif %}</td>
