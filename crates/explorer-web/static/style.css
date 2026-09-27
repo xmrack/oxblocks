@@ -602,14 +602,8 @@ form.as-of button {
 .grid-legend i.other { background: var(--bg-raised); border: 1px solid var(--accent); }
 
 table.path-status { margin-bottom: 0.6rem; }
-.lede.wide { max-width: 86ch; }
-/* Two panels side by side where there is room, so their prose fills the
-   width rather than stopping two thirds of the way across. */
-.facts-pair { display: grid; gap: 0.7rem; margin-top: 0.9rem; }
-.facts-pair > .facts { margin: 0; }
-@media (min-width: 960px) {
-  .facts-pair { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
-}
+/* The paths page's prose runs the width of the page. */
+.lede.full, .paths-page .keeps { max-width: none; }
 .facts.wait { margin: 0 0 1rem; }
 .facts.wait .keeps + .keeps { margin-top: 0.5rem; }
 h2.kept-h { margin-top: 1.6rem; }

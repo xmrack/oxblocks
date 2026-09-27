@@ -1,9 +1,10 @@
 {% extends "base.html" %}
 {% block title %}Curve tree paths of {{ hash }} &mdash; oxblocks{% endblock %}
 {% block content %}
+<div class="paths-page">
 <p class="crumb"><a href="/tx/{{ hash }}">Transaction</a> <span class="hash">{{ hash }}</span></p>
 <h1>Paths through the curve tree</h1>
-<p class="lede wide">To spend an output, its owner proves that it is one of the
+<p class="lede full">To spend an output, its owner proves that it is one of the
 tree's leaves by climbing from that leaf to the root. The climb needs the
 output's path: the group of outputs it sits in, and at every layer above, the
 group holding its ancestor. These are the paths of this transaction's
@@ -11,7 +12,20 @@ group holding its ancestor. These are the paths of this transaction's
 {{ as_of }}{% if as_of == tip %}, the tip{% endif %}, each recomputed here from
 its leaves up.</p>
 
-<div class="facts-pair">
+<div class="facts"><div class="facts-h">What a wallet keeps</div>
+<p class="keeps">This is what a wallet needs to spend one of these outputs with
+FCMP++: the output's path as of the block its spending transaction references.
+The proof shows that the output is somewhere in the tree without saying where,
+so spending it gives none of this away. Each block adds outputs at the tree's
+right edge, which changes the last group of every layer, and with it, sooner
+or later, the upper groups of every path. So a wallet does not fetch a path
+once: it keeps its outputs' paths current as it syncs, holding the tree's
+right edge to do so. It builds them from its own sync, because asking a node
+for a path tells that node which outputs are yours; monerod's wallet asks
+only for the outputs of transactions it is told to scan out of order. Looking
+one up here tells this explorer's operator which outputs you looked at, as
+any lookup on any explorer does.</p></div>
+
 <div class="facts"><div class="facts-h">The tree</div><dl>
 <dt>As of block</dt><dd><a href="/block/{{ as_of }}">{{ as_of }}</a>{% if as_of == tip %} <span class="tag">tip</span>{% endif %}</dd>
 <dt>Outputs in the tree</dt><dd>{{ leaves }}</dd>
@@ -37,20 +51,6 @@ the ones whose hashes do not hold.</div>
 </form>
 </div>
 
-<div class="facts"><div class="facts-h">What a wallet keeps</div>
-<p class="keeps">This is what a wallet needs to spend one of these outputs with
-FCMP++: the output's path as of the block its spending transaction references.
-The proof shows that the output is somewhere in the tree without saying where,
-so spending it gives none of this away. Each block adds outputs at the tree's
-right edge, which changes the last group of every layer, and with it, sooner
-or later, the upper groups of every path. So a wallet does not fetch a path
-once: it keeps its outputs' paths current as it syncs, holding the tree's
-right edge to do so. It builds them from its own sync, because asking a node
-for a path tells that node which outputs are yours; monerod's wallet asks
-only for the outputs of transactions it is told to scan out of order. Looking
-one up here tells this explorer's operator which outputs you looked at, as
-any lookup on any explorer does.</p></div>
-</div>
 
 {% if !windows.is_empty() %}<nav class="tabs" aria-label="Outputs, fifty at a time">{% for w in windows %}<a href="{{ w.href }}"{% if w.on %} class="on" aria-current="page"{% endif %}>{{ w.label }}</a>{% endfor %}</nav>{% endif %}
 <nav class="tabs" aria-label="Which paths">{% for t in tabs %}<a href="{{ t.href }}"{% if t.on %} class="on" aria-current="page"{% endif %}>{{ t.label }}</a>{% endfor %}</nav>
@@ -168,4 +168,5 @@ Kept path by path, the same paths come to {{ apart }} bytes: they share groups.{
 {% endif %}
 </details>
 {% endif %}
+</div>
 {% endblock %}
