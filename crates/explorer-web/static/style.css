@@ -604,7 +604,11 @@ form.as-of button {
 table.path-status { margin-bottom: 0.6rem; }
 /* The paths page's prose runs the width of the page. */
 .lede.full, .paths-page .keeps { max-width: none; }
-.facts.wait { margin: 0 0 1rem; }
+.facts.wait {
+  margin: 0 0 1rem; background: var(--warn-bg);
+  border-color: var(--accent); border-left-width: 4px;
+}
+.facts.wait .facts-h { color: var(--accent); font-weight: 600; }
 .facts.wait .keeps + .keeps { margin-top: 0.5rem; }
 h2.kept-h { margin-top: 1.6rem; }
 table.kept td.layer { color: var(--accent); }
