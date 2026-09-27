@@ -602,6 +602,26 @@ form.as-of button {
 .grid-legend i.other { background: var(--bg-raised); border: 1px solid var(--accent); }
 
 table.path-status { margin-bottom: 0.6rem; }
+.lede.wide { max-width: 86ch; }
+/* Two panels side by side where there is room, so their prose fills the
+   width rather than stopping two thirds of the way across. */
+.facts-pair { display: grid; gap: 0.7rem; margin-top: 0.9rem; }
+.facts-pair > .facts { margin: 0; }
+@media (min-width: 960px) {
+  .facts-pair { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+}
+.facts.wait { margin: 0 0 1rem; }
+.facts.wait .keeps + .keeps { margin-top: 0.5rem; }
+h2.kept-h { margin-top: 1.6rem; }
+table.kept td.layer { color: var(--accent); }
+table.kept td.layer .curve { display: block; color: var(--fg-faint); font-size: 0.8em; }
+table.kept td.place { white-space: normal; font-variant-numeric: tabular-nums; }
+table.kept td.num { font-variant-numeric: tabular-nums; }
+table.kept tfoot td { font-weight: 600; border-bottom: 0; }
+details.path-data { margin-top: 1.4rem; border-top: 1px solid var(--line); padding-top: 0.8rem; }
+details.path-data > summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+details.path-data[open] > summary { margin-bottom: 0.4rem; }
+table.leaves td:first-child { white-space: nowrap; }
 .path-layer h2 .curve { color: var(--fg-faint); font-weight: 400; font-size: 0.75em; margin-left: 0.3rem; }
 .group-h { font-size: 0.84rem; color: var(--fg-muted); margin: 0.5rem 0 0.35rem; }
 .chips { display: flex; flex-wrap: wrap; gap: 0.3rem; }

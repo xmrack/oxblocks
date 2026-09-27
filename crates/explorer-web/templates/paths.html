@@ -3,7 +3,7 @@
 {% block content %}
 <p class="crumb"><a href="/tx/{{ hash }}">Transaction</a> <span class="hash">{{ hash }}</span></p>
 <h1>Paths through the curve tree</h1>
-<p class="lede">To spend an output, its owner proves that it is one of the
+<p class="lede wide">To spend an output, its owner proves that it is one of the
 tree's leaves by climbing from that leaf to the root. The climb needs the
 output's path: the group of outputs it sits in, and at every layer above, the
 group holding its ancestor. These are the paths of this transaction's
@@ -11,20 +11,7 @@ group holding its ancestor. These are the paths of this transaction's
 {{ as_of }}{% if as_of == tip %}, the tip{% endif %}, each recomputed here from
 its leaves up.</p>
 
-<div class="facts"><div class="facts-h">What a wallet keeps</div>
-<p class="keeps">This is what a wallet needs to spend one of these outputs with
-FCMP++: the output's path as of the block its spending transaction references.
-The proof shows that the output is somewhere in the tree without saying where,
-so spending it gives none of this away. Each block adds outputs at the tree's
-right edge, which changes the last group of every layer, and with it, sooner
-or later, the upper groups of every path. So a wallet does not fetch a path
-once: it keeps its outputs' paths current as it syncs, holding the tree's
-right edge to do so. It builds them from its own sync, because asking a node
-for a path tells that node which outputs are yours; monerod's wallet asks
-only for the outputs of transactions it is told to scan out of order. Looking
-one up here tells this explorer's operator which outputs you looked at, as
-any lookup on any explorer does.</p></div>
-
+<div class="facts-pair">
 <div class="facts"><div class="facts-h">The tree</div><dl>
 <dt>As of block</dt><dd><a href="/block/{{ as_of }}">{{ as_of }}</a>{% if as_of == tip %} <span class="tag">tip</span>{% endif %}</dd>
 <dt>Outputs in the tree</dt><dd>{{ leaves }}</dd>
@@ -33,9 +20,9 @@ any lookup on any explorer does.</p></div>
 {% if root_check == "matches" %} <span class="tag ok">every path leads here</span>{% else if root_check == "fails" %} <span class="tag bad">a path does not lead here</span>{% endif %}</dd>{% endif %}
 </dl>
 {% if root_check == "matches" %}
-<p class="keeps">Every group shown below was hashed, from the leaves up, and each
-hash is the next layer's member the path says it is, up to the root the block
-records. A block carries the root of the tree as it stands eight blocks
+<p class="keeps">Every group of these paths was hashed, from the leaves up, and
+each hash is the next layer's member the path says it is, up to the root the
+block records. A block carries the root of the tree as it stands eight blocks
 later, so the tree as of block {{ as_of }} has its root in block
 {% if let Some((b, _)) = root_block %}{{ b }}{% endif %}.</p>
 {% else if root_check == "fails" %}
@@ -50,10 +37,37 @@ the ones whose hashes do not hold.</div>
 </form>
 </div>
 
+<div class="facts"><div class="facts-h">What a wallet keeps</div>
+<p class="keeps">This is what a wallet needs to spend one of these outputs with
+FCMP++: the output's path as of the block its spending transaction references.
+The proof shows that the output is somewhere in the tree without saying where,
+so spending it gives none of this away. Each block adds outputs at the tree's
+right edge, which changes the last group of every layer, and with it, sooner
+or later, the upper groups of every path. So a wallet does not fetch a path
+once: it keeps its outputs' paths current as it syncs, holding the tree's
+right edge to do so. It builds them from its own sync, because asking a node
+for a path tells that node which outputs are yours; monerod's wallet asks
+only for the outputs of transactions it is told to scan out of order. Looking
+one up here tells this explorer's operator which outputs you looked at, as
+any lookup on any explorer does.</p></div>
+</div>
+
 {% if !windows.is_empty() %}<nav class="tabs" aria-label="Outputs, fifty at a time">{% for w in windows %}<a href="{{ w.href }}"{% if w.on %} class="on" aria-current="page"{% endif %}>{{ w.label }}</a>{% endfor %}</nav>{% endif %}
 <nav class="tabs" aria-label="Which paths">{% for t in tabs %}<a href="{{ t.href }}"{% if t.on %} class="on" aria-current="page"{% endif %}>{{ t.label }}</a>{% endfor %}</nav>
 
-{% if let Some(g) = grid %}
+{% if let Some(w) = waiting %}
+<div class="facts wait"><div class="facts-h">Not in the tree {% if w.blocks_left.is_some() %}yet{% else %}as of block {{ as_of }}{% endif %}</div>
+<p class="keeps">{% if showing.is_some() || outputs_total == 1 %}This output joins{% else %}These outputs join{% endif %}
+the curve tree as of block {{ w.joins }}{% if let Some(n) = w.blocks_left %}, {{ n }} block{% if *n != 1 %}s{% endif %} after the tip,
+in about {{ w.minutes }} minutes{% endif %}. Until then {% if showing.is_some() || outputs_total == 1 %}it has{% else %}they have{% endif %} no path to show.</p>
+<p class="keeps">An output joins the tree only once it unlocks, and it cannot be
+spent before: the spending transaction's proof has to show it among the
+tree's leaves. Most outputs unlock nine blocks after the block that mined
+them, a coinbase's 59 blocks after, and an output whose transaction sets an
+unlock time of its own at the block that time names.</p>
+{% if let Some(href) = w.href %}<p class="keeps"><a href="{{ href }}">Show {% if showing.is_some() || outputs_total == 1 %}its path{% else %}their paths{% endif %} as of block {{ w.joins }}</a></p>{% endif %}
+</div>
+{% else if let Some(g) = grid %}
 <figure class="curve-tree">
   <figcaption>{% if showing.is_some() %}This output's path{% else %}The paths together{% endif %}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
@@ -85,20 +99,31 @@ the ones whose hashes do not hold.</div>
   <tr>
     <td>{% if showing.is_some() %}{{ s.label }}{% else %}<a href="{{ s.href }}">{{ s.label }}</a>{% endif %}</td>
     <td class="num">{{ s.unified_id }}</td>
-    <td>{% if let Some(leaf) = s.leaf %}leaf {{ leaf }}{% if s.check == "holds" %} <span class="tag ok">hashes hold</span>{% else %} <span class="tag bad">{{ s.check }}</span>{% endif %}{% else if let Some(b) = s.joins %}not yet: it joins the tree as of block {{ b }}, once it unlocks{% endif %}</td>
+    <td>{% if let Some(leaf) = s.leaf %}leaf {{ leaf }}{% if s.check != "holds" %} <span class="tag bad">{{ s.check }}</span>{% else if show_holds %} <span class="tag ok">hashes hold</span>{% endif %}{% else if let Some(b) = s.joins %}joins as of block {{ b }}{% endif %}</td>
   </tr>
   {% endfor %}
   </tbody>
 </table>
 </div>
 
-{% if let Some(bytes) = stored %}
-<p class="keeps">{% if let Some(apart) = stored_apart %}Kept together, these paths come to {{ bytes }}
-bytes: {{ apart }} bytes path by path, less the groups they share.{% else %}A wallet keeps
-about {{ bytes }} bytes for this path.{% endif %} That is 64 bytes a leaf, the output's key
-and commitment, and 32 bytes for each point above.</p>
-{% endif %}
+{% if !kept.is_empty() %}
+<h2 class="kept-h">What a wallet keeps for {% if showing.is_some() || statuses.len() == 1 %}this path{% else %}these paths{% endif %}</h2>
+<div class="scroll">
+<table class="kept">
+  <thead><tr><th>Layer</th><th>Kept</th><th class="num">Bytes</th></tr></thead>
+  <tbody>
+  {% for k in kept %}<tr><td class="layer">{{ k.name }}<span class="curve">{{ k.curve }}</span></td><td class="place">{{ k.place }}</td><td class="num">{{ k.bytes }}</td></tr>
+  {% endfor %}
+  </tbody>
+  {% if let Some(bytes) = stored %}<tfoot><tr><td colspan="2">In all</td><td class="num">{{ bytes }}</td></tr></tfoot>{% endif %}
+</table>
+</div>
+<p class="keeps">64 bytes a leaf, the output's one-time key and commitment, and
+32 bytes a node, a point of its layer's curve.{% if let Some(apart) = stored_apart %}
+Kept path by path, the same paths come to {{ apart }} bytes: they share groups.{% endif %}</p>
 
+<details class="path-data">
+<summary>The path data, member by member</summary>
 {% for l in layers %}
 <section class="path-layer">
 <h2>{{ l.name }} <span class="curve">{{ l.curve }}</span></h2>
@@ -124,16 +149,15 @@ and commitment, and 32 bytes for each point above.</p>
 <p class="group-h">{{ g.caption }}</p>
 <div class="scroll">
 <table class="leaves">
-  <thead><tr><th class="num">Leaf</th><th class="num">Unified ID</th><th>Kind</th><th>Output key</th><th>Commitment</th><th></th></tr></thead>
+  <thead><tr><th class="num">Leaf</th><th class="num">Unified ID</th><th>Kind</th><th>Output key</th><th>Commitment</th></tr></thead>
   <tbody>
   {% for r in g.rows %}
   <tr{% if r.output.is_some() %} class="on"{% endif %}>
-    <td class="num">{{ r.position }}</td>
+    <td class="num">{% if let Some(k) = r.output %}<span class="tag">output {{ k }}</span> {% endif %}{{ r.position }}</td>
     <td class="num">{{ r.unified_id }}</td>
     <td>{{ r.kind }}</td>
     <td><span class="hash">{{ r.key }}</span></td>
     <td><span class="hash">{{ r.commitment }}</span></td>
-    <td>{% if let Some(k) = r.output %}<span class="tag">output {{ k }}</span>{% endif %}</td>
   </tr>
   {% endfor %}
   </tbody>
@@ -141,5 +165,7 @@ and commitment, and 32 bytes for each point above.</p>
 </div>
 {% endfor %}
 </section>
+{% endif %}
+</details>
 {% endif %}
 {% endblock %}

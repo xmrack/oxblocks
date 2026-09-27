@@ -22,6 +22,9 @@ use crate::tree_paths::{MAX_OUTPUTS, PathsError, PathsParams, RootCheck, TxPaths
 const LEAF_BYTES: u64 = 64;
 const POINT_BYTES: u64 = 32;
 
+/// Minutes a block takes, on average: `DIFFICULTY_TARGET_V2`.
+const BLOCK_MINUTES: u64 = 2;
+
 #[derive(Template)]
 #[template(path = "paths.html")]
 struct PathsPage {
@@ -52,10 +55,40 @@ struct PathsPage {
     /// From the root down, the leaves' parents last.
     layers: Vec<LayerView>,
     leaf_groups: Vec<LeafGroupView>,
-    /// What a wallet keeps for the paths shown, and for the same paths kept
-    /// apart, when more than one is shown and they share groups.
+    /// What a wallet keeps for the paths shown, layer by layer from the
+    /// root down, and in all.
+    kept: Vec<KeptRow>,
     stored: Option<String>,
+    /// The same paths kept apart, when more than one is shown and they share
+    /// groups.
     stored_apart: Option<String>,
+    /// When no output shown is in the tree as of the block asked about, when
+    /// they join it.
+    waiting: Option<Waiting>,
+    /// Whether a path's own "hashes hold" is worth saying: only when there is
+    /// no root to check the paths against, which says it for all of them.
+    show_holds: bool,
+}
+
+/// One layer of what a wallet keeps.
+struct KeptRow {
+    name: String,
+    curve: &'static str,
+    /// How many members are kept, and their places in the layer.
+    place: String,
+    bytes: String,
+}
+
+/// Outputs that are not in the tree as of the block asked about.
+struct Waiting {
+    /// The first block whose tree holds them.
+    joins: u64,
+    /// Blocks from the tip until then, when that is still to come.
+    blocks_left: Option<u64>,
+    /// About how long those blocks take, in minutes.
+    minutes: u64,
+    /// The page as of the block they join, when the chain has it.
+    href: Option<String>,
 }
 
 struct Tab {
@@ -295,8 +328,46 @@ fn page(
     let every_output: BTreeMap<u64, usize> = unified_ids.iter().copied().zip(1..).collect();
     let grid = leaf_grid(&placed, paths.n_leaf_tuples, &every_output);
 
-    let (layers, leaf_groups) = union(&placed, &outputs_by_id);
+    let (layers, leaf_groups, kept) = union(&placed, &outputs_by_id);
     let (stored, stored_apart) = stored_bytes(&placed);
+
+    // Nothing shown is in the tree yet: say when it will be. Outputs of one
+    // transaction share its lock, so they join together.
+    let waiting = if placed.is_empty() {
+        paths
+            .outputs
+            .iter()
+            .map(|o| o.last_locked_block)
+            .min()
+            .map(|joins| {
+                let blocks_left = (joins > paths.tip).then(|| joins - paths.tip);
+                let href = (joins <= paths.tip).then(|| {
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(k) = showing {
+                        parts.push(format!("output={k}"));
+                    } else if from > 0 {
+                        parts.push(format!("from={from}"));
+                    }
+                    if joins != paths.tip {
+                        parts.push(format!("block={joins}"));
+                    }
+                    if parts.is_empty() {
+                        base.clone()
+                    } else {
+                        format!("{base}?{}", parts.join("&"))
+                    }
+                });
+                Waiting {
+                    joins,
+                    blocks_left,
+                    minutes: blocks_left.unwrap_or(0).saturating_mul(BLOCK_MINUTES),
+                    href,
+                }
+            })
+    } else {
+        None
+    };
+    let root_check = paths.root_check();
 
     PathsPage {
         version: VERSION,
@@ -310,7 +381,7 @@ fn page(
         leaves: grouped(paths.n_leaf_tuples),
         n_layers: monerod_rpc::types::tree_layers(paths.n_leaf_tuples).len(),
         root_block: paths.root_block.clone(),
-        root_check: match paths.root_check() {
+        root_check: match root_check {
             RootCheck::Matches => "matches",
             RootCheck::Fails => "fails",
             RootCheck::Unchecked => "unchecked",
@@ -323,8 +394,11 @@ fn page(
         grid,
         layers,
         leaf_groups,
+        kept,
         stored,
         stored_apart,
+        waiting,
+        show_holds: root_check == RootCheck::Unchecked,
     }
 }
 
@@ -336,7 +410,7 @@ type Lit<'a> = (&'a Group, &'a [[u8; 32]], Vec<bool>);
 fn union(
     placed: &[&PlacedPath],
     outputs_by_id: &BTreeMap<u64, usize>,
-) -> (Vec<LayerView>, Vec<LeafGroupView>) {
+) -> (Vec<LayerView>, Vec<LeafGroupView>, Vec<KeptRow>) {
     // (layer, start) -> the group, its members, and which of them are lit.
     let mut groups: BTreeMap<(usize, u64), Lit<'_>> = BTreeMap::new();
     let mut leaves: BTreeMap<u64, (&Group, &[PathLeaf])> = BTreeMap::new();
@@ -364,6 +438,69 @@ fn union(
     let depth = placed
         .first()
         .map_or(0, |p| p.groups.len().saturating_sub(1));
+    let kept_row = |name: String, curve: &'static str, gs: &[&Group], each: u64, what: &str| {
+        let members: u64 = gs.iter().map(|g| g.len).sum();
+        let size = gs.first().map_or(0, |g| g.layer_size);
+        let place = if size == 1 {
+            "the root".to_owned()
+        } else {
+            let spans: Vec<String> = gs
+                .iter()
+                .map(|g| {
+                    let last = g.start + g.len.saturating_sub(1);
+                    if g.len == 1 {
+                        grouped(g.start)
+                    } else {
+                        format!("{}–{}", grouped(g.start), grouped(last))
+                    }
+                })
+                .collect();
+            format!(
+                "{members} {what}{}, {} of {}",
+                if members == 1 { "" } else { "s" },
+                spans.join(" and "),
+                grouped(size)
+            )
+        };
+        KeptRow {
+            name,
+            curve,
+            place,
+            bytes: grouped(members * each),
+        }
+    };
+    let mut kept: Vec<KeptRow> = (1..=depth)
+        .rev()
+        .map(|layer| {
+            let gs: Vec<&Group> = groups
+                .range((layer, 0)..=(layer, u64::MAX))
+                .map(|(_, (g, _, _))| *g)
+                .collect();
+            let name = if layer == depth {
+                "Root".to_owned()
+            } else {
+                format!("Layer {layer}")
+            };
+            kept_row(
+                name,
+                Curve::of_layer(layer).name(),
+                &gs,
+                POINT_BYTES,
+                "node",
+            )
+        })
+        .collect();
+    if !leaves.is_empty() {
+        let gs: Vec<&Group> = leaves.values().map(|(g, _)| *g).collect();
+        kept.push(kept_row(
+            "Outputs".to_owned(),
+            "leaves",
+            &gs,
+            LEAF_BYTES,
+            "output",
+        ));
+    }
+
     let layers = (1..=depth)
         .rev()
         .map(|layer| LayerView {
@@ -416,7 +553,7 @@ fn union(
                 .collect(),
         })
         .collect();
-    (layers, leaf_groups)
+    (layers, leaf_groups, kept)
 }
 
 /// "Group 2 of 2, the last and short: nodes 18–19 of 20", for one group.
@@ -425,17 +562,7 @@ fn group_caption(g: &Group, what: &str) -> String {
     if g.layer_size == 1 {
         return "The root, alone at the top".to_owned();
     }
-    let last = g.start + g.len.saturating_sub(1);
-    let members = if g.len == 1 {
-        format!("{what} {} of {}", grouped(g.start), grouped(g.layer_size))
-    } else {
-        format!(
-            "{what}s {}–{} of {}",
-            grouped(g.start),
-            grouped(last),
-            grouped(g.layer_size)
-        )
-    };
+    let members = members_text(g, what);
     let groups = g.groups_in_layer();
     if groups == 1 {
         return format!("One group: {members}");
@@ -450,6 +577,24 @@ fn group_caption(g: &Group, what: &str) -> String {
         grouped(g.index() + 1),
         grouped(groups)
     )
+}
+
+/// "nodes 18–19 of 20": a group's members, as places in its layer.
+fn members_text(g: &Group, what: &str) -> String {
+    if g.layer_size == 1 {
+        return "the root".to_owned();
+    }
+    let last = g.start + g.len.saturating_sub(1);
+    if g.len == 1 {
+        format!("{what} {} of {}", grouped(g.start), grouped(g.layer_size))
+    } else {
+        format!(
+            "{what}s {}–{} of {}",
+            grouped(g.start),
+            grouped(last),
+            grouped(g.layer_size)
+        )
+    }
 }
 
 /// What a wallet keeps for these paths together, and, when there is more
@@ -559,10 +704,29 @@ mod tests {
         assert_eq!(p.stored_apart, Some(grouped(4 * one)));
         assert_eq!(p.stored, Some(grouped(one)));
 
+        // What a wallet keeps, layer by layer, adds up to the total.
+        let names: Vec<&str> = p.kept.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(names, ["Root", "Layer 2", "Layer 1", "Outputs"]);
+        assert_eq!(p.kept[3].bytes, grouped(38 * 64));
+        let places: Vec<&str> = p.kept.iter().map(|k| k.place.as_str()).collect();
+        assert_eq!(
+            places,
+            [
+                "the root",
+                "2 nodes, 0–1 of 2",
+                "2 nodes, 18–19 of 20",
+                "38 outputs, 722–759 of 760"
+            ]
+        );
+
         let html = p.render().unwrap();
         assert!(html.contains("every path leads here"));
         assert!(html.contains("What a wallet keeps"));
         assert!(html.contains("class=\"leaf-grid\""));
+        // The root says every path holds, so no path says it again.
+        assert!(!p.show_holds && !html.contains("hashes hold"));
+        // An output's tag sits beside its leaf, not after the hashes.
+        assert!(html.contains("<span class=\"tag\">output 1</span> 752</td>"));
     }
 
     /// The cells of one grid, by what they are.
@@ -640,9 +804,30 @@ mod tests {
                 .iter()
                 .all(|s| s.joins == Some(810) && s.leaf.is_none())
         );
-        assert!(p.layers.is_empty() && p.leaf_groups.is_empty());
+        assert!(p.layers.is_empty() && p.leaf_groups.is_empty() && p.grid.is_none());
+        // The chain has reached block 810, so the page links to the tree
+        // as of it.
+        let w = p.waiting.as_ref().unwrap();
+        assert_eq!((w.joins, w.blocks_left), (810, None));
+        assert_eq!(w.href.as_deref(), Some("/tx/ab/paths?block=810"));
         let html = p.render().unwrap();
-        assert!(html.contains("it joins the tree as of block 810"));
+        assert!(html.contains("Not in the tree as of block 801"));
+        assert!(html.contains("These outputs join\nthe curve tree as of block 810."));
+        assert!(html.contains("Show their paths as of block 810"));
+        assert!(html.contains("joins as of block 810"));
+
+        // With the tip short of block 810, it says how long there is to go.
+        let mut early = paths;
+        early.tip = 805;
+        let p = page(None, "ab".to_owned(), 4, None, &early, &IDS);
+        let w = p.waiting.as_ref().unwrap();
+        assert_eq!(
+            (w.blocks_left, w.minutes, w.href.as_deref()),
+            (Some(5), 10, None)
+        );
+        let html = p.render().unwrap();
+        assert!(html.contains("Not in the tree yet"));
+        assert!(html.contains("5 blocks after the tip,\nin about 10 minutes"));
     }
 
     #[test]
