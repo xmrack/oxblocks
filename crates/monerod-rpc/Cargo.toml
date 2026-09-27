@@ -13,7 +13,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 # hyper directly rather than reqwest. reqwest is a fine client, but this crate
-# uses one shape of it -- POST JSON to a fixed URL, read JSON back -- and it
+# uses one shape of it -- POST to a fixed URL, read the body back -- and it
 # enables tower-http/follow-redirect, which Cargo unifies into the whole
 # workspace and which drags in `url` -> `idna` -> ~25 ICU crates. We then set
 # the redirect policy to `none`, so all of that was carried in order to be

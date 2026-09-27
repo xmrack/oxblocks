@@ -419,9 +419,11 @@ details.hint > p {
 .empty.indented { padding-left: 0.6rem; }
 dl.kv.spaced { margin-top: 0.8rem; }
 
-/* The curve tree an FCMP++ spend proved against. Drawn at full size, and
-   redrawn with its labels above the bars when that would not fit. */
+/* The curve tree, on a transaction's page and its paths page. The funnel is
+   drawn at full size, and redrawn with its labels above the bars when that
+   would not fit. */
 .curve-tree {
+  position: relative;
   margin: 0 0 0.85rem;
   padding: 0.6rem 0.75rem 0.45rem;
   border: 1px solid var(--line);
@@ -447,7 +449,6 @@ dl.kv.spaced { margin-top: 0.8rem; }
    in the caption's line, clear of the hint that opens below it, and on a line
    of its own where the two would not fit side by side. */
 .walk { font-weight: 600; font-size: 0.85rem; }
-.curve-tree { position: relative; }
 .curve-tree > .walk { position: absolute; top: 0.55rem; right: 0.75rem; }
 @media (max-width: 420px) {
   .curve-tree > .walk { position: static; display: inline-block; margin: 0 0 0.5rem; }
@@ -561,9 +562,7 @@ dl.kv.spaced { margin-top: 0.8rem; }
 .tag.ok { color: var(--coinbase); border-color: currentColor; }
 .tag.bad { color: var(--fg); background: var(--warn-bg); border-color: var(--warn-line); }
 .keeps { font-size: 0.89rem; max-width: 78ch; margin: 0.35rem 0 0; }
-.facts + .facts { margin-top: 0.7rem; }
 .facts .keeps { margin: 0; }
-.facts dl + .keeps { margin-top: 0.6rem; }
 
 form.as-of { display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center; margin-top: 0.7rem; font-size: 0.88rem; }
 form.as-of label { display: flex; gap: 0.45rem; align-items: center; color: var(--fg-muted); }
@@ -587,8 +586,7 @@ form.as-of button {
 .tabs a:hover { color: var(--fg); }
 .tabs a.on { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 
-/* A path over the funnel: a line through its ancestor on every bar, in the
-   text colour so it reads against the accent bars. */
+/* The groups the paths climb through, one cell a member. */
 .leaf-grid { display: block; width: 100%; max-width: 480px; height: auto; margin: 0.4rem auto 0; overflow: visible; }
 .leaf-grid .cell.on { fill: var(--accent); }
 .leaf-grid .cell.kept { fill: var(--accent); opacity: 0.42; }
@@ -614,7 +612,6 @@ h2.kept-h { margin-top: 1.6rem; }
 table.kept td.layer { color: var(--accent); }
 table.kept td.layer .curve { display: block; color: var(--fg-faint); font-size: 0.8em; }
 table.kept td.place { white-space: normal; font-variant-numeric: tabular-nums; }
-table.kept td.num { font-variant-numeric: tabular-nums; }
 table.kept tfoot td { font-weight: 600; border-bottom: 0; }
 details.path-data { margin-top: 1.4rem; border-top: 1px solid var(--line); padding-top: 0.8rem; }
 details.path-data > summary { cursor: pointer; color: var(--accent); font-weight: 600; }

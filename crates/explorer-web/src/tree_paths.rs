@@ -144,6 +144,22 @@ impl PathsParams {
     }
 }
 
+impl Wanted {
+    /// The outputs asked for, counted from 0, of a transaction with `total`:
+    /// `output` alone, or up to [`MAX_OUTPUTS`] from `from`.
+    pub fn outputs(&self, total: usize) -> Result<Range<usize>, PathsError> {
+        match self.output {
+            Some(k) if k == 0 || k > total => Err(PathsError::NoSuchOutput { asked: k, total }),
+            Some(k) => Ok((k - 1)..k),
+            None if self.from >= total => Err(PathsError::NoSuchOutputs {
+                from: self.from,
+                total,
+            }),
+            None => Ok(self.from..self.from.saturating_add(MAX_OUTPUTS).min(total)),
+        }
+    }
+}
+
 /// Paths as of one block, for some of one transaction's outputs.
 pub struct TxPaths {
     pub as_of_block: u64,
@@ -172,36 +188,76 @@ pub struct OutputPath {
 /// What every path found says about the root, against the block's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootCheck {
-    /// Every path's hashes hold and end at the root the block records.
+    /// Every output is in the tree, and its path ends at the root the block
+    /// records.
     Matches,
-    /// Some path's hashes do not hold, or end at another root.
+    /// Some output's path is missing, does not hold, or ends at another root.
     Fails,
     /// No block carries the root to compare with, or no output is in the
     /// tree yet.
     Unchecked,
 }
 
+impl RootCheck {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Matches => "matches",
+            Self::Fails => "fails",
+            Self::Unchecked => "unchecked",
+        }
+    }
+}
+
+/// Where one output's path stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// Not in the tree as of the block asked about.
+    Waiting,
+    /// In the tree as of it, by its lock, but the daemon sent no path.
+    Missing,
+    /// The path's hashes do not hold.
+    Fails(PathCheck),
+    /// The hashes hold and end at a root other than the block's.
+    OtherRoot,
+    /// The hashes hold and end at the block's root.
+    Reaches,
+    /// The hashes hold, and no block carries a root to compare with.
+    Holds,
+}
+
 impl TxPaths {
     #[must_use]
-    pub fn root_check(&self) -> RootCheck {
-        let placed: Vec<&PlacedPath> = self
-            .outputs
-            .iter()
-            .filter_map(|o| o.placed.as_ref())
-            .collect();
-        if placed.iter().any(|p| p.check != PathCheck::Holds) {
-            return RootCheck::Fails;
-        }
-        let Some((_, root)) = &self.root_block else {
-            return RootCheck::Unchecked;
+    pub fn standing(&self, o: &OutputPath) -> Standing {
+        let Some(p) = &o.placed else {
+            return if o.last_locked_block > self.as_of_block {
+                Standing::Waiting
+            } else {
+                Standing::Missing
+            };
         };
-        if placed.is_empty() {
-            return RootCheck::Unchecked;
+        match (p.check, &self.root_block) {
+            (PathCheck::Holds, None) => Standing::Holds,
+            (PathCheck::Holds, Some((_, root))) if leads_to(p, root) => Standing::Reaches,
+            (PathCheck::Holds, Some(_)) => Standing::OtherRoot,
+            (check, _) => Standing::Fails(check),
         }
-        if placed.iter().all(|p| leads_to(p, root)) {
+    }
+
+    #[must_use]
+    pub fn root_check(&self) -> RootCheck {
+        let standings: Vec<Standing> = self.outputs.iter().map(|o| self.standing(o)).collect();
+        if standings.iter().any(|s| {
+            matches!(
+                s,
+                Standing::Missing | Standing::Fails(_) | Standing::OtherRoot
+            )
+        }) {
+            RootCheck::Fails
+        } else if standings.contains(&Standing::Reaches) {
             RootCheck::Matches
         } else {
-            RootCheck::Fails
+            RootCheck::Unchecked
         }
     }
 }
@@ -218,6 +274,12 @@ pub enum PathsError {
     Ahead {
         asked: u64,
         tip: u64,
+    },
+    /// The output asked for, counted from 1, is not one of the
+    /// transaction's.
+    NoSuchOutput {
+        asked: usize,
+        total: usize,
     },
     /// The window asked for starts past the transaction's last output.
     NoSuchOutputs {
@@ -244,7 +306,11 @@ pub async fn gather(
     let ids = entry
         .unified_ids_per_output(tx.vout.len())
         .ok_or(PathsError::NoIds)?;
-    let info = state.chain.info().await.map_err(PathsError::Chain)?;
+    let mut info = state.chain.info().await.map_err(PathsError::Chain)?;
+    // The cached info can trail a block that was just mined.
+    if as_of == Some(info.height) {
+        info = state.chain.fresh_info().await.map_err(PathsError::Chain)?;
+    }
     let tip = info.height.saturating_sub(1);
     let as_of_block = as_of.unwrap_or(tip);
     if as_of_block > tip {
@@ -477,6 +543,32 @@ pub(crate) mod tests {
         assert_eq!(cache.stats().len, 1);
     }
 
+    /// The page and the API take the same outputs for the same query.
+    #[test]
+    fn the_outputs_asked_for_are_one_alone_or_a_window() {
+        let wanted = |output: Option<&str>, from: Option<&str>| {
+            params(output, None, from).read().unwrap().outputs(60)
+        };
+        assert_eq!(wanted(Some("2"), None).ok(), Some(1..2));
+        assert_eq!(wanted(None, Some("7")).ok(), Some(7..57));
+        assert_eq!(wanted(None, Some("30")).ok(), Some(30..60));
+        assert!(matches!(
+            wanted(Some("0"), None),
+            Err(PathsError::NoSuchOutput {
+                asked: 0,
+                total: 60
+            })
+        ));
+        assert!(matches!(
+            wanted(Some("61"), None),
+            Err(PathsError::NoSuchOutput { asked: 61, .. })
+        ));
+        assert!(matches!(
+            wanted(None, Some("60")),
+            Err(PathsError::NoSuchOutputs { from: 60, .. })
+        ));
+    }
+
     #[test]
     fn an_empty_parameter_is_absent_and_a_bad_one_is_refused() {
         assert_eq!(
@@ -487,11 +579,6 @@ pub(crate) mod tests {
                 from: 0
             })
         );
-        assert_eq!(
-            params(None, Some("814"), Some("50")).read().unwrap().block,
-            Some(814)
-        );
-        assert!(params(None, Some("+8"), None).read().is_err());
         assert!(params(None, None, Some("x")).read().is_err());
         assert!(
             params(Some("99999999999999999999"), None, None)

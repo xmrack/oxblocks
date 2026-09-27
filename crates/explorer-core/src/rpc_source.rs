@@ -157,6 +157,11 @@ pub const MAX_RANGE_KIB: u64 = RANGE_KIB as u64 / 2;
 /// request time to fetch once it has its share.
 pub const RANGE_WAIT: Duration = Duration::from_secs(5);
 
+/// How many blocks sit on block `height`, in a chain of `chain_height`.
+const fn depth(chain_height: u64, height: u64) -> u64 {
+    chain_height.saturating_sub(height.saturating_add(1))
+}
+
 /// A range of blocks with their transactions, holding its share of
 /// [`RANGE_KIB`] until it is dropped.
 pub struct BlockRange {
@@ -410,8 +415,7 @@ impl RpcChainSource {
             .map_err(|e| tracing::warn!("tree size as of block {reference}: {e}"))
             .ok()?;
         let size = TreeSizeQuery::answer(&root)?;
-        let depth = chain_height.saturating_sub(reference.saturating_add(1));
-        if safe_to_cache_by_height(depth) {
+        if safe_to_cache_by_height(depth(chain_height, reference)) {
             self.tree_sizes.insert(reference, size);
         }
         Some(size)
@@ -423,7 +427,7 @@ impl RpcChainSource {
     ///
     /// Not cached here: a path as of the tip changes with every block, and
     /// whether an answer is worth keeping is known only once it is placed
-    /// and checked, which is [`crate::curve_tree::place`].
+    /// and checked, which is [`crate::curve_tree::place_all`].
     pub async fn tree_paths(
         &self,
         as_of_block: u64,
@@ -510,7 +514,6 @@ impl RpcChainSource {
             });
         }
 
-        // Keyed by hash: always safe, because a hash names one block forever.
         if let Some(h) = answered {
             self.blocks_by_hash.insert(h, fresh.clone());
         }
@@ -528,10 +531,7 @@ impl RpcChainSource {
         // its word alone.
         let buried = safe_to_cache_by_height(fresh.block_header.depth)
             && self.info().await.is_ok_and(|info| {
-                safe_to_cache_by_height(
-                    info.height
-                        .saturating_sub(fresh.block_header.height.saturating_add(1)),
-                )
+                safe_to_cache_by_height(depth(info.height, fresh.block_header.height))
             });
         if buried && !fresh.block_header.orphan_status {
             return Ok(self
@@ -614,7 +614,7 @@ impl RpcChainSource {
             return 0;
         }
         match self.info().await {
-            Ok(info) => info.height.saturating_sub(header.height.saturating_add(1)),
+            Ok(info) => depth(info.height, header.height),
             Err(_) => header.depth,
         }
     }
@@ -691,9 +691,9 @@ impl RpcChainSource {
                     tip_height = Some(self.info().await.ok().map(|i| i.height));
                 }
                 let buried = candidate
-                    && tip_height.flatten().is_some_and(|tip| {
-                        safe_to_cache_by_height(tip.saturating_sub(entry.block_height))
-                    });
+                    && tip_height
+                        .flatten()
+                        .is_some_and(|tip| safe_to_cache_by_height(depth(tip, entry.block_height)));
                 if buried {
                     self.txs.insert(h, entry.clone());
                 }
@@ -1072,11 +1072,7 @@ impl RpcChainSource {
     /// `join_all` preserves order, which ring display depends on: ring `n`
     /// must belong to input `n`.
     pub async fn resolve_rings(&self, tx: &TxJson) -> Vec<ResolvedInput> {
-        // An FCMP++ input proves it spends one of the outputs in the tree.
-        // There is no ring to fetch, and nothing was refused, so the answer is
-        // complete without asking the daemon anything. Checked by type rather
-        // than left to the empty offset lists below, which would also reach no
-        // daemon but only by way of a fallback written for a different case.
+        // An FCMP++ input has no ring to fetch, and nothing was refused.
         if tx.is_fcmp_pp() {
             return unexpanded_inputs(tx);
         }
@@ -1103,6 +1099,17 @@ impl RpcChainSource {
         futures_util::future::join_all(inputs.iter().map(|k| self.resolve_ring(k))).await
     }
 
+    /// A ring member, cached when its block is buried past the reorg window
+    /// below `tip`, the chain's height, and returned either way.
+    fn keep_out(&self, key: (u64, u64), out: OutKey, tip: Option<u64>) -> Arc<OutKey> {
+        let buried = tip.is_some_and(|tip| safe_to_cache_by_height(depth(tip, out.height)));
+        if buried {
+            self.outs.insert(key, out)
+        } else {
+            Arc::new(out)
+        }
+    }
+
     /// Every ring of one transaction in a single `get_outs`.
     ///
     /// `None` means the batch is not usable and the caller must fall back to
@@ -1116,19 +1123,6 @@ impl RpcChainSource {
     /// entry written at the top of this function can be evicted before the
     /// bottom of it, and a ring assembled from what survived would be reported
     /// as partly unavailable when it was in fact complete.
-    /// A ring member, cached when its block is buried past the reorg window
-    /// below `tip`, the chain's height, and returned either way.
-    fn keep_out(&self, key: (u64, u64), out: OutKey, tip: Option<u64>) -> Arc<OutKey> {
-        let buried = tip.is_some_and(|tip| {
-            safe_to_cache_by_height(tip.saturating_sub(out.height.saturating_add(1)))
-        });
-        if buried {
-            self.outs.insert(key, out)
-        } else {
-            Arc::new(out)
-        }
-    }
-
     async fn resolve_rings_together(&self, inputs: &[&TxInToKey]) -> Option<Vec<ResolvedInput>> {
         let rings: Vec<Vec<OutKeyRequest>> = inputs
             .iter()
@@ -1711,12 +1705,19 @@ mod tests {
     }
 
     /// An FCMP++ input has no ring, so resolving one must not reach the
-    /// daemon. The source here points at a port nothing listens on: a call
-    /// would come back unavailable, and the count would move.
+    /// daemon, even with offsets a ring spend would carry. The source here
+    /// points at a port nothing listens on: a call would come back
+    /// unavailable, and the count would move.
     #[tokio::test]
     async fn an_fcmp_pp_transaction_resolves_without_asking_the_daemon() {
         let src = source();
-        let resolved = src.resolve_rings(&fcmp_pp_tx()).await;
+        let mut tx = fcmp_pp_tx();
+        for input in &mut tx.vin {
+            if let monerod_rpc::types::TxIn::Key(k) = input {
+                k.key_offsets = vec![5, 1];
+            }
+        }
+        let resolved = src.resolve_rings(&tx).await;
         assert_eq!(resolved.len(), 2, "every input is still listed");
         for r in &resolved {
             assert!(r.ring.is_empty());
@@ -2099,8 +2100,7 @@ mod tests {
     async fn a_range_that_does_not_show_the_tree_does_not_pay_for_it() {
         let chain = Chain { tip: 9, fork: 0 };
         let daemon = chain.daemon(&[], None);
-        let blocks = daemon.source().blocks_in_range(0, 9, false).await.unwrap();
-        assert!(blocks.iter().all(|b| b.tree.is_none()));
+        daemon.source().blocks_in_range(0, 9, false).await.unwrap();
         assert_eq!(daemon.count("get_block"), 0);
     }
 

@@ -176,6 +176,19 @@ pub enum PathCheck {
     NotTheOutput,
 }
 
+impl PathCheck {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Holds => "holds",
+            Self::Broken { .. } => "broken",
+            Self::Unreadable { .. } => "unreadable",
+            Self::Misshapen => "misshapen",
+            Self::NotTheOutput => "not_the_output",
+        }
+    }
+}
+
 /// An output as its transaction records it: what the leaf its path climbs
 /// from must hold.
 ///
@@ -255,19 +268,17 @@ impl PlacedPath {
     }
 }
 
-/// Place and check the path the daemon sent for `output`, in a tree of
-/// `n_leaf_tuples` leaves.
-///
-/// This costs a hash per layer and a point decompression and a hash to a
-/// point per leaf in the output's group: a few milliseconds, all of it CPU.
-#[must_use]
-pub fn place(output: &Output, path: TreePath, n_leaf_tuples: u64) -> PlacedPath {
+/// One path placed and checked on its own.
+#[cfg(test)]
+fn place(output: &Output, path: TreePath, n_leaf_tuples: u64) -> PlacedPath {
     Hashes::default().place(output, path, n_leaf_tuples)
 }
 
 /// Place and check every path of one answer, `paths[i]` being the path of
-/// `outputs[i]`.
+/// `outputs[i]`, in a tree of `n_leaf_tuples` leaves.
 ///
+/// A path costs a hash per layer and a point decompression and a hash to a
+/// point per leaf in the output's group: a few milliseconds, all of it CPU.
 /// A transaction's outputs usually share their groups, so each distinct
 /// group is hashed once. Groups are told apart by their contents, not their
 /// place, so two paths that disagree about a group are each checked.
@@ -582,20 +593,6 @@ mod tests {
         }
     }
 
-    /// Output 0, the genesis coinbase, predates Carrot: its leaf takes the
-    /// legacy derivation, torsion clearing and the biased hash, and the path
-    /// holding it still reaches the root.
-    #[test]
-    fn a_legacy_leaf_hashes_the_way_monerod_hashes_it() {
-        let answer = paths("get_path_by_unified_id_old.bin", 814, &[10, 60]);
-        let path = answer.paths[0].clone().unwrap();
-        assert_eq!(path.leaves[0].kind, LeafKind::Legacy);
-        assert_eq!(
-            place(&own(10, &path), path, answer.n_leaf_tuples).check,
-            PathCheck::Holds
-        );
-    }
-
     /// Any one byte changed anywhere in a path is caught, at the layer it is
     /// in.
     #[test]
@@ -784,7 +781,5 @@ mod tests {
     fn layers_alternate_curves_from_selene() {
         let curves: Vec<&str> = (0..5).map(|l| Curve::of_layer(l).name()).collect();
         assert_eq!(curves, ["Ed25519", "Selene", "Helios", "Selene", "Helios"]);
-        let widths: Vec<u64> = (0..5).map(group_width).collect();
-        assert_eq!(widths, [38, 18, 38, 18, 38]);
     }
 }

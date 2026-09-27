@@ -46,7 +46,7 @@
     all.</p></details>
   </dd>
   {% if fcmp_pp %}
-  <dt>Anonymity set</dt><dd>{% if let Some(count) = anonymity_set %}{{ count }} outputs{% else %}Every output in the curve tree{% endif %}{% if let Some(r) = reference_block %}, as of block <a href="/block/{{ r }}">{{ r }}</a>{% endif %}{% if let Some(n) = n_tree_layers %} <span class="tag">{{ n }} tree layers</span>{% endif %}{% if let Some((b, root)) = root_block %} <span class="tag" title="Tree root {{ root }}">root in block <a href="/block/{{ b }}">{{ b }}</a></span>{% endif %}
+  <dt>Anonymity set</dt><dd>{% if let Some(count) = anonymity_set %}{{ count }} outputs{% else %}Every output in the curve tree{% endif %}{% if let Some(r) = reference_block %}, as of block <a href="/block/{{ r }}">{{ r }}</a>{% endif %}{% if let Some(n) = n_tree_layers %} <span class="tag">{{ n }} tree layer{% if *n != 1 %}s{% endif %}</span>{% endif %}{% if let Some((b, root)) = root_block %} <span class="tag" title="Tree root {{ root }}">root in block <a href="/block/{{ b }}">{{ b }}</a></span>{% endif %}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
     <p>This transaction spends with FCMP++, so its inputs have no ring. Each
     input proves that it spends one of the outputs in a tree of every output
@@ -212,7 +212,7 @@
 {% endif %}
 
 <h2>{{ outputs.len() }} Output{% if outputs.len() != 1 %}s{% endif %}</h2>
-{% if has_unified_ids && !in_pool %}<p class="walk-row"><a class="walk" href="/tx/{{ hash }}/paths">Where {% if outputs.len() == 1 %}this output sits{% else %}these outputs sit{% endif %} in the curve tree &rarr;</a></p>{% endif %}
+{% if has_unified_ids %}<p class="walk-row"><a class="walk" href="/tx/{{ hash }}/paths">Where {% if outputs.len() == 1 %}this output sits{% else %}these outputs sit{% endif %} in the curve tree &rarr;</a></p>{% endif %}
 <div class="legend">
   <div>Stealth address
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
@@ -272,7 +272,7 @@
       <td class="num">{% if let Some(amount) = o.amount %}{{ amount }}{% else %}<span class="tag">hidden</span>{% endif %}</td>
       {% if has_view_tags %}<td><code>{{ o.view_tag }}</code></td>{% endif %}
       {% if carrot %}<td><span class="hash">{{ o.anchor }}</span></td>{% endif %}
-      {% if has_unified_ids %}<td class="num">{% if let Some(id) = o.unified_id %}{% if in_pool %}{{ id }}{% else %}<a href="/tx/{{ hash }}/paths?output={{ loop.index }}" title="This output's path through the curve tree">{{ id }}</a>{% endif %}{% endif %}</td>{% endif %}
+      {% if has_unified_ids %}<td class="num">{% if let Some(id) = o.unified_id %}<a href="/tx/{{ hash }}/paths?output={{ loop.index }}" title="This output's path through the curve tree">{{ id }}</a>{% endif %}</td>{% endif %}
     </tr>
   {% endfor %}
   </tbody>

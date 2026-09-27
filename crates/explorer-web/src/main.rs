@@ -173,6 +173,10 @@ fn router(config: &Config, state: Arc<AppState>) -> Router {
     app
 }
 
+/// The routes that never reach the daemon, served outside `--max-concurrent`
+/// so that a slow daemon filling every slot cannot fail them too.
+const OUTSIDE_THE_LIMIT: [&str; 3] = ["/health", "/static/style.css", "/robots.txt"];
+
 /// Run the request once a slot of `--max-concurrent` is free.
 ///
 /// The slot is waited for inside the request's future, under the request
@@ -184,6 +188,9 @@ async fn within_limit(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
+    if OUTSIDE_THE_LIMIT.contains(&request.uri().path()) {
+        return next.run(request).await;
+    }
     let Ok(_slot) = slots.acquire_owned().await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -360,35 +367,41 @@ mod tests {
         })
     }
 
-    /// The limit is the server's, not each route's, and a request waiting
-    /// for a slot is shed by the timeout rather than waiting on.
+    /// The limit is the server's, not each route's; a request waiting for a
+    /// slot is shed by the timeout; and the routes that never reach the
+    /// daemon are answered while a slow one holds every slot.
     #[tokio::test]
-    async fn one_slot_is_shared_by_every_route_and_waiting_times_out() {
+    async fn a_slow_daemon_fills_the_limit_but_not_health() {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let app = Router::new()
-            .route(
-                "/slow",
-                axum::routing::get(|| async {
-                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-                    "slow"
-                }),
-            )
-            .route("/fast", axum::routing::get(|| async { "fast" }))
-            .layer(
-                ServiceBuilder::new()
-                    .layer(TimeoutLayer::with_status_code(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        std::time::Duration::from_millis(200),
-                    ))
-                    .layer(axum::middleware::from_fn_with_state(
-                        Arc::clone(&slots),
-                        within_limit,
-                    )),
-            );
+        // A daemon that never answers, counting who reaches it.
+        let daemon = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", daemon.local_addr().unwrap());
+        let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&reached);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((c, _)) = daemon.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(c);
+            }
+        });
+        let reached = move || reached.load(std::sync::atomic::Ordering::SeqCst);
+        let state = Arc::new(AppState {
+            chain: explorer_core::RpcChainSource::new(monerod_rpc::Client::new(&url).unwrap()),
+            limits: crate::config::Limits::default(),
+            paths: crate::tree_paths::PathCache::default(),
+        });
+        let config = Config::parse_from([
+            "oxblocks",
+            "--max-concurrent",
+            "1",
+            "--request-timeout-secs",
+            "1",
+        ]);
+        let app = router(&config, state);
         let ask = |uri: &'static str| {
             let app = app.clone();
             async move {
@@ -399,22 +412,22 @@ mod tests {
             }
         };
 
-        // The slow route holds the one slot until its timeout frees it, and
-        // another route waits for that slot rather than having its own.
+        let slow = tokio::spawn(ask("/"));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let started = std::time::Instant::now();
-        let slow = tokio::spawn(ask("/slow"));
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(slots.available_permits(), 0);
-        assert_eq!(ask("/fast").await, StatusCode::OK);
-        assert!(started.elapsed() >= std::time::Duration::from_millis(190));
-        assert_eq!(slow.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(ask("/health").await, StatusCode::OK);
+        assert_eq!(ask("/static/style.css").await, StatusCode::OK);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
 
-        // A request queued behind a slot that is not given back is shed by
-        // its timeout.
-        let held = Arc::clone(&slots).acquire_owned().await.unwrap();
-        assert_eq!(ask("/fast").await, StatusCode::GATEWAY_TIMEOUT);
-        drop(held);
-        assert_eq!(ask("/fast").await, StatusCode::OK);
+        // Another route waits for the one slot, not reaching the daemon
+        // while the slow request holds it.
+        let before = reached();
+        assert!(before > 0);
+        let waiting = tokio::spawn(ask("/api/version"));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(reached(), before);
+        assert_eq!(slow.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(waiting.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]

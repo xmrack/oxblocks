@@ -48,7 +48,6 @@ confidence-threshold = 0.9
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# monero-oxide publishes its curve-tree crates (helioselene, ec-divisors,
-# monero-ed25519, monero-primitives) from git only, pinned by revision in each
-# Cargo.toml to the one monerod's stressnet v3 branch builds with.
+# monero-oxide's crates come from git, pinned by revision to the one monerod's
+# stressnet v3 branch builds with.
 allow-git = ["https://github.com/monero-oxide/monero-oxide"]

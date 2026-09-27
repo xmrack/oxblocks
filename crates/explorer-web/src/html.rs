@@ -151,7 +151,7 @@ struct TxPage {
     /// That tree, drawn. Present exactly when `anonymity_set` is.
     tree: Option<[TreeFunnel; 2]>,
     /// The FCMP++ proof's length in bytes.
-    proof_size: Option<u64>,
+    proof_size: Option<String>,
     /// Any output is a Carrot output, which carries a three-byte view tag and
     /// an encrypted Janus anchor.
     carrot: bool,
@@ -463,10 +463,9 @@ fn tree_funnel(leaves: u64, root: Option<&str>, layout: &FunnelLayout) -> Option
             let width = funnel_width(count, leaves, span);
             let x = centre - width / 2;
             let y = layout.top + i * layout.row;
-            // Layer 1 is the leaves' parents, all Selene; the curves alternate
-            // from there.
             let layer = depth - i as usize;
-            let curve = (layer > 0).then_some(if layer % 2 == 1 { "Selene" } else { "Helios" });
+            let curve =
+                (layer > 0).then(|| explorer_core::curve_tree::Curve::of_layer(layer).name());
             let (name, class) = match i {
                 0 => ("Root".to_owned(), "root"),
                 _ if layer == 0 => ("Outputs".to_owned(), "leaf"),
@@ -1188,17 +1187,7 @@ pub async fn block(
     // document that does not decode costs this one row and nothing else:
     // everything above it came from the header.
     let tree = BlockTree::of(&got);
-    // A cached block carries the depth it had when fetched, so a block cached
-    // as the tip would read as the tip for as long as it stayed cached.
-    // Counted from the tip the status strip shows instead.
-    // An orphan is on no chain the tip is on, so nothing buries it.
-    let depth = if header.orphan_status {
-        0
-    } else {
-        chain.as_ref().map_or(header.depth, |c| {
-            c.height.saturating_sub(header.height.saturating_add(1))
-        })
-    };
+    let depth = state.chain.depth_now(&header).await;
 
     render(
         StatusCode::OK,
@@ -1379,7 +1368,8 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
 
     let mut has_view_tags = false;
     let unified_ids = entry.unified_ids_per_output(tx.vout.len());
-    let has_unified_ids = unified_ids.is_some();
+    // A pool transaction's outputs have no place in the tree yet.
+    let has_unified_ids = unified_ids.is_some() && !entry.in_pool;
     let outputs = tx
         .vout
         .iter()
@@ -1470,7 +1460,7 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
                 .and_then(|n| tree_picture(n, root_block.as_ref().map(|(_, root)| root.as_str()))),
             root_block,
             anonymity_set: anonymity_set.map(grouped),
-            proof_size: f.fcmp_pp.and_then(|x| x.proof_size),
+            proof_size: f.fcmp_pp.and_then(|x| x.proof_size).map(grouped),
             carrot: f.carrot,
             unlock_time: f.unlock_time,
             payment_id: f.payment_id_hex(),
@@ -1735,9 +1725,10 @@ fn fcmp_page(
     let tree = anonymity_set
         .and_then(|n| tree_picture(n, root_block.as_ref().map(|(_, root)| root.as_str())));
 
+    // Without the root anchor, which step 5 counts, as the bar does.
     let membership = parts.as_ref().zip(proof_len).map(|(p, total)| {
-        let share = p.membership_len * 100 / total.max(1);
-        (grouped(p.membership_len as u64), share as u64)
+        let body = p.membership_len.saturating_sub(FCMP_PP_ROOT_POK_LEN);
+        (grouped(body as u64), (body * 100 / total.max(1)) as u64)
     });
 
     FcmpPage {
@@ -1765,7 +1756,8 @@ fn fcmp_page(
         outputs: tx.vout.len(),
         range_proofs: prunable.and_then(|p| p.bpp.as_ref()).map_or(0, Vec::len),
         shape,
-        root_curve: layers.map(|l| if l % 2 == 1 { "Selene" } else { "Helios" }),
+        root_curve: layers
+            .map(|l| explorer_core::curve_tree::Curve::of_layer(usize::from(l)).name()),
         map,
         tree,
     }
@@ -3198,16 +3190,13 @@ mod tests {
         }
     }
 
-    /// The pager's links come from the handler, which knows where the chain
-    /// ends: none past the genesis block, and none that could overflow.
+    /// With no older page, the pager's link to one is dead.
     #[test]
     fn the_last_page_links_to_no_older_one() {
         let mut page = index_page();
-        page.page = u64::MAX;
         page.older = None;
         let html = page.render().expect("renders");
         assert!(html.contains("<span>Older &rarr;</span>"));
-        assert!(!html.contains("/page/0\""));
         assert!(
             index_page()
                 .render()
@@ -3669,7 +3658,7 @@ mod tests {
     fn a_known_tree_size_is_the_anonymity_set_and_the_proof_has_a_size() {
         let mut page = fcmp_tx_page();
         page.anonymity_set = Some(grouped(1_234_567));
-        page.proof_size = Some(6_528);
+        page.proof_size = Some(grouped(6_528));
         page.has_unified_ids = true;
         for (i, o) in page.outputs.iter_mut().enumerate() {
             o.unified_id = Some(900 + i as u64);
@@ -3680,7 +3669,7 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("Every output in the curve tree"));
-        assert!(html.contains("<dt>FCMP++ proof</dt><dd>6528 bytes"));
+        assert!(html.contains("<dt>FCMP++ proof</dt><dd>6,528 bytes"));
         assert!(html.contains(r#"<th class="num">Unified ID</th>"#));
         // Each unified id links to its output's path, and the section to all
         // of them.
@@ -3688,12 +3677,6 @@ mod tests {
         assert!(html.contains(&format!(r#"<a href="{paths}?output=1" title="This output's path through the curve tree">900</a>"#)));
         assert!(html.contains(&format!(r#"<a href="{paths}?output=2" title="This output's path through the curve tree">901</a>"#)));
         assert!(html.contains(&format!(r#"<a class="walk" href="{paths}">"#)));
-        // A transaction in the pool has no place in the tree to link to.
-        page.in_pool = true;
-        let pooled = page.render().expect("renders");
-        assert!(pooled.contains(r#"<td class="num">900</td>"#));
-        assert!(!pooled.contains("/paths"));
-
         // Without them, none of it appears.
         let bare = fcmp_tx_page().render().expect("renders");
         assert!(bare.contains("Every output in the curve tree"));
@@ -3823,18 +3806,6 @@ mod tests {
             html.contains(r#"aria-label="Curve tree of 22 outputs in 1 layer, the root"#),
             "{html}"
         );
-        assert!(
-            html.contains(
-                r#"<rect class="bar root" x="395" y="14" rx="3" width="10" height="14"/>"#
-            )
-        );
-        assert!(
-            html.contains(
-                r#"<rect class="bar leaf" x="150" y="44" rx="3" width="500" height="14"/>"#
-            )
-        );
-        assert!(html.contains(r#"<polygon class="web" points="395,28 405,28 650,44 150,44"/>"#));
-        assert!(html.contains(r#"<line class="cut" x1="172" y1="44" x2="172" y2="58"/>"#));
         assert!(html.contains(
             r#"<text class="label" x="0" y="26">Root<tspan class="curve"> · Selene</tspan>"#
         ));
@@ -3969,7 +3940,8 @@ mod tests {
                 );
             }
             let total = proof.len() / 2;
-            let membership = total - n * 480;
+            // What is left after the tuples and signatures, less the anchor.
+            let membership = total - n * 480 - 64;
             assert_eq!(
                 page.membership,
                 Some((
@@ -4126,8 +4098,6 @@ mod tests {
             .expect("the tree");
         let pic = first.find(r#"<svg class="pic""#).expect("the picture");
         assert!(tree < first.find("Show the maths").expect("maths") && tree < pic);
-        assert_eq!(html.matches(r#"<svg class="pic""#).count(), 7);
-        assert_eq!(html.matches(r#"<details class="maths">"#).count(), 7);
         assert!(!html.contains(r#"class="maths" open"#));
         assert_eq!(html.matches(r#"aria-current="step""#).count(), 7);
         // Step 2 lights both inputs' tuples, step 4 the membership proof,

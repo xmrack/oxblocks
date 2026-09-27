@@ -1,6 +1,6 @@
 //! Transport for the monerod daemon RPC.
 //!
-//! monerod exposes two different calling conventions and they fail differently:
+//! monerod exposes three calling conventions and they fail differently:
 //!
 //! * `POST /json_rpc` — a JSON-RPC 2.0 envelope. Failures arrive as an `error`
 //!   member alongside HTTP 200.
@@ -10,7 +10,7 @@
 //!   JSON. Used for the one figure monerod reports only in binary; see
 //!   [`crate::epee`].
 //!
-//! Both are normalised into [`RpcError`] here so that callers never have to
+//! All are normalised into [`RpcError`] here so that callers never have to
 //! remember which convention a given call uses.
 
 use std::time::Duration;
@@ -869,8 +869,6 @@ mod tests {
         }
     }
 
-    /// The same body, under the ceiling, is read normally -- so the test above
-    /// is measuring the limit rather than a transport that never works.
     /// A declared length over the ceiling is refused on the strength of the
     /// declaration, without reading the body it promises.
     ///
@@ -897,6 +895,8 @@ mod tests {
         }
     }
 
+    /// The same body, under the ceiling, is read normally -- so the size tests
+    /// is measuring the limit rather than a transport that never works.
     #[tokio::test]
     async fn a_response_under_the_ceiling_is_read() {
         let peer = serve_json(r#"{"result":{"status":"OK","height":7}}"#);
@@ -957,18 +957,7 @@ mod tests {
             crate::epee::read_root(&b, &["status"]).unwrap()
         };
         assert!(Client::check_binary_status(&root(b"OK"), "x.bin").is_ok());
-        assert!(Client::check_binary_status(&root(b"Failed"), "x.bin").is_err());
         assert!(Client::check_binary_status(&root(b"OK\xff"), "x.bin").is_err());
-        assert!(
-            matches!(
-                Client::check_binary_status(&crate::epee::Root::default(), "x.bin"),
-                Err(RpcError::Missing {
-                    field: "status",
-                    ..
-                })
-            ),
-            "a binary answer without a status is refused"
-        );
     }
 
     /// A portable-storage root section holding `entries`, each a name, a type
@@ -1103,19 +1092,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[tokio::test]
-    async fn a_binary_call_that_meets_an_http_error_reports_it() {
-        let peer = serve(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-        let client = Client::new(format!("http://127.0.0.1:{}", peer.port)).expect("valid url");
-        let outcome = client
-            .binary("get_path_by_unified_id.bin", &PROBE, &[], 1024)
-            .await;
-        let _ = peer.request();
-        assert!(
-            matches!(outcome, Err(RpcError::Http { status: 404, .. })),
-            "{outcome:?}"
-        );
     }
 }

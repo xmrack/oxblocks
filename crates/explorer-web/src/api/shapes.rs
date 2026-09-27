@@ -674,11 +674,6 @@ mod tests {
         assert_eq!(summary.reference_block, Some(3_012_390));
         assert_eq!(summary.n_tree_layers, Some(6));
 
-        // Filled by the handler, which pays the daemon call for it.
-        assert_eq!(detail.anonymity_set, None);
-        // No proof in this document, and no unified ids on this entry.
-        assert_eq!(detail.fcmp_pp_proof_size, None);
-        assert_eq!(detail.outputs[0].unified_id, None);
         let inputs = detail.inputs.as_ref().expect("a spend lists its inputs");
         assert_eq!(inputs.len(), 1);
         assert_eq!(

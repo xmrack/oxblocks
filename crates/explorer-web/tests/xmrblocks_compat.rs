@@ -256,15 +256,16 @@ fn a_captured_fcmp_pp_transaction_fills_the_fcmp_pp_keys() {
         ))
         .expect("serialises");
 
-        let reference = detail["reference_block"].as_u64().expect("a number");
-        assert!(reference < entry.block_height);
-        assert!(detail["n_tree_layers"].as_u64().is_some_and(|n| n >= 1));
+        assert_eq!(detail["reference_block"].as_u64(), Some(120));
+        assert_eq!(
+            detail["n_tree_layers"].as_u64(),
+            tx.n_tree_layers().map(u64::from)
+        );
         let proof = tx.rctsig_prunable.as_ref().and_then(|p| p.fcmp_pp_len());
         assert_eq!(
             detail["fcmp_pp_proof_size"].as_u64(),
             proof.map(|n| n as u64)
         );
-        assert!(proof.is_some_and(|n| n > 0));
         let ids: Vec<u64> = detail["outputs"]
             .as_array()
             .expect("outputs")
@@ -276,11 +277,16 @@ fn a_captured_fcmp_pp_transaction_fills_the_fcmp_pp_keys() {
             })
             .collect();
         assert_eq!(ids, entry.unified_ids);
-        for out in detail["outputs"].as_array().expect("outputs") {
-            assert_eq!(out["view_tag"].as_str().map(str::len), Some(6));
+        for (out, vout) in detail["outputs"]
+            .as_array()
+            .expect("outputs")
+            .iter()
+            .zip(&tx.vout)
+        {
+            assert_eq!(out["view_tag"].as_str(), vout.target.view_tag());
             assert_eq!(
-                out["encrypted_janus_anchor"].as_str().map(str::len),
-                Some(32)
+                out["encrypted_janus_anchor"].as_str(),
+                vout.target.encrypted_janus_anchor()
             );
         }
     }

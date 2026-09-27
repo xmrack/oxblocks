@@ -270,11 +270,12 @@
     outputs at most, starting at output <code class="lit">from</code>, counted
     from 0, or output <code class="lit">output</code> alone, counted from 1 as
     the transaction page lists them. Each parameter is a plain number, and an
-    empty one counts as left out. One daemon call. The explorer recomputes each path's hashes from
+    empty one counts as left out. The explorer recomputes each path's hashes from
     its leaves up and compares the result with the root in block
     <code class="lit">block</code> &minus; 8. <code class="lit">root_check</code>
     is <code class="lit">matches</code> when every path holds and reaches that
-    root, <code class="lit">fails</code> when one does not, and
+    root, <code class="lit">fails</code> when one does not or the daemon sends
+    none for an output its lock puts in the tree, and
     <code class="lit">unchecked</code> when no output is in the tree yet or no
     block carries the root.
   </p>

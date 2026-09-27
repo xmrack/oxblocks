@@ -28,7 +28,7 @@
   </dd>
   {% if let Some(root) = tree_root %}
   <dt>Curve tree</dt>
-  <dd><span class="hash">{{ root }}</span>{% match tree_layers %}{% when Some(0) %} <span class="tag" title="No outputs have entered the tree yet">empty</span>{% when Some(layers) %} <span class="tag">{{ layers }} layers</span>{% when None %}{% endmatch %}
+  <dd><span class="hash">{{ root }}</span>{% match tree_layers %}{% when Some(0) %} <span class="tag" title="No outputs have entered the tree yet">empty</span>{% when Some(layers) %} <span class="tag">{{ layers }} layer{% if *layers != 1 %}s{% endif %}</span>{% when None %}{% endmatch %}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
     <p>The root of the tree of spendable outputs that this block commits to.
     An FCMP++ transaction proves that each of its inputs is somewhere in such

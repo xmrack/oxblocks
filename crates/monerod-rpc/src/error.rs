@@ -26,7 +26,7 @@ const MAX_STATUS_CHARS: usize = 64;
 /// `?`: text from the daemon, on its way into an error message and a log
 /// line, where a newline or an escape sequence would forge or garble one.
 #[must_use]
-pub fn printable(raw: &str, max: usize) -> String {
+pub(crate) fn printable(raw: &str, max: usize) -> String {
     raw.chars()
         .take(max)
         .map(|c| if c.is_control() { '?' } else { c })

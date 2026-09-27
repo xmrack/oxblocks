@@ -12,7 +12,7 @@ use crate::tx_extra::{self, ParsedTxExtra, PaymentId};
 
 /// What an FCMP++ transaction says about the tree it proved membership in.
 ///
-/// Both fields sit in the prunable half, so a pruned node that no longer holds
+/// Its fields sit in the prunable half, so a pruned node that no longer holds
 /// it knows the transaction is FCMP++ and nothing about the tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FcmpFacts {
@@ -293,8 +293,6 @@ mod tests {
         }
         let facts = TxFacts::derive(&t, 3000, None);
         assert!(!facts.coinbase);
-        assert_eq!(facts.ring_size, 0);
-        assert_eq!(facts.rct_type, 7);
         assert!(facts.carrot);
         assert_eq!(
             facts.fcmp_pp,

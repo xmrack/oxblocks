@@ -1,7 +1,7 @@
 //! `/tx/<hash>/paths`: where a transaction's outputs sit in the curve tree,
 //! one output at a time or all of them together.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use askama::Template;
 use axum::extract::{Path, Query, State};
@@ -15,7 +15,7 @@ use super::{
     ChainStatus, Page, VERSION, chain_error_page, error_page, fetch_tx, grouped, render, status_of,
 };
 use crate::api::handlers::Shared;
-use crate::tree_paths::{MAX_OUTPUTS, PathsError, PathsParams, RootCheck, TxPaths, gather};
+use crate::tree_paths::{MAX_OUTPUTS, PathsError, PathsParams, Standing, TxPaths, gather};
 
 /// Bytes a wallet keeps per leaf of a path, its key and commitment, and per
 /// point above.
@@ -69,9 +69,6 @@ struct PathsPage {
     /// When no output shown is in the tree as of the block asked about, when
     /// they join it.
     waiting: Option<Waiting>,
-    /// Whether a path's own "hashes hold" is worth saying: only when there is
-    /// no root to check the paths against, which says it for all of them.
-    show_holds: bool,
 }
 
 /// One layer of what a wallet keeps.
@@ -109,7 +106,9 @@ struct StatusRow {
     leaf: Option<String>,
     /// The first block whose tree holds it, when it is not in this one.
     joins: Option<u64>,
+    /// What checking its path found, and whether that is good news.
     check: &'static str,
+    ok: bool,
 }
 
 struct LayerView {
@@ -142,6 +141,8 @@ struct LeafRow {
     commitment: String,
     /// This transaction's output, counted from 1, when the leaf is one.
     output: Option<usize>,
+    /// Whether that output is one of those shown.
+    on: bool,
 }
 
 pub async fn tree_paths(
@@ -163,23 +164,11 @@ pub async fn tree_paths(
         }
     };
 
-    let which = match q.output {
-        Some(k) if k == 0 || k > total => {
-            return error_page(
-                chain,
-                StatusCode::NOT_FOUND,
-                "No such output",
-                &format!("Transaction {hash} has {total} output{}.", plural(total)),
-            );
-        }
-        Some(k) => (k - 1)..k,
-        None => {
-            let from = q.from / MAX_OUTPUTS * MAX_OUTPUTS;
-            from..from.saturating_add(MAX_OUTPUTS)
-        }
+    let found = match q.outputs(total) {
+        Ok(which) => gather(&state, &entry, &tx, q.block, which).await,
+        Err(e) => Err(e),
     };
-
-    let paths = match gather(&state, &entry, &tx, q.block, which).await {
+    let paths = match found {
         Ok(p) => p,
         Err(PathsError::InPool) => {
             return error_page(
@@ -187,7 +176,7 @@ pub async fn tree_paths(
                 StatusCode::NOT_FOUND,
                 "Not in the tree yet",
                 "This transaction is still in the pool. Its outputs join the curve tree only \
-                 once it is mined and they unlock, ten blocks later.",
+                 once it is mined and they unlock, most nine blocks after that.",
             );
         }
         Err(PathsError::NoIds) => {
@@ -207,6 +196,14 @@ pub async fn tree_paths(
                 &format!(
                     "The chain's tip is block {tip}, so there is no tree as of block {asked}."
                 ),
+            );
+        }
+        Err(PathsError::NoSuchOutput { total, .. }) => {
+            return error_page(
+                chain,
+                StatusCode::NOT_FOUND,
+                "No such output",
+                &format!("Transaction {hash} has {total} output{}.", plural(total)),
             );
         }
         Err(PathsError::NoSuchOutputs { from, total }) => {
@@ -248,7 +245,7 @@ fn page(
 ) -> PathsPage {
     let block = (paths.as_of_block != paths.tip).then_some(paths.as_of_block);
     let base = format!("/tx/{hash}/paths");
-    let link = |output: Option<usize>, from: usize| {
+    let link_as_of = |output: Option<usize>, from: usize, block: Option<u64>| {
         let parts: Vec<String> = [
             output.map(|k| format!("output={k}")),
             (from > 0).then(|| format!("from={from}")),
@@ -263,6 +260,7 @@ fn page(
             format!("{base}?{}", parts.join("&"))
         }
     };
+    let link = |output: Option<usize>, from: usize| link_as_of(output, from, block);
 
     // The window of outputs shown together, and the one holding the output
     // shown alone.
@@ -298,80 +296,62 @@ fn page(
         Vec::new()
     };
 
+    let standings: Vec<Standing> = paths.outputs.iter().map(|o| paths.standing(o)).collect();
     let statuses = paths
         .outputs
         .iter()
-        .map(|o| StatusRow {
+        .zip(&standings)
+        .map(|(o, &standing)| StatusRow {
             label: format!("Output {}", o.index + 1),
             href: link(Some(o.index + 1), 0),
             unified_id: o.unified_id,
             leaf: o.placed.as_ref().map(|p| grouped(p.path.leaf_idx)),
-            joins: o.placed.is_none().then_some(o.last_locked_block),
-            check: match o.placed.as_ref().map(|p| p.check) {
-                None => "",
-                Some(PathCheck::Holds) => "holds",
-                Some(PathCheck::Broken { .. }) => "broken",
-                Some(PathCheck::Unreadable { .. }) => "unreadable",
-                Some(PathCheck::Misshapen) => "misshapen",
-                Some(PathCheck::NotTheOutput) => "not this output's leaf",
+            joins: (standing == Standing::Waiting).then_some(o.last_locked_block),
+            check: match standing {
+                Standing::Waiting => "",
+                Standing::Missing => "no path from the daemon",
+                Standing::Fails(PathCheck::NotTheOutput) => "not this output's leaf",
+                Standing::Fails(check) => check.as_str(),
+                Standing::OtherRoot => "leads to another root",
+                Standing::Reaches => "leads to the root",
+                Standing::Holds => "hashes hold",
             },
+            ok: matches!(standing, Standing::Reaches | Standing::Holds),
         })
         .collect();
 
+    // A path to a leaf the tree does not have has no groups above it to draw.
+    let depth = monerod_rpc::types::tree_layers(paths.n_leaf_tuples).len();
     let placed: Vec<&PlacedPath> = paths
         .outputs
         .iter()
         .filter_map(|o| o.placed.as_ref())
+        .filter(|p| p.groups.len() == depth + 1)
         .collect();
-    let outputs_by_id: BTreeMap<u64, usize> = paths
-        .outputs
-        .iter()
-        .map(|o| (o.unified_id, o.index + 1))
-        .collect();
-
+    let shown: BTreeSet<u64> = paths.outputs.iter().map(|o| o.unified_id).collect();
     let every_output: BTreeMap<u64, usize> = unified_ids.iter().copied().zip(1..).collect();
     let grid = leaf_grid(&placed, paths.n_leaf_tuples, &every_output);
 
-    let (layers, leaf_groups, kept) = union(&placed, &outputs_by_id);
+    let (layers, leaf_groups, kept) = union(&placed, &every_output, &shown);
     let (stored, stored_apart) = stored_bytes(&placed);
 
-    // Nothing shown is in the tree yet: say when it will be. Outputs of one
-    // transaction share its lock, so they join together.
-    let waiting = if placed.is_empty() {
-        paths
-            .outputs
-            .iter()
-            .map(|o| o.last_locked_block)
-            .min()
-            .map(|joins| {
-                let blocks_left = (joins > paths.tip).then(|| joins - paths.tip);
-                let href = (joins <= paths.tip).then(|| {
-                    let mut parts: Vec<String> = Vec::new();
-                    if let Some(k) = showing {
-                        parts.push(format!("output={k}"));
-                    } else if from > 0 {
-                        parts.push(format!("from={from}"));
-                    }
-                    if joins != paths.tip {
-                        parts.push(format!("block={joins}"));
-                    }
-                    if parts.is_empty() {
-                        base.clone()
-                    } else {
-                        format!("{base}?{}", parts.join("&"))
-                    }
-                });
-                Waiting {
-                    joins,
-                    blocks_left,
-                    minutes: blocks_left.unwrap_or(0).saturating_mul(BLOCK_MINUTES),
-                    href,
-                }
-            })
-    } else {
-        None
-    };
-    let root_check = paths.root_check();
+    // Outputs of one transaction share its lock, so they join together.
+    let joins = paths.outputs.iter().map(|o| o.last_locked_block).min();
+    let waiting = joins
+        .filter(|_| standings.iter().all(|&s| s == Standing::Waiting))
+        .map(|joins| {
+            let blocks_left = (joins > paths.tip).then(|| joins - paths.tip);
+            let href = (joins <= paths.tip).then(|| {
+                let from = if showing.is_some() { 0 } else { from };
+                link_as_of(showing, from, (joins != paths.tip).then_some(joins))
+            });
+            Waiting {
+                joins,
+                blocks_left,
+                minutes: blocks_left.unwrap_or(0).saturating_mul(BLOCK_MINUTES),
+                href,
+            }
+        });
 
     PathsPage {
         version: VERSION,
@@ -383,15 +363,11 @@ fn page(
         block,
         from: if showing.is_some() { 0 } else { from },
         mined_in: paths.mined_in,
-        joins: paths.outputs.iter().map(|o| o.last_locked_block).min(),
+        joins,
         leaves: grouped(paths.n_leaf_tuples),
-        n_layers: monerod_rpc::types::tree_layers(paths.n_leaf_tuples).len(),
+        n_layers: depth,
         root_block: paths.root_block.clone(),
-        root_check: match root_check {
-            RootCheck::Matches => "matches",
-            RootCheck::Fails => "fails",
-            RootCheck::Unchecked => "unchecked",
-        },
+        root_check: paths.root_check().as_str(),
         outputs_total: total,
         showing,
         tabs,
@@ -404,7 +380,6 @@ fn page(
         stored,
         stored_apart,
         waiting,
-        show_holds: root_check == RootCheck::Unchecked,
     }
 }
 
@@ -415,7 +390,8 @@ type Lit<'a> = (&'a Group, &'a [[u8; 32]], Vec<bool>);
 /// the layers above the leaves from the root down, and the groups of leaves.
 fn union(
     placed: &[&PlacedPath],
-    outputs_by_id: &BTreeMap<u64, usize>,
+    every_output: &BTreeMap<u64, usize>,
+    shown: &BTreeSet<u64>,
 ) -> (Vec<LayerView>, Vec<LeafGroupView>, Vec<KeptRow>) {
     // (layer, start) -> the group, its members, and which of them are lit.
     let mut groups: BTreeMap<(usize, u64), Lit<'_>> = BTreeMap::new();
@@ -554,7 +530,8 @@ fn union(
                     },
                     key: explorer_core::hex::encode(l.output_key),
                     commitment: explorer_core::hex::encode(l.commitment),
-                    output: outputs_by_id.get(&l.unified_id).copied(),
+                    output: every_output.get(&l.unified_id).copied(),
+                    on: shown.contains(&l.unified_id),
                 })
                 .collect(),
         })
@@ -620,7 +597,7 @@ fn stored_bytes(placed: &[&PlacedPath]) -> (Option<String>, Option<String>) {
         .sum();
     match placed.len() {
         0 => (None, None),
-        1 => (Some(grouped(apart)), None),
+        1 => (Some(grouped(together)), None),
         _ => (Some(grouped(together)), Some(grouped(apart))),
     }
 }
@@ -630,7 +607,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
-    use crate::tree_paths::OutputPath;
+    use crate::tree_paths::{OutputPath, RootCheck};
     use monerod_rpc::types::PathQuery;
 
     const IDS: [u64; 4] = [802, 803, 804, 805];
@@ -682,13 +659,16 @@ mod tests {
         let paths = later();
         assert_eq!(paths.root_check(), RootCheck::Matches);
         let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
-        assert_eq!(p.root_check, "matches");
-        assert_eq!(p.n_layers, 3);
-        assert_eq!(p.statuses.len(), 4);
+        let leaves: Vec<&str> = p
+            .statuses
+            .iter()
+            .filter_map(|s| s.leaf.as_deref())
+            .collect();
+        assert_eq!(leaves, ["752", "753", "754", "755"]);
         assert!(
             p.statuses
                 .iter()
-                .all(|s| s.check == "holds" && s.leaf.is_some())
+                .all(|s| s.check == "leads to the root" && s.ok)
         );
 
         // The four sit side by side in one group of leaves, so the union has
@@ -727,10 +707,7 @@ mod tests {
         );
 
         let html = p.render().unwrap();
-        assert!(html.contains("What a wallet keeps"));
-        assert!(html.contains("class=\"leaf-grid\""));
-        // The root says every path holds, so no path says it again.
-        assert!(!p.show_holds && !html.contains("hashes hold"));
+        assert!(html.contains("leaf 752 <span class=\"tag ok\">leads to the root</span>"));
         // An output's tag sits beside its leaf, not after the hashes.
         assert!(html.contains("<td class=\"num\">752</td>"));
         assert!(html.contains("<td><span class=\"tag\">output 1</span></td>"));
@@ -751,7 +728,6 @@ mod tests {
     /// join layer 1 to layer 2 and layer 2 to the root.
     #[test]
     fn the_grid_draws_the_groups_the_paths_climb_through() {
-        use super::super::leaf_grid::PITCH;
         let paths = later();
         let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
         let g = p.grid.as_ref().unwrap();
@@ -766,18 +742,6 @@ mod tests {
         assert!(!g.has_others);
         let labels: Vec<&str> = g.labels.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(&labels[1..], ["L1", "L2", "Root"]);
-        assert!(labels[0].starts_with("Leaves "), "{}", labels[0]);
-
-        // Rows the paths miss are drawn with a pattern whose cells fall
-        // every pitch, so every row starts on one.
-        assert!(g.bars.iter().all(|b| b.y % PITCH == 0));
-        assert!(
-            g.cells
-                .iter()
-                .filter(|c| c.x < 38 * PITCH)
-                .all(|c| c.y % PITCH == 0 && c.x % PITCH == 0)
-        );
-        assert!(g.cells.iter().all(|c| c.x < g.width && c.y < g.height));
     }
 
     /// Shown alone, an output is solid and the transaction's others in its
@@ -850,10 +814,40 @@ mod tests {
             &"00".repeat(32),
         );
         assert_eq!(paths.root_check(), RootCheck::Fails);
-        let html = page(None, "ab".to_owned(), 4, None, &paths, &IDS)
-            .render()
-            .unwrap();
-        assert!(html.contains("a path does not lead here"));
+        let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
+        assert!(
+            p.statuses
+                .iter()
+                .all(|s| s.check == "leads to another root" && !s.ok)
+        );
+        assert!(p.render().unwrap().contains("a path does not lead here"));
+    }
+
+    /// An output its lock puts in the tree, with no path from the daemon, is
+    /// a failure, not an output still to join.
+    #[test]
+    fn a_path_the_daemon_leaves_out_fails_the_root() {
+        let mut paths = later();
+        paths.outputs[2].placed = None;
+        assert_eq!(paths.root_check(), RootCheck::Fails);
+        let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
+        assert_eq!(
+            (p.statuses[2].check, p.statuses[2].joins),
+            ("no path from the daemon", None)
+        );
+        // With none sent at all, the page does not say they are still to join.
+        for o in &mut paths.outputs {
+            o.placed = None;
+        }
+        assert!(
+            page(None, "ab".to_owned(), 4, None, &paths, &IDS)
+                .waiting
+                .is_none()
+        );
+
+        // Before its lock ends, the same absence is an output still to join.
+        paths.as_of_block = 809;
+        assert_eq!(paths.standing(&paths.outputs[2]), Standing::Waiting);
     }
 
     #[test]

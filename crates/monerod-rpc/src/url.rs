@@ -93,15 +93,14 @@ impl BaseUrl {
     }
 }
 
-/// `raw` as an error may show it: any credentials in its authority are
-/// replaced, since the refusal of them is carried in the error.
+/// `raw` as an error may show it: everything before its last `@` is replaced,
+/// since a refused URL's authority cannot be told apart from its path, and a
+/// password may hold any of `/?#`.
 pub(crate) fn shown(raw: &str) -> String {
     let (scheme, rest) = raw.split_once("://").map_or(("", raw), |(s, r)| (s, r));
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    match authority.rsplit_once('@') {
-        Some((_, host)) if scheme.is_empty() => format!("<credentials>@{host}{tail}"),
-        Some((_, host)) => format!("{scheme}://<credentials>@{host}{tail}"),
+    match rest.rsplit_once('@') {
+        Some((_, host)) if scheme.is_empty() => format!("<credentials>@{host}"),
+        Some((_, host)) => format!("{scheme}://<credentials>@{host}"),
         None => raw.to_owned(),
     }
 }
@@ -128,7 +127,10 @@ mod tests {
             "http://<credentials>@h:1/mon"
         );
         assert_eq!(shown("user@h:1"), "<credentials>@h:1");
-        assert_eq!(shown("http://h:1/a@b"), "http://h:1/a@b");
+        assert_eq!(
+            shown("http://u:p#s/x@h:1/mon"),
+            "http://<credentials>@h:1/mon"
+        );
     }
 
     #[test]

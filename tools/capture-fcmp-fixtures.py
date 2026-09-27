@@ -196,7 +196,6 @@ def main():
         print(f"  get_path_by_unified_id_{name}.bin  {len(body):>9,} bytes"
               f"  (as of block {reference}, probe {probe})")
     write("get_info", rpc(d, "get_info"))
-    write("get_version", rpc(d, "get_version"))
     write("get_fee_estimate", rpc(d, "get_fee_estimate"))
 
 

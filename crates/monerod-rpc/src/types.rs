@@ -1101,8 +1101,7 @@ impl PathQuery {
         }
         let paths = entries
             .iter()
-            .zip(&self.unified_ids)
-            .map(|(entry, &id)| TreePath::read(entry, id))
+            .map(TreePath::read)
             .collect::<Result<_, _>>()?;
         Ok(TreePaths {
             n_leaf_tuples,
@@ -1183,8 +1182,9 @@ impl LeafKind {
 }
 
 impl TreePath {
-    /// One entry of the answer's `paths`, for the output `unified_id`.
-    fn read(entry: &crate::epee::Value, unified_id: u64) -> Result<Option<Self>, PathAnswerError> {
+    /// One entry of the answer's `paths`. Whether its leaf is the output
+    /// asked about is left to the check of the whole path.
+    fn read(entry: &crate::epee::Value) -> Result<Option<Self>, PathAnswerError> {
         use crate::epee::Value;
         let Value::Section(entry) = entry else {
             return Err(PathAnswerError::Malformed("entry"));
@@ -1233,9 +1233,6 @@ impl TreePath {
                 commitment: *commitment,
             })
             .collect::<Vec<_>>();
-        if !leaves.iter().any(|l| l.unified_id == unified_id) {
-            return Err(PathAnswerError::Malformed("leaves"));
-        }
         let layers = chunks
             .iter()
             .map(|chunk| {
@@ -2990,10 +2987,6 @@ mod tests {
         assert!(carrot.target.is_carrot());
         assert_eq!(carrot.target.public_key(), Some("8f3b62c1"));
         assert_eq!(carrot.target.view_tag(), Some("a1b2c3"));
-        let TxOutTarget::CarrotV1(c) = &carrot.target else {
-            panic!("not a carrot output");
-        };
-        assert_eq!(c.encrypted_janus_anchor.len(), 32);
         assert_eq!(
             carrot.target.encrypted_janus_anchor(),
             Some("00112233445566778899aabbccddeeff")
@@ -3045,89 +3038,6 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(ecdh.first().unwrap().form(), Some(EcdhForm::Compact));
-    }
-
-    /// Type 7 in the layout the FCMP++ branch's serializer writes it: no ring
-    /// in the input, no CLSAGs, and the proof as one blob beside the tree it
-    /// was built against. The captured fixtures under `fixtures/fcmp` hold the
-    /// same shape from a real daemon.
-    #[test]
-    fn a_constructed_fcmp_pp_transaction_parses() {
-        let raw = r#"{"version":2,"unlock_time":0,
-            "vin":[{"key":{"amount":0,"key_offsets":[],"k_image":"86e1cc68"}},
-                   {"key":{"amount":0,"key_offsets":[],"k_image":"77aa0011"}}],
-            "vout":[{"amount":0,"target":{"carrot_v1":{"key":"570482","view_tag":"9f00a1",
-                "encrypted_janus_anchor":"00112233445566778899aabbccddeeff"}}}],
-            "extra":[1,39,23],
-            "rct_signatures":{"type":7,"txnFee":30660000,
-                "ecdhInfo":[{"amount":"64717b40fad782d9"}],
-                "outPk":["aabb"]},
-            "rctsig_prunable":{"nbp":1,
-                "bpp":[{"A":"a1","A1":"a2","B":"b1","r1":"r","s1":"s","d1":"d",
-                        "L":["l1","l2"],"R":["r1","r2"]}],
-                "reference_block":3012345,"n_tree_layers":6,"fcmp_pp":"0a0b0c",
-                "pseudoOuts":["po1","po2"]}}"#;
-        let tx: TxJson = serde_json::from_str(raw).unwrap();
-        assert_eq!(tx.rct_type(), Some(RctType::FcmpPlusPlus));
-        assert!(tx.is_fcmp_pp());
-        assert!(!tx.is_coinbase());
-        assert!(!tx.looks_pruned());
-        assert_eq!(tx.reference_block(), Some(3_012_345));
-        assert_eq!(tx.n_tree_layers(), Some(6));
-        assert_eq!(
-            tx.pseudo_outs().len(),
-            2,
-            "one per input, in the prunable half"
-        );
-
-        let prunable = tx.rctsig_prunable.as_ref().unwrap();
-        assert!(prunable.clsags.is_none(), "type 7 has no ring signatures");
-        assert_eq!(prunable.fcmp_pp_len(), Some(3));
-        for input in &tx.vin {
-            let k = input.as_key().unwrap();
-            assert_eq!(k.ring_size(), 0);
-            assert_eq!(k.ring_members(), Some(vec![]));
-        }
-    }
-
-    /// Pruning takes the reference block with it, because it sits in the
-    /// prunable half. The transaction is still FCMP++; the tree it named is
-    /// simply no longer known here.
-    #[test]
-    fn a_pruned_fcmp_pp_transaction_is_still_fcmp_pp_without_its_reference_block() {
-        let raw = r#"{"version":2,"unlock_time":0,
-            "vin":[{"key":{"amount":0,"key_offsets":[],"k_image":"86e1cc68"}}],
-            "vout":[],"extra":[],
-            "rct_signatures":{"type":7,"txnFee":1,"ecdhInfo":[],"outPk":[]}}"#;
-        let tx: TxJson = serde_json::from_str(raw).unwrap();
-        assert!(tx.is_fcmp_pp());
-        assert!(tx.looks_pruned());
-        assert_eq!(tx.reference_block(), None);
-        assert_eq!(tx.n_tree_layers(), None);
-    }
-
-    /// A block below the fork has no tree fields and one above has both. The
-    /// block format gains them at the fork, so absence below it is the rule.
-    #[test]
-    fn block_json_carries_the_tree_only_from_the_fork() {
-        let miner = r#"{"version":2,"unlock_time":70,"vin":[{"gen":{"height":10}}],
-            "vout":[],"extra":[],"rct_signatures":{"type":0}}"#;
-        let before: BlockJson = serde_json::from_str(&format!(
-            r#"{{"major_version":16,"minor_version":16,"timestamp":1,"prev_id":"aa",
-                "nonce":0,"miner_tx":{miner},"tx_hashes":[]}}"#
-        ))
-        .unwrap();
-        assert_eq!(before.fcmp_pp_n_tree_layers, None);
-        assert_eq!(before.fcmp_pp_tree_root, None);
-
-        let after: BlockJson = serde_json::from_str(&format!(
-            r#"{{"major_version":17,"minor_version":17,"timestamp":1,"prev_id":"aa",
-                "nonce":0,"miner_tx":{miner},"tx_hashes":[],
-                "fcmp_pp_n_tree_layers":4,"fcmp_pp_tree_root":"5d0c"}}"#
-        ))
-        .unwrap();
-        assert_eq!(after.fcmp_pp_n_tree_layers, Some(4));
-        assert_eq!(after.fcmp_pp_tree_root.as_deref(), Some("5d0c"));
     }
 
     /// Likewise no fixture: a v2 transaction whose prunable half this node

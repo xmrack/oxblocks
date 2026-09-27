@@ -22,9 +22,9 @@ its leaves up.</p>
 {% if root_check == "fails" %} <span class="tag bad">a path does not lead here</span>{% endif %}</dd>{% endif %}
 </dl>
 {% if root_check == "fails" %}
-<div class="notice">A path from the daemon does not hash up to its root. The
-groups are shown as the daemon sent them; the outputs listed as failing are
-the ones whose hashes do not hold.</div>
+<div class="notice">Not every output's path from the daemon leads to the root
+this block records. The groups are shown as the daemon sent them, and the
+outputs marked below are the ones whose paths do not.</div>
 {% endif %}
 <form class="as-of" method="get" action="/tx/{{ hash }}/paths">
 {% if let Some(k) = showing %}<input type="hidden" name="output" value="{{ k }}">{% endif %}{% if from > 0 %}<input type="hidden" name="from" value="{{ from }}">{% endif %}
@@ -34,7 +34,7 @@ the ones whose hashes do not hold.</div>
 </div>
 
 
-{% if !windows.is_empty() %}<nav class="tabs" aria-label="Outputs, fifty at a time">{% for w in windows %}<a href="{{ w.href }}"{% if w.on %} class="on" aria-current="page"{% endif %}>{{ w.label }}</a>{% endfor %}</nav>{% endif %}
+{% if !windows.is_empty() %}<nav class="tabs" aria-label="Outputs, {{ crate::tree_paths::MAX_OUTPUTS }} at a time">{% for w in windows %}<a href="{{ w.href }}"{% if w.on %} class="on" aria-current="page"{% endif %}>{{ w.label }}</a>{% endfor %}</nav>{% endif %}
 <nav class="tabs" aria-label="Which paths">{% for t in tabs %}<a href="{{ t.href }}"{% if t.on %} class="on" aria-current="page"{% endif %}>{{ t.label }}</a>{% endfor %}</nav>
 
 {% if let Some(w) = waiting %}
@@ -81,7 +81,7 @@ unlock time of its own at the block that time names.</p>
   <tr>
     <td>{% if showing.is_some() %}{{ s.label }}{% else %}<a href="{{ s.href }}">{{ s.label }}</a>{% endif %}</td>
     <td class="num">{{ s.unified_id }}</td>
-    <td>{% if let Some(leaf) = s.leaf %}leaf {{ leaf }}{% if s.check != "holds" %} <span class="tag bad">{{ s.check }}</span>{% else if show_holds %} <span class="tag ok">hashes hold</span>{% endif %}{% else if let Some(b) = s.joins %}joins as of block {{ b }}{% endif %}</td>
+    <td>{% if let Some(leaf) = s.leaf %}leaf {{ leaf }} {% else if let Some(b) = s.joins %}joins as of block {{ b }}{% endif %}{% if !s.check.is_empty() %}<span class="tag {% if s.ok %}ok{% else %}bad{% endif %}">{{ s.check }}</span>{% endif %}</td>
   </tr>
   {% endfor %}
   </tbody>
@@ -138,7 +138,7 @@ Kept path by path, the same paths come to {{ apart }} bytes: they share groups.{
   <thead><tr><th class="num">Leaf</th><th class="num">Unified ID</th><th>Output</th><th>Kind</th><th>Key and commitment</th></tr></thead>
   <tbody>
   {% for r in g.rows %}
-  <tr{% if r.output.is_some() %} class="on"{% endif %}>
+  <tr{% if r.on %} class="on"{% endif %}>
     <td class="num">{{ r.position }}</td>
     <td class="num">{{ r.unified_id }}</td>
     <td>{% if let Some(k) = r.output %}<span class="tag">output {{ k }}</span>{% endif %}</td>

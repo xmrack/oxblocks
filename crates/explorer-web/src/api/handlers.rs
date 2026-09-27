@@ -231,8 +231,8 @@ pub async fn transaction_paths(
     Path(raw): Path<String>,
     axum::extract::Query(q): axum::extract::Query<crate::tree_paths::PathsParams>,
 ) -> Result<ApiOk<PathsData>, ApiError> {
-    use crate::tree_paths::{MAX_OUTPUTS, PathsError, RootCheck, gather};
-    use explorer_core::curve_tree::{Curve, PathCheck};
+    use crate::tree_paths::{PathsError, gather};
+    use explorer_core::curve_tree::Curve;
     use monerod_rpc::types::LeafKind;
 
     let q = q.read().map_err(ApiError::bad_request)?;
@@ -241,25 +241,26 @@ pub async fn transaction_paths(
     let entry = &entry;
     let tx = decode_tx(&hash, entry)?;
 
-    let which = match q.output {
-        Some(k) => k.saturating_sub(1)..k,
-        None => q.from..q.from.saturating_add(MAX_OUTPUTS),
-    };
-    let paths = gather(&state, entry, &tx, q.block, which)
-        .await
-        .map_err(|e| match e {
-            PathsError::InPool => {
-                ApiError::not_found(format!("Tx {hash} is in the pool, so not in the tree"))
-            }
-            PathsError::NoIds => ApiError::unsupported("The daemon has no curve tree".to_owned()),
-            PathsError::Ahead { asked, tip } => {
-                ApiError::not_found(format!("Block {asked} is past the tip, {tip}"))
-            }
-            PathsError::NoSuchOutputs { from, total } => {
-                ApiError::not_found(format!("Tx {hash} has {total} outputs, none from {from}"))
-            }
-            PathsError::Chain(e) => on_chain_error(&e, &format!("Cant get paths of tx: {hash}")),
-        })?;
+    let paths = match q.outputs(tx.vout.len()) {
+        Ok(which) => gather(&state, entry, &tx, q.block, which).await,
+        Err(e) => Err(e),
+    }
+    .map_err(|e| match e {
+        PathsError::InPool => {
+            ApiError::not_found(format!("Tx {hash} is in the pool, so not in the tree"))
+        }
+        PathsError::NoIds => ApiError::unsupported("The daemon has no curve tree".to_owned()),
+        PathsError::Ahead { asked, tip } => {
+            ApiError::not_found(format!("Block {asked} is past the tip, {tip}"))
+        }
+        PathsError::NoSuchOutput { asked, total } => {
+            ApiError::not_found(format!("Tx {hash} has {total} outputs, not output {asked}"))
+        }
+        PathsError::NoSuchOutputs { from, total } => {
+            ApiError::not_found(format!("Tx {hash} has {total} outputs, none from {from}"))
+        }
+        PathsError::Chain(e) => on_chain_error(&e, &format!("Cant get paths of tx: {hash}")),
+    })?;
 
     let outputs = paths
         .outputs
@@ -271,13 +272,7 @@ pub async fn transaction_paths(
                 unified_id: o.unified_id,
                 last_locked_block: o.last_locked_block,
                 leaf_idx: placed.map(|p| p.path.leaf_idx),
-                check: placed.map(|p| match p.check {
-                    PathCheck::Holds => "holds",
-                    PathCheck::Broken { .. } => "broken",
-                    PathCheck::Unreadable { .. } => "unreadable",
-                    PathCheck::Misshapen => "misshapen",
-                    PathCheck::NotTheOutput => "not_the_output",
-                }),
+                check: placed.map(|p| p.check.as_str()),
                 groups: placed
                     .map(|p| {
                         p.groups
@@ -327,11 +322,7 @@ pub async fn transaction_paths(
         n_layers: monerod_rpc::types::tree_layers(paths.n_leaf_tuples).len(),
         root_block: paths.root_block.as_ref().map(|(b, _)| *b),
         root: paths.root_block.as_ref().map(|(_, r)| r.clone()),
-        root_check: match paths.root_check() {
-            RootCheck::Matches => "matches",
-            RootCheck::Fails => "fails",
-            RootCheck::Unchecked => "unchecked",
-        },
+        root_check: paths.root_check().as_str(),
         outputs,
     }))
 }
@@ -1199,14 +1190,8 @@ pub async fn transaction_private(
 /// range served before costs little more than its header call and its
 /// transactions.
 ///
-/// **What it does not bound is bytes.** A hundred blocks is roughly ten
-/// thousand mainnet transactions, and every one of them is fetched whole
-/// before any of them is summarised. Measured against a mainnet daemon: one
-/// such request takes about 10 seconds and holds about 40 MiB, and four at
-/// once held 172 MiB. That number multiplies by `--max-concurrent`, whose
-/// default of 128 would want some five gigabytes — far past the 512 MiB the
-/// shipped systemd unit allows. An operator serving mainnet should size those
-/// two against each other; see `deploy/oxblocks.service`.
+/// The bytes ranges hold together are bounded by `RANGE_KIB` in
+/// explorer-core; see `deploy/oxblocks.service`.
 pub async fn blocks_range(
     State(state): Shared,
     Path((start_raw, end_raw)): Path<(String, String)>,
@@ -1242,8 +1227,9 @@ pub async fn blocks_range(
         .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
 
     // `height` counts blocks, so the tip is `height - 1`. The cached info can
-    // trail a block that was just mined, so check a fresh one before refusing.
-    if end >= info.height {
+    // trail a block that was just mined, so check a fresh one before refusing
+    // the block after the tip.
+    if end == info.height {
         info = state
             .chain
             .fresh_info()
@@ -1338,7 +1324,8 @@ pub async fn transactions_recent(State(state): Shared) -> Result<ApiOk<RecentDat
     let window = state
         .chain
         .blocks_in_range(from_height, to_height, false)
-        .await;
+        .await
+        .map_err(|e| on_chain_error(&e, "Cant get recent blocks"))?;
 
     // The pool is listed first: those are more recent than any mined
     // transaction, and a caller reaching for this endpoint is reaching for a
@@ -1355,10 +1342,8 @@ pub async fn transactions_recent(State(state): Shared) -> Result<ApiOk<RecentDat
     }
     drop(pool);
 
-    if let Ok(window) = window {
-        for block in &window {
-            push_unexpanded(&mut txs, &block.txs, info.height);
-        }
+    for block in &window {
+        push_unexpanded(&mut txs, &block.txs, info.height);
     }
 
     Ok(ApiOk(RecentData {
