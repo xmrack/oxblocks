@@ -419,12 +419,35 @@ pub struct FeeEstimate {
     pub top_hash: String,
 }
 
+/// The hard fork that widens a wallet's fee estimate to 1000 grace blocks
+/// (monerod's `HF_VERSION_2026_SCALING`).
+pub const HF_VERSION_2026_SCALING: u8 = 17;
+
+/// The grace window wallet2 asks a fee estimate for at hard fork `hf`, its
+/// `FEE_ESTIMATE_GRACE_BLOCKS_2021` and `_2026`. Another window gives another
+/// fee from the one wallets pay, and monerod logs it as a possible wallet
+/// fingerprint.
+#[must_use]
+pub const fn wallet_grace_blocks(hf: u8) -> u64 {
+    if hf >= HF_VERSION_2026_SCALING {
+        1000
+    } else {
+        10
+    }
+}
+
+/// The widest grace window the daemon is asked for. monerod loops once per
+/// grace block with its chain lock held, so a window of `u64::MAX` stops the
+/// node.
+pub const MAX_GRACE_BLOCKS: u64 = 1000;
+
 /// One alternative chain. `difficulty` here is the **cumulative** difficulty of
 /// the alt chain's tip, not the per-block difficulty.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChainInfo {
     pub block_hash: String,
-    /// Height of the chain's first block.
+    /// Height of the chain's tip, the block `block_hash` names. Its first
+    /// block is `length - 1` below.
     pub height: u64,
     /// Number of blocks in the chain.
     pub length: u64,
@@ -3594,5 +3617,160 @@ mod tests {
             matches!(info.parse_json(), Err(NestedJsonError::Absent)),
             "an undecoded pool entry is absent, not malformed"
         );
+    }
+
+    /// Every way a path answer can be malformed is refused, not read short:
+    /// each case is the captured answer as of block 814 with one thing
+    /// wrong.
+    #[test]
+    fn a_malformed_path_answer_is_refused() {
+        use crate::epee::{Root, Value, encode_root, read_root};
+
+        const IDS: [u64; 4] = [802, 803, 804, 805];
+        let bin = include_bytes!("../../../fixtures/fcmp/paths/get_path_by_unified_id_later.bin");
+        let answer = read_root(bin, PathQuery::WANTED).unwrap();
+
+        /// `root` with `name` given `f` of its value, and left out where `f`
+        /// gives nothing.
+        fn with(root: &Root, name: &str, f: impl Fn(&Value) -> Option<Value>) -> Root {
+            Root::new(
+                root.entries()
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if k == name {
+                            f(v).map(|v| (k.clone(), v))
+                        } else {
+                            Some((k.clone(), v.clone()))
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        fn section(v: &Value) -> &Root {
+            let Value::Section(s) = v else {
+                panic!("a section")
+            };
+            s
+        }
+        // The answer with its first path's `path` section given `f`.
+        let first_path = |f: &dyn Fn(&Root) -> Root| -> Root {
+            with(&answer, "paths", |v| {
+                let Value::Array(paths) = v else {
+                    panic!("paths")
+                };
+                let mut paths = paths.clone();
+                paths[0] = Value::Section(with(section(&paths[0]), "path", |p| {
+                    Some(Value::Section(f(section(p))))
+                }));
+                Some(Value::Array(paths))
+            })
+        };
+        let leaves = |name: &'static str, f: fn(&mut Vec<u8>)| {
+            first_path(&move |p: &Root| {
+                with(p, "leaves", |l| {
+                    Some(Value::Section(with(section(l), name, |b| {
+                        let Value::Bytes(b) = b else { panic!("bytes") };
+                        let mut b = b.clone();
+                        f(&mut b);
+                        Some(Value::Bytes(b))
+                    })))
+                })
+            })
+        };
+        let chunk = |f: fn(&mut Vec<u8>)| {
+            first_path(&move |p: &Root| {
+                with(p, "layer_chunks", |c| {
+                    let Value::Array(chunks) = c else {
+                        panic!("chunks")
+                    };
+                    let mut chunks = chunks.clone();
+                    chunks[0] = Value::Section(with(section(&chunks[0]), "elems", |e| {
+                        let Value::Bytes(e) = e else { panic!("elems") };
+                        let mut e = e.clone();
+                        f(&mut e);
+                        Some(Value::Bytes(e))
+                    }));
+                    Some(Value::Array(chunks))
+                })
+            })
+        };
+        let read = |root: &Root, ids: &[u64]| {
+            let bytes = encode_root(root).unwrap();
+            PathQuery::as_of_block(814, ids)
+                .unwrap()
+                .answer(&read_root(&bytes, PathQuery::WANTED).unwrap())
+        };
+
+        // Unchanged, it reads, re-encoded as it is.
+        assert_eq!(read(&answer, &IDS).unwrap().paths.len(), 4);
+
+        let malformed = PathAnswerError::Malformed;
+        for (what, root, why) in [
+            (
+                "an id short",
+                leaves("unified_ids", |b| b.truncate(b.len() - 1)),
+                malformed("leaves"),
+            ),
+            (
+                "a key short",
+                leaves("output_pubkeys", |b| b.truncate(b.len() - 1)),
+                malformed("leaves"),
+            ),
+            (
+                "a commitment short",
+                leaves("commitments", |b| b.truncate(b.len() - 1)),
+                malformed("leaves"),
+            ),
+            (
+                "a type too many",
+                leaves("output_types", |b| b.push(0)),
+                malformed("leaves"),
+            ),
+            (
+                "an empty chunk",
+                chunk(Vec::clear),
+                malformed("layer_chunks"),
+            ),
+            (
+                "a byte past a point",
+                chunk(|e| e.push(0)),
+                malformed("layer_chunks"),
+            ),
+            (
+                "no layers",
+                first_path(&|p: &Root| with(p, "layer_chunks", |_| None)),
+                malformed("layer_chunks"),
+            ),
+            (
+                "layers with no leaves",
+                first_path(&|p: &Root| {
+                    with(p, "leaves", |_| Some(Value::Section(Root::default())))
+                }),
+                malformed("leaves"),
+            ),
+            (
+                "no n_leaf_tuples",
+                with(&answer, "n_leaf_tuples", |_| None),
+                PathAnswerError::Missing("n_leaf_tuples"),
+            ),
+        ] {
+            assert_eq!(read(&root, &IDS), Err(why), "{what}");
+        }
+        // Paths that are not sections.
+        let not_a_section = with(&answer, "paths", |_| {
+            Some(Value::Array(vec![Value::Unsigned(1); 4]))
+        });
+        assert_eq!(read(&not_a_section, &IDS), Err(malformed("entry")));
+
+        // As many paths as ids, neither more nor fewer.
+        for ids in [&IDS[..3], &[802, 803, 804, 805, 806][..]] {
+            assert_eq!(
+                read(&answer, ids),
+                Err(PathAnswerError::Count {
+                    asked: ids.len(),
+                    answered: 4
+                })
+            );
+        }
     }
 }

@@ -3,11 +3,21 @@
 {% block title %}Block {{ height }} &mdash; oxblocks{% endblock %}
 {% block content %}
 <h1>Block {{ height }}<span class="sub">{{ timestamp_utc }} UTC</span></h1>
+{% if orphan %}
+<div class="notice">This block is not on the main chain. Another block at
+height {{ height }} won, and this one's transactions count only where that
+block's do too.</div>
+{% endif %}
+{% if unreadable > 0 %}
+<div class="notice">{{ unreadable }} of this block's transactions could not
+be read, so {% if unreadable == 1 %}it is{% else %}they are{% endif %} not
+listed below.</div>
+{% endif %}
 
 <dl class="kv">
   <dt>Hash</dt><dd class="hash">{{ hash }}</dd>
   <dt>Previous</dt><dd><a class="hash" href="/block/{{ prev_hash }}">{{ prev_hash }}</a></dd>
-  <dt>Height</dt><dd>{{ height }}{% if depth > 0 %} <span class="tag">{{ depth }} deep</span>{% endif %}</dd>
+  <dt>Height</dt><dd>{{ height }}{% if orphan %} <span class="tag bad">orphaned</span>{% else if depth > 0 %} <span class="tag">{{ depth }} deep</span>{% endif %}</dd>
   <dt>Timestamp</dt><dd>{{ timestamp }} &mdash; {{ timestamp_utc }} UTC <span class="tag">{{ age }} ago</span></dd>
   <dt>Size</dt><dd>{{ size }} bytes{% if weight != size %} <span class="tag">weight {{ weight }}</span>{% endif %}</dd>
   <dt>Transactions</dt><dd>{{ tx_count }}</dd>
@@ -76,7 +86,7 @@
 </div>
 
 <div class="pager">
-  {% if height > 0 %}<a href="/block/{{ height - 1 }}">&larr; {{ height - 1 }}</a>{% else %}<span>&larr;</span>{% endif %}
-  {% if depth > 0 %}<a href="/block/{{ height + 1 }}">{{ height + 1 }} &rarr;</a>{% else %}<span>&rarr;</span>{% endif %}
+  {% if orphan && height > 0 %}<a href="/block/{{ prev_hash }}">&larr; {{ height - 1 }}</a>{% else if height > 0 %}<a href="/block/{{ height - 1 }}">&larr; {{ height - 1 }}</a>{% else %}<span>&larr;</span>{% endif %}
+  {% if depth > 0 && !orphan %}<a href="/block/{{ height + 1 }}">{{ height + 1 }} &rarr;</a>{% else %}<span>&rarr;</span>{% endif %}
 </div>
 {% endblock %}

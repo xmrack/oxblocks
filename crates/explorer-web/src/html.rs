@@ -16,7 +16,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use explorer_core::fmt::{age, decimal, now, timestamp_utc};
 use explorer_core::{Amount, BlockId, BlockTree, ChainError, Hash32, TxFacts};
-use monerod_rpc::types::{TxEntry, TxJson};
+use monerod_rpc::types::{PoolTxInfo, TxEntry, TxJson};
 
 use crate::api::handlers::{AppState, Shared, echo};
 use crate::config::Theme;
@@ -80,10 +80,15 @@ struct BlockPage {
     age: String,
     size: u64,
     weight: u64,
-    /// Every transaction rendered in the table below, coinbase included.
-    /// Agrees with the index row's `total_tx_count(num_txes)` because every
-    /// valid block carries exactly one coinbase.
+    /// Every transaction in the block, coinbase included: the rows below and
+    /// the unreadable ones. Agrees with the index row's
+    /// `total_tx_count(num_txes)` because every valid block carries exactly
+    /// one coinbase.
     tx_count: usize,
+    /// Transactions the daemon sent that did not decode, so have no row.
+    unreadable: usize,
+    /// Not on the main chain: reached by its hash, an alternative block.
+    orphan: bool,
     reward: String,
     difficulty: String,
     nonce: u32,
@@ -699,15 +704,22 @@ struct MempoolPage {
     waiting_sort: ColumnSort,
     fee_sort: ColumnSort,
     size_sort: ColumnSort,
+    /// Every transaction in the pool, of which `txs` are the first.
+    total: usize,
+    /// Whether the pool is longer than the page shows.
+    cut: bool,
     txs: Vec<PoolRow>,
 }
+
+/// The most rows the mempool page shows: as many as `/api/mempool` sends at
+/// once.
+#[allow(clippy::cast_possible_truncation, reason = "500 fits any usize")]
+const MEMPOOL_ROWS: usize = crate::api::handlers::MAX_MEMPOOL_LIMIT as usize;
 
 struct PoolRow {
     hash: String,
     age: String,
-    waiting_secs: u64,
     fee: String,
-    fee_atomic: u64,
     ring: usize,
     full_chain: bool,
     size: u64,
@@ -743,11 +755,13 @@ impl SortKey {
         }
     }
 
-    fn of(self, row: &PoolRow) -> u64 {
+    /// What a pool transaction sorts by, as the daemon states it: the same
+    /// numbers its row shows.
+    fn of(self, t: &PoolTxInfo, asked_at: u64) -> u64 {
         match self {
-            Self::Waiting => row.waiting_secs,
-            Self::Fee => row.fee_atomic,
-            Self::Size => row.size,
+            Self::Waiting => waiting_secs(asked_at, t.receive_time),
+            Self::Fee => t.fee,
+            Self::Size => t.blob_size,
         }
     }
 }
@@ -836,8 +850,35 @@ fn sort_rows<T>(rows: &mut [T], dir: SortDir, value: impl Fn(&T) -> u64) {
     });
 }
 
-fn sort_pool_rows(rows: &mut [PoolRow], key: SortKey, dir: SortDir) {
-    sort_rows(rows, dir, |r| key.of(r));
+/// The mempool page's rows: the pool sorted as asked, and cut to
+/// [`MEMPOOL_ROWS`] before any transaction is decoded, so a pool of
+/// thousands costs the rows shown. A transaction that does not decode has no
+/// row.
+fn pool_rows(
+    pool: &[PoolTxInfo],
+    active: Option<(SortKey, SortDir)>,
+    asked_at: u64,
+) -> Vec<PoolRow> {
+    let mut listed: Vec<&PoolTxInfo> = pool.iter().collect();
+    if let Some((key, dir)) = active {
+        sort_rows(&mut listed, dir, |t| key.of(t, asked_at));
+    }
+    listed
+        .into_iter()
+        .take(MEMPOOL_ROWS)
+        .filter_map(|t| {
+            let tx = t.parse_json().ok()?;
+            let f = TxFacts::from_pool(t, &tx);
+            Some(PoolRow {
+                hash: t.id_hash.to_lowercase(),
+                age: age(asked_at, t.receive_time),
+                fee: xmr_aligned(f.fee),
+                ring: f.ring_size,
+                full_chain: f.fcmp_pp.is_some(),
+                size: f.size,
+            })
+        })
+        .collect()
 }
 
 /// Orders a block's rows. A block has no `Waiting` column, so that key is
@@ -861,14 +902,26 @@ struct AltBlocksPage {
 }
 
 struct AltChainRow {
-    /// The chain's **first** block -- where it diverged -- not its tip.
-    /// monerod names this `height`, which reads like a tip and is not one.
-    height: u64,
+    /// The height of the chain's first block, where it diverged.
+    diverged: u64,
     length: u64,
     tip: u64,
     block_hash: String,
     difficulty: String,
     parent: String,
+}
+
+/// An alternative chain as the page shows it. monerod's `height` is the
+/// tip's, and the chain runs `length` blocks down to where it diverged.
+fn alt_chain_row(c: &monerod_rpc::types::ChainInfo) -> AltChainRow {
+    AltChainRow {
+        diverged: c.height.saturating_add(1).saturating_sub(c.length),
+        length: c.length,
+        tip: c.height,
+        block_hash: c.block_hash.to_lowercase(),
+        difficulty: c.cumulative_difficulty().to_string(),
+        parent: c.main_chain_parent_block.to_lowercase(),
+    }
 }
 
 /// The JSON API's own documentation.
@@ -1250,17 +1303,7 @@ pub async fn block(
     };
 
     let header = got.block_header.clone();
-    let mut hashes: Vec<Hash32> = Vec::new();
-    if let Ok(h) = header.miner_tx_hash.parse::<Hash32>() {
-        hashes.push(h);
-    }
-    for h in &got.tx_hashes {
-        if let Ok(h) = h.parse::<Hash32>() {
-            hashes.push(h);
-        }
-    }
-
-    let fetched = match state.chain.transactions(&hashes).await {
+    let (fetched, _held) = match state.chain.block_transactions(&got).await {
         Ok(f) => f,
         // Rendering the header on its own would show a block that holds
         // transactions as though it were empty -- a wrong page rather than a
@@ -1291,13 +1334,12 @@ pub async fn block(
             })
         })
         .collect::<Vec<_>>();
-    let tx_count = table_tx_count(&txs);
+    let unreadable = fetched.txs.len().saturating_sub(txs.len());
+    let tx_count = table_tx_count(&txs) + unreadable;
     if let Some((key, dir)) = active {
         sort_block_rows(&mut txs, key, dir);
     }
-    // By height rather than by whatever the request named, so a sorted link
-    // from a page reached by hash still lands on this block.
-    let page = format!("/block/{}", header.height);
+    let page = block_link(&header);
 
     // The tree fields are in the block's own JSON, not in its header. A
     // document that does not decode costs this one row and nothing else:
@@ -1321,6 +1363,8 @@ pub async fn block(
             size: header.block_size,
             weight: header.block_weight,
             tx_count,
+            unreadable,
+            orphan: header.orphan_status,
             reward: xmr(header.reward),
             difficulty: header.difficulty().to_string(),
             nonce: header.nonce,
@@ -1333,6 +1377,18 @@ pub async fn block(
             txs,
         },
     )
+}
+
+/// The block page's own address, for its sort links. By height rather than
+/// by whatever the request named, so a sorted link from a page reached by
+/// hash still lands on this block; but an orphan's height names the main
+/// chain's block, so it goes by its hash.
+fn block_link(header: &monerod_rpc::types::BlockHeader) -> String {
+    if header.orphan_status {
+        format!("/block/{}", header.hash.to_lowercase())
+    } else {
+        format!("/block/{}", header.height)
+    }
 }
 
 fn chain_error_page(chain: Option<ChainStatus>, e: &ChainError, title: &str) -> Page {
@@ -1974,28 +2030,7 @@ pub async fn mempool(State(state): Shared, Query(q): Query<SortQuery>) -> Page {
     // pool: the latter always shows the newest transaction as having waited no
     // time at all, even on a pool nothing has arrived in for an hour.
     let asked_at = now();
-
-    let mut txs: Vec<PoolRow> = pool
-        .transactions
-        .iter()
-        .filter_map(|t| {
-            let tx = t.parse_json().ok()?;
-            let f = TxFacts::from_pool(t, &tx);
-            Some(PoolRow {
-                hash: t.id_hash.to_lowercase(),
-                age: age(asked_at, t.receive_time),
-                waiting_secs: waiting_secs(asked_at, t.receive_time),
-                fee: xmr_aligned(f.fee),
-                fee_atomic: f.fee,
-                ring: f.ring_size,
-                full_chain: f.fcmp_pp.is_some(),
-                size: f.size,
-            })
-        })
-        .collect();
-    if let Some((key, dir)) = active {
-        sort_pool_rows(&mut txs, key, dir);
-    }
+    let txs = pool_rows(&pool.transactions, active, asked_at);
 
     render(
         StatusCode::OK,
@@ -2006,6 +2041,8 @@ pub async fn mempool(State(state): Shared, Query(q): Query<SortQuery>) -> Page {
             waiting_sort: column_sort("/mempool", SortKey::Waiting, active),
             fee_sort: column_sort("/mempool", SortKey::Fee, active),
             size_sort: column_sort("/mempool", SortKey::Size, active),
+            total: pool.transactions.len(),
+            cut: pool.transactions.len() > MEMPOOL_ROWS,
             txs,
         },
     )
@@ -2030,22 +2067,7 @@ pub async fn alt_blocks(State(state): Shared) -> Page {
         Err(e) => return chain_error_page(chain, &e, "Could not load alternative chains"),
     };
 
-    let chains = alt
-        .chains
-        .iter()
-        .map(|c| AltChainRow {
-            height: c.height,
-            length: c.length,
-            tip: c.height.saturating_add(c.length).saturating_sub(1),
-            block_hash: c.block_hash.to_lowercase(),
-            // ChainInfo has no accessor of its own; reassembling here keeps
-            // one call site rather than adding a fourth place a 128-bit
-            // value could be read from the wrong top word.
-            difficulty: monerod_rpc::types::reassemble_u128(c.difficulty, c.difficulty_top64)
-                .to_string(),
-            parent: c.main_chain_parent_block.to_lowercase(),
-        })
-        .collect();
+    let chains = alt.chains.iter().map(alt_chain_row).collect();
 
     render(
         StatusCode::OK,
@@ -3407,6 +3429,8 @@ mod tests {
             size: 40_490,
             weight: 40_490,
             tx_count: table_tx_count(&txs),
+            unreadable: 0,
+            orphan: false,
             reward: "0.60160672".to_owned(),
             difficulty: "691253322598".to_owned(),
             nonce: 7,
@@ -3420,13 +3444,11 @@ mod tests {
         }
     }
 
-    fn pool_row(waiting_secs: u64, fee_atomic: u64, size: u64) -> PoolRow {
+    fn pool_row(size: u64) -> PoolRow {
         PoolRow {
             hash: "e".repeat(64),
             age: "00:00:00".to_owned(),
-            waiting_secs,
             fee: "0.0".to_owned(),
-            fee_atomic,
             ring: 16,
             full_chain: false,
             size,
@@ -3434,11 +3456,7 @@ mod tests {
     }
 
     fn mempool_page(active: Option<(SortKey, SortDir)>) -> MempoolPage {
-        let txs = vec![
-            pool_row(10, 300, 2_000),
-            pool_row(30, 100, 1_000),
-            pool_row(20, 200, 3_000),
-        ];
+        let txs = vec![pool_row(2_000), pool_row(1_000), pool_row(3_000)];
         MempoolPage {
             version: VERSION,
             query: None,
@@ -3446,6 +3464,8 @@ mod tests {
             waiting_sort: column_sort("/mempool", SortKey::Waiting, active),
             fee_sort: column_sort("/mempool", SortKey::Fee, active),
             size_sort: column_sort("/mempool", SortKey::Size, active),
+            total: txs.len(),
+            cut: false,
             txs,
         }
     }
@@ -3548,31 +3568,89 @@ mod tests {
         assert_eq!(asc.state, "asc");
     }
 
+    /// A pool transaction as the daemon lists it, received at `received`,
+    /// paying `fee` and `size` bytes long.
+    fn pool_tx(received: u64, fee: u64, size: u64) -> PoolTxInfo {
+        let tx = serde_json::json!({
+            "version": 2, "unlock_time": 0, "extra": [], "vout": [],
+            "vin": [{"key": {"amount": 0, "key_offsets": vec![1; 16], "k_image": "ab".repeat(32)}}],
+        });
+        serde_json::from_value(serde_json::json!({
+            "id_hash": format!("{fee:064x}"), "tx_json": tx.to_string(), "blob_size": size,
+            "fee": fee, "max_used_block_id_hash": "", "max_used_block_height": 0,
+            "kept_by_block": false, "last_failed_height": 0, "last_failed_id_hash": "",
+            "receive_time": received, "relayed": true, "last_relayed_time": 0,
+            "do_not_relay": false, "double_spend_seen": false, "tx_blob": "",
+        }))
+        .expect("a pool transaction")
+    }
+
+    /// Each row's fee, which `pool_tx` writes into its hash.
+    fn fees(rows: &[PoolRow]) -> Vec<u64> {
+        rows.iter()
+            .map(|r| u64::from_str_radix(&r.hash, 16).expect("a fee"))
+            .collect()
+    }
+
     #[test]
     fn rows_sort_by_the_requested_column_in_the_requested_direction() {
-        let mut rows = vec![
-            pool_row(10, 300, 2_000),
-            pool_row(30, 100, 1_000),
-            pool_row(20, 200, 3_000),
+        let pool = [
+            pool_tx(990, 300, 2_000),
+            pool_tx(970, 100, 1_000),
+            pool_tx(980, 200, 3_000),
         ];
+        let rows = |key, dir| pool_rows(&pool, Some((key, dir)), 1_000);
 
-        sort_pool_rows(&mut rows, SortKey::Fee, SortDir::Asc);
+        assert_eq!(fees(&rows(SortKey::Fee, SortDir::Asc)), [100, 200, 300]);
+        // Waiting 30, 20 and 10 seconds.
         assert_eq!(
-            rows.iter().map(|r| r.fee_atomic).collect::<Vec<_>>(),
-            vec![100, 200, 300]
+            fees(&rows(SortKey::Waiting, SortDir::Desc)),
+            [100, 200, 300]
+        );
+        assert_eq!(fees(&rows(SortKey::Waiting, SortDir::Asc)), [300, 200, 100]);
+        let sizes: Vec<u64> = rows(SortKey::Size, SortDir::Asc)
+            .iter()
+            .map(|r| r.size)
+            .collect();
+        assert_eq!(sizes, [1_000, 2_000, 3_000]);
+        assert!(
+            rows(SortKey::Fee, SortDir::Asc)
+                .iter()
+                .all(|r| r.ring == 16)
+        );
+    }
+
+    /// A pool longer than the page is sorted whole and cut after, so the
+    /// rows shown are the top of the whole pool, and says so.
+    #[test]
+    fn a_long_pool_shows_the_top_of_its_sorted_whole() {
+        let pool: Vec<PoolTxInfo> = (1..=MEMPOOL_ROWS as u64 + 20)
+            .map(|fee| pool_tx(0, fee, 1))
+            .collect();
+        let rows = pool_rows(&pool, Some((SortKey::Fee, SortDir::Desc)), 0);
+        assert_eq!(rows.len(), MEMPOOL_ROWS);
+        let fees = fees(&rows);
+        assert_eq!(fees.first(), Some(&(MEMPOOL_ROWS as u64 + 20)));
+        assert_eq!(fees.last(), Some(&21));
+        let unsorted = pool_rows(&pool, None, 0);
+        assert_eq!(
+            unsorted[0].hash,
+            format!("{:064x}", 1),
+            "the daemon's order"
         );
 
-        sort_pool_rows(&mut rows, SortKey::Waiting, SortDir::Desc);
-        assert_eq!(
-            rows.iter().map(|r| r.waiting_secs).collect::<Vec<_>>(),
-            vec![30, 20, 10]
+        let mut page = mempool_page(None);
+        assert!(
+            !page
+                .render()
+                .expect("renders")
+                .contains("Showing the first")
         );
-
-        sort_pool_rows(&mut rows, SortKey::Size, SortDir::Asc);
-        assert_eq!(
-            rows.iter().map(|r| r.size).collect::<Vec<_>>(),
-            vec![1_000, 2_000, 3_000]
-        );
+        page.total = pool.len();
+        page.cut = true;
+        let html = page.render().expect("renders");
+        assert!(html.contains(&format!("{} transactions", MEMPOOL_ROWS + 20)));
+        assert!(html.contains(&format!("Showing the first {MEMPOOL_ROWS}, in the")));
     }
 
     #[test]
@@ -3649,16 +3727,11 @@ mod tests {
     /// whichever direction was asked for, rather than flipping arbitrarily.
     #[test]
     fn rows_tied_on_the_sort_key_keep_their_original_order() {
-        let mut rows = vec![
-            pool_row(5, 100, 1),
-            pool_row(5, 200, 2),
-            pool_row(5, 300, 3),
-        ];
-        sort_pool_rows(&mut rows, SortKey::Waiting, SortDir::Desc);
-        assert_eq!(
-            rows.iter().map(|r| r.fee_atomic).collect::<Vec<_>>(),
-            vec![100, 200, 300]
-        );
+        let pool = [pool_tx(5, 100, 1), pool_tx(5, 200, 2), pool_tx(5, 300, 3)];
+        for dir in [SortDir::Desc, SortDir::Asc] {
+            let rows = pool_rows(&pool, Some((SortKey::Waiting, dir)), 10);
+            assert_eq!(fees(&rows), [100, 200, 300]);
+        }
     }
 
     #[test]
@@ -4509,7 +4582,7 @@ mod tests {
         pool.txs.push(PoolRow {
             ring: 0,
             full_chain: true,
-            ..pool_row(5, 5, 5)
+            ..pool_row(5)
         });
         let html = pool.render().expect("renders");
         assert!(html.contains(">all</span>"));
@@ -4691,5 +4764,110 @@ mod tests {
         let html = page.render().expect("renders");
         assert!(html.contains("monerod is unavailable"));
         assert!(!html.contains("class=\"status\""));
+    }
+
+    /// monerod's `height` for an alternative chain is its tip's, the block
+    /// `block_hash` names, so a three-block chain on 101, 102 and 103 comes
+    /// as height 103 and length 3.
+    #[test]
+    fn an_alternative_chain_diverged_length_blocks_below_its_tip() {
+        let chain = |height: u64, length: u64| -> monerod_rpc::types::ChainInfo {
+            serde_json::from_value(serde_json::json!({
+                "block_hash": "AB".repeat(32), "height": height, "length": length,
+                "difficulty": 5, "difficulty_top64": 1, "wide_difficulty": "",
+                "main_chain_parent_block": "CD".repeat(32),
+            }))
+            .expect("a chain")
+        };
+        let row = alt_chain_row(&chain(103, 3));
+        assert_eq!((row.diverged, row.tip, row.length), (101, 103, 3));
+        assert_eq!(row.difficulty, ((1u128 << 64) + 5).to_string());
+        assert_eq!(
+            (row.block_hash, row.parent),
+            ("ab".repeat(32), "cd".repeat(32))
+        );
+        let row = alt_chain_row(&chain(50, 1));
+        assert_eq!((row.diverged, row.tip), (50, 50));
+
+        let html = AltBlocksPage {
+            version: "test",
+            query: None,
+            chain: None,
+            chains: vec![alt_chain_row(&chain(103, 3))],
+        }
+        .render()
+        .expect("renders");
+        assert!(
+            html.contains(
+                r#"<td class="num"><a href="/block/101">101</a></td>
+      <td class="num">103</td>
+      <td class="num">3</td>"#
+            ),
+            "{html}"
+        );
+    }
+
+    /// A block off the main chain says so, and links only by hash: its
+    /// height, sorted or stepped from, would name the main chain's block.
+    #[test]
+    fn an_orphaned_block_says_so_and_links_by_its_hash() {
+        let header = |orphan: bool| -> monerod_rpc::types::BlockHeader {
+            serde_json::from_value(serde_json::json!({
+                "major_version": 16, "minor_version": 16, "timestamp": 0,
+                "prev_hash": "b".repeat(64), "nonce": 0, "orphan_status": orphan,
+                "height": 70, "depth": 3, "hash": "AB".repeat(32), "difficulty": 1,
+                "difficulty_top64": 0, "wide_difficulty": "0x1", "cumulative_difficulty": 1,
+                "cumulative_difficulty_top64": 0, "wide_cumulative_difficulty": "0x1",
+                "reward": 1, "block_size": 1, "num_txes": 0, "pow_hash": "", "miner_tx_hash": "",
+            }))
+            .expect("a header")
+        };
+        assert_eq!(block_link(&header(false)), "/block/70");
+        let link = block_link(&header(true));
+        assert_eq!(link, format!("/block/{}", "ab".repeat(32)));
+
+        let mut page = block_page();
+        let main = page.render().expect("renders");
+        assert!(!main.contains("not on the main chain") && !main.contains("orphaned"));
+        assert!(main.contains(r#"<a href="/block/3185431">3185431 &rarr;</a>"#));
+
+        page.orphan = true;
+        page.fee_sort = column_sort(&link, SortKey::Fee, None);
+        let html = page.render().expect("renders");
+        assert!(html.contains("This block is not on the main chain."));
+        assert!(html.contains(r#"<span class="tag bad">orphaned</span>"#));
+        assert!(!html.contains("1 deep"));
+        assert!(html.contains(&format!(
+            r#"<a href="/block/{}">&larr; 3185429</a>"#,
+            "b".repeat(64)
+        )));
+        assert!(
+            !html.contains("/block/3185431"),
+            "no step to the main chain's next block"
+        );
+        assert!(html.contains(&format!("/block/{}?sort=fee", "ab".repeat(32))));
+    }
+
+    /// A transaction the daemon sent that does not decode is counted and
+    /// said to be missing from the table, not silently left out.
+    #[test]
+    fn an_unreadable_transaction_is_counted_and_noted() {
+        let mut page = block_page();
+        assert!(
+            !page
+                .render()
+                .expect("renders")
+                .contains("could not\nbe read")
+        );
+        page.unreadable = 2;
+        page.tx_count += 2;
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Transactions</dt><dd>5</dd>"));
+        assert!(
+            html.contains(
+                "2 of this block's transactions could not\nbe read, so they are not\nlisted below."
+            ),
+            "{html}"
+        );
     }
 }

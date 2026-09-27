@@ -47,6 +47,25 @@ const MAX_ERROR_BODY_READ: u64 = 64 * 1024;
 /// near this.
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The largest answer to a call whose answer is a few kilobytes whatever
+/// the chain holds, such as `get_info`. Decoded, an answer
+/// takes several times its size in memory, so a daemon answering one of
+/// these at the general ceiling could take gigabytes.
+pub const SMALL_ANSWER_BYTES: u64 = 1024 * 1024;
+
+/// The calls whose answers are a few kilobytes whatever the chain holds.
+const SMALL_ANSWERS: &[&str] = &[
+    "get_info",
+    "get_last_block_header",
+    "get_block_header_by_hash",
+    "get_block_header_by_height",
+    "get_fee_estimate",
+    "get_transaction_pool_stats",
+    "get_version",
+    "get_height",
+    "hard_fork_info",
+];
+
 #[cfg(feature = "tls")]
 type Connector = hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
 #[cfg(not(feature = "tls"))]
@@ -183,14 +202,13 @@ impl Client {
     ) -> Result<Bytes, RpcError> {
         let payload =
             serde_json::to_vec(body).map_err(|source| RpcError::Encode { context, source })?;
-        self.exchange(
-            path,
-            context,
-            "application/json",
-            payload,
-            self.max_response_bytes,
-        )
-        .await
+        let ceiling = if SMALL_ANSWERS.contains(&context) {
+            SMALL_ANSWER_BYTES.min(self.max_response_bytes)
+        } else {
+            self.max_response_bytes
+        };
+        self.exchange(path, context, "application/json", payload, ceiling)
+            .await
     }
 
     /// POST `payload` to `path` and return the body of a successful answer.
@@ -893,6 +911,28 @@ mod tests {
             ),
             other => panic!("expected refusal on the declared length, got {other:?}"),
         }
+    }
+
+    /// A call whose answer is small whatever the chain holds is held to
+    /// SMALL_ANSWER_BYTES, and one whose answer grows with the chain is not.
+    #[tokio::test]
+    async fn a_small_answer_has_a_ceiling_of_its_own() {
+        let body = format!(
+            r#"{{"result":{{"status":"OK","pad":"{}"}}}}"#,
+            "x".repeat(usize::try_from(SMALL_ANSWER_BYTES).unwrap())
+        );
+        let peer = serve_json(&body);
+        let client = Client::new(format!("http://127.0.0.1:{}", peer.port)).expect("valid url");
+        let outcome: Result<serde_json::Value, _> = client.json_rpc("get_info", None::<()>).await;
+        assert!(
+            matches!(outcome, Err(RpcError::ResponseTooLarge { .. })),
+            "{outcome:?}"
+        );
+
+        let peer = serve_json(&body);
+        let client = Client::new(format!("http://127.0.0.1:{}", peer.port)).expect("valid url");
+        let outcome: Result<serde_json::Value, _> = client.json_rpc("get_block", None::<()>).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
     }
 
     /// The same body, under the ceiling, is read normally -- so the size tests

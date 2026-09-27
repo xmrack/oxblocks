@@ -273,11 +273,13 @@
     empty one counts as left out. The explorer recomputes each path's hashes from
     its leaves up and compares the result with the root in block
     <code class="lit">block</code> &minus; 8. <code class="lit">root_check</code>
-    is <code class="lit">matches</code> when every path holds and reaches that
-    root, <code class="lit">fails</code> when one does not or the daemon sends
-    none for an output its lock puts in the tree, and
-    <code class="lit">unchecked</code> when no output is in the tree yet or no
-    block carries the root.
+    is <code class="lit">matches</code> when the path of every output in the
+    tree so far holds and reaches that root, <code class="lit">fails</code>
+    when one does not or the daemon sends none for an output its lock puts in
+    the tree, and <code class="lit">unchecked</code> when no output is in the
+    tree yet or no block carries the root. The paths, the transaction and the
+    root all come from this explorer's daemon, so a match shows they agree
+    with each other, not that the daemon is honest.
   </p>
   <p>
     Each output carries its <code class="lit">unified_id</code> and its

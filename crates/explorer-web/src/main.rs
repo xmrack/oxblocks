@@ -287,6 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let node = monerod_rpc::Client::builder(&config.daemon_url)
         .timeout(config.rpc_timeout())
+        .max_response_bytes(config.max_response_bytes())
         .user_agent(concat!("oxblocks/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
@@ -635,6 +636,36 @@ mod tests {
                 "{uri} answered {status} with {body}"
             );
             assert!(body.contains(r#""status":"fail""#), "{uri} said {body}");
+        }
+    }
+
+    /// A request axum's own extractors cannot read is refused in the API's
+    /// envelope too, not in axum's plain text.
+    #[tokio::test]
+    async fn a_request_axum_cannot_read_is_refused_in_the_envelope() {
+        for uri in [
+            "/api/transactions?page=1&page=2",
+            "/api/mempool?limit=1&limit=2",
+            "/api/feeestimate?grace_blocks=1&grace_blocks=2",
+            "/api/transaction/private/%FF%FE",
+            "/api/block/%FF",
+            "/api/blocks/%FF/1",
+        ] {
+            let (status, body) = get(uri).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{uri} answered {status} with {body}"
+            );
+            let body: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|_| panic!("{uri} did not answer JSON: {body}"));
+            assert_eq!(body["status"], "fail", "{uri}");
+            assert!(
+                body["data"]["title"]
+                    .as_str()
+                    .is_some_and(|t| !t.is_empty()),
+                "{uri}"
+            );
         }
     }
 

@@ -7,6 +7,8 @@ pub mod amount;
 pub mod cache;
 pub mod chain;
 pub mod curve_tree;
+#[cfg(any(test, feature = "fake-daemon"))]
+pub mod fake_daemon;
 pub mod fcmp;
 pub mod fmt;
 pub mod hash;
@@ -21,7 +23,7 @@ pub use chain::{BlockId, BlockIdError, ChainError, ResolvedInput, RingMember};
 pub use fmt::{age, decimal, timestamp_utc};
 pub use hash::{Hash32, HashParseError};
 pub use rpc_source::{
-    BlockTree, BlockWithTxs, DEFAULT_MAX_INFLIGHT_RPC, FetchedTxs, RpcChainSource,
+    BlockTree, BlockWithTxs, DEFAULT_MAX_INFLIGHT_RPC, FetchedTxs, Held, RpcChainSource,
     unexpanded_inputs,
 };
 pub use tx::TxFacts;

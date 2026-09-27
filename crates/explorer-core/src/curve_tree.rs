@@ -2,7 +2,7 @@
 //! sits in the tree, and whether its hashes hold up to the root.
 //!
 //! The daemon hands out a path as bare groups of points (see
-//! [`monerod_rpc::types::PathQuery`]). [`place`] works out, from the leaf's
+//! [`monerod_rpc::types::PathQuery`]). [`place_all`] works out, from the leaf's
 //! index and the tree's size, which group of which layer each one is and
 //! which member of it is the output's ancestor, and recomputes every hash
 //! from the leaves up:
@@ -203,8 +203,7 @@ pub struct Output {
     pub key: Option<[u8; 32]>,
     /// The amount commitment: the one the transaction records, or for an
     /// output whose amount is in the clear, [`visible_commitment`]. `None`
-    /// only when the transaction's are unreadable, and then only the key is
-    /// compared.
+    /// when the transaction's are unreadable, which no leaf matches.
     pub commitment: Option<[u8; 32]>,
 }
 
@@ -226,7 +225,7 @@ impl Output {
     pub fn is(&self, leaf: &PathLeaf) -> bool {
         leaf.unified_id == self.unified_id
             && self.key == Some(leaf.output_key)
-            && self.commitment.is_none_or(|c| c == leaf.commitment)
+            && self.commitment == Some(leaf.commitment)
     }
 }
 
@@ -749,14 +748,18 @@ mod tests {
         };
         assert_eq!(place(&relabelled, next, n).check, PathCheck::Holds);
 
-        // The key alone is compared where the transaction records no
-        // commitment; a commitment it does record must match too.
+        // The commitment must match as well as the key, and a transaction
+        // whose commitments are unreadable has no output a leaf can match.
         let path = answer.paths[0].clone().unwrap();
+        assert_eq!(place(&outputs[0], path.clone(), n).check, PathCheck::Holds);
         let key_only = Output {
             commitment: None,
             ..outputs[0]
         };
-        assert_eq!(place(&key_only, path.clone(), n).check, PathCheck::Holds);
+        assert_eq!(
+            place(&key_only, path.clone(), n).check,
+            PathCheck::NotTheOutput
+        );
         let other_commitment = Output {
             commitment: outputs[1].commitment,
             ..outputs[0]

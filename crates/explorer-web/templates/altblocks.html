@@ -25,7 +25,7 @@
   <tbody>
   {% for c in chains %}
     <tr>
-      <td class="num"><a href="/block/{{ c.height }}">{{ c.height }}</a></td>
+      <td class="num"><a href="/block/{{ c.diverged }}">{{ c.diverged }}</a></td>
       <td class="num">{{ c.tip }}</td>
       <td class="num">{{ c.length }}</td>
       <td><span class="hash">{{ c.block_hash }}</span></td>

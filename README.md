@@ -54,6 +54,7 @@ Each option also reads an environment variable. The command line wins.
 | `--max-concurrent` | `OXBLOCKS_MAX_CONCURRENT` | `128` | Requests handled at the same time, across all routes. A request waits for a slot within its timeout. |
 | `--max-inflight-rpc` | `OXBLOCKS_MAX_INFLIGHT_RPC` | `24` | RPC calls open at the same time. |
 | `--max-body-bytes` | `OXBLOCKS_MAX_BODY` | `8192` | Largest accepted request body. |
+| `--max-response-mib` | `OXBLOCKS_MAX_RESPONSE_MIB` | `256` | Largest answer accepted from monerod, in MiB. Lower it for a node you do not run. |
 | `--postfix-min` | `OXBLOCKS_POSTFIX_MIN` | `2` | Shortest postfix the private lookup accepts. |
 | `--postfix-max` | `OXBLOCKS_POSTFIX_MAX` | `12` | Longest postfix the private lookup accepts. |
 | `--max-block-range` | `OXBLOCKS_MAX_BLOCK_RANGE` | `100` | Most blocks `/api/blocks` serves at once. |

@@ -2,7 +2,11 @@
 {% import "sort.html" as sort %}
 {% block title %}Mempool &mdash; oxblocks{% endblock %}
 {% block content %}
-<h1>Mempool<span class="sub">{{ txs.len() }} transactions</span></h1>
+<h1>Mempool<span class="sub">{{ total }} transactions</span></h1>
+{% if cut %}
+<p class="empty">Showing the first {{ crate::html::MEMPOOL_ROWS }}, in the
+order the table is sorted.</p>
+{% endif %}
 
 {% if txs.is_empty() %}
 <p class="empty">The mempool is empty.</p>

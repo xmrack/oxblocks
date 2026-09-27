@@ -174,6 +174,55 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// axum's `Path`, refusing a path it cannot read in this API's envelope
+/// rather than in axum's plain text.
+pub struct ApiPath<T>(pub T);
+
+/// axum's `Query`, likewise.
+pub struct ApiQuery<T>(pub T);
+
+/// A refusal by axum's own extractor, as this API's `fail`. Its text can
+/// quote the request, so it is bounded as any echoed argument is.
+fn refused(text: &str) -> ApiError {
+    ApiError::bad_request(crate::api::handlers::echo(text))
+}
+
+impl<S, T> axum::extract::FromRequestParts<S> for ApiPath<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned + Send,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, ApiError> {
+        axum::extract::Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Path(t)| Self(t))
+            .map_err(|e| refused(&e.body_text()))
+    }
+}
+
+impl<S, T> axum::extract::FromRequestParts<S> for ApiQuery<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, ApiError> {
+        axum::extract::Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Query(t)| Self(t))
+            .map_err(|e| refused(&e.body_text()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

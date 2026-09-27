@@ -186,6 +186,84 @@ fn put_varint(out: &mut Vec<u8>, v: u64) -> Result<(), EpeeError> {
     Ok(())
 }
 
+/// Encode a whole document, for a test standing in for monerod.
+#[cfg(any(test, feature = "test-support"))]
+pub fn encode_root(root: &Root) -> Result<Vec<u8>, EpeeError> {
+    let mut out = monero_epee::HEADER.to_vec();
+    out.push(monero_epee::VERSION);
+    put_section(&mut out, root)?;
+    Ok(out)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Root {
+    #[must_use]
+    pub const fn new(entries: Vec<(String, Value)>) -> Self {
+        Self(entries)
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[(String, Value)] {
+        &self.0
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn put_section(out: &mut Vec<u8>, section: &Root) -> Result<(), EpeeError> {
+    put_varint(out, section.0.len() as u64)?;
+    for (name, value) in &section.0 {
+        out.push(u8::try_from(name.len()).map_err(|_| EpeeError::Unencodable("name"))?);
+        out.extend_from_slice(name.as_bytes());
+        match value {
+            Value::Array(items) => {
+                let first = items.first().ok_or(EpeeError::Unencodable("empty array"))?;
+                out.push(kind_of(first) as u8 | monero_epee::Array::Array as u8);
+                put_varint(out, items.len() as u64)?;
+                for item in items {
+                    if kind_of(item) as u8 != kind_of(first) as u8 {
+                        return Err(EpeeError::Unencodable("mixed array"));
+                    }
+                    put_value(out, item)?;
+                }
+            }
+            v => {
+                out.push(kind_of(v) as u8);
+                put_value(out, v)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+const fn kind_of(v: &Value) -> Type {
+    match v {
+        Value::Signed(_) => Type::Int64,
+        Value::Unsigned(_) => Type::Uint64,
+        Value::Double(_) => Type::Double,
+        Value::Bool(_) => Type::Bool,
+        Value::Bytes(_) => Type::String,
+        Value::Section(_) | Value::Array(_) => Type::Object,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn put_value(out: &mut Vec<u8>, v: &Value) -> Result<(), EpeeError> {
+    match v {
+        Value::Signed(n) => out.extend_from_slice(&n.to_le_bytes()),
+        Value::Unsigned(n) => out.extend_from_slice(&n.to_le_bytes()),
+        Value::Double(n) => out.extend_from_slice(&n.to_le_bytes()),
+        Value::Bool(b) => out.push(u8::from(*b)),
+        Value::Bytes(b) => {
+            put_varint(out, b.len() as u64)?;
+            out.extend_from_slice(b);
+        }
+        Value::Section(s) => put_section(out, s)?,
+        Value::Array(_) => return Err(EpeeError::Unencodable("nested array")),
+    }
+    Ok(())
+}
+
 /// Read a whole document, keeping the root entries named in `wanted`.
 ///
 /// Every entry is still read -- a malformed value anywhere, kept or walked
@@ -489,5 +567,17 @@ mod tests {
             read_root(&nested(MAX_DEPTH + 1), &["o"]),
             Err(EpeeError::TooDeep)
         );
+    }
+
+    /// A document written by `encode_root` reads back as the one it was
+    /// written from, a real path answer's nesting included.
+    #[test]
+    fn an_encoded_document_reads_back_whole() {
+        let bin = include_bytes!("../../../fixtures/fcmp/paths/get_path_by_unified_id_later.bin");
+        let names = ["n_leaf_tuples", "paths", "status"];
+        let root = read_root(bin, &names).unwrap();
+        assert_eq!(root.entries().len(), 3);
+        let again = read_root(&encode_root(&root).unwrap(), &names).unwrap();
+        assert_eq!(again, root);
     }
 }

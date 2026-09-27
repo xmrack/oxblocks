@@ -845,9 +845,12 @@ mod tests {
                 .is_none()
         );
 
-        // Before its lock ends, the same absence is an output still to join.
+        // Before its lock ends, the same absence is an output still to join;
+        // as of the block it joins at, it is missing.
         paths.as_of_block = 809;
         assert_eq!(paths.standing(&paths.outputs[2]), Standing::Waiting);
+        paths.as_of_block = 810;
+        assert_eq!(paths.standing(&paths.outputs[2]), Standing::Missing);
     }
 
     #[test]

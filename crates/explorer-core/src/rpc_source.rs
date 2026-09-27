@@ -68,6 +68,10 @@ pub struct RpcChainSource {
     /// The chain tip. Short-lived by nature, so it expires rather than being
     /// invalidated.
     info: Cache<(), GetInfo>,
+    /// The mempool, newest first, for as long as a page takes to ask for it
+    /// twice: a pool of thousands is megabytes for the daemon to write. As
+    /// large as the client's response ceiling allows.
+    pool: Cache<(), GetTransactionPool>,
     /// Curve-tree sizes keyed by the block they were taken at, cached only once
     /// that block is buried past [`REORG_WINDOW`]: a reorg gives a height a
     /// different block, and with it a different tree.
@@ -166,7 +170,12 @@ const fn depth(chain_height: u64, height: u64) -> u64 {
 /// [`RANGE_KIB`] until it is dropped.
 pub struct BlockRange {
     blocks: Vec<BlockWithTxs>,
-    _held: Option<tokio::sync::OwnedSemaphorePermit>,
+    _held: Held,
+}
+
+/// A share of [`RANGE_KIB`], given back when dropped.
+pub struct Held {
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl std::ops::Deref for BlockRange {
@@ -295,6 +304,7 @@ impl RpcChainSource {
             // Long enough to collapse the several calls a single page makes,
             // short enough that the height on screen is never visibly stale.
             info: Cache::expiring(1, Duration::from_secs(5)),
+            pool: Cache::expiring(1, Duration::from_secs(2)),
             tree_sizes: Cache::permanent(4096),
             rpc_permits: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_RPC)),
             range_kib: Arc::new(Semaphore::new(RANGE_KIB as usize)),
@@ -367,13 +377,14 @@ impl RpcChainSource {
     }
 
     /// Cache occupancy and hit counts, for `/health` and for tests.
-    pub fn cache_stats(&self) -> [(&'static str, crate::cache::Stats); 6] {
+    pub fn cache_stats(&self) -> [(&'static str, crate::cache::Stats); 7] {
         [
             ("blocks_by_hash", self.blocks_by_hash.stats()),
             ("blocks_by_height", self.blocks_by_height.stats()),
             ("txs", self.txs.stats()),
             ("outs", self.outs.stats()),
             ("info", self.info.stats()),
+            ("pool", self.pool.stats()),
             ("tree_sizes", self.tree_sizes.stats()),
         ]
     }
@@ -775,14 +786,7 @@ impl RpcChainSource {
         if kib > MAX_RANGE_KIB {
             return Err(ChainError::RangeTooLarge { start, end, kib });
         }
-        let share = u32::try_from(kib).unwrap_or(u32::MAX).clamp(1, RANGE_KIB);
-        let held = tokio::time::timeout(
-            RANGE_WAIT,
-            Arc::clone(&self.range_kib).acquire_many_owned(share),
-        )
-        .await
-        .map_err(|_| ChainError::Busy("other ranges of blocks"))?
-        .ok();
+        let held = self.hold_kib(kib).await?;
 
         // A block's body is fetched when it holds transactions, whose hashes
         // only the body lists -- the range cannot be answered without it --
@@ -850,6 +854,14 @@ impl RpcChainSource {
             .into_iter()
             .filter_map(|e| e.tx_hash.parse::<Hash32>().ok().map(|h| (h, e)))
             .collect();
+        // A block shown without one of its transactions would be wrong, not
+        // partial.
+        if let Some(h) = flat.iter().find(|h| !fetched.contains_key(h)) {
+            return Err(ChainError::BadAnswer {
+                what: "get_transactions",
+                detail: format!("transaction {h} of blocks {start} to {end} did not come back"),
+            });
+        }
 
         let blocks = headers
             .into_iter()
@@ -870,6 +882,51 @@ impl RpcChainSource {
         })
     }
 
+    /// Wait for `kib` of [`RANGE_KIB`], or all of it if that is less, for a
+    /// caller about to fetch that much chain data whole. Busy after
+    /// [`RANGE_WAIT`].
+    pub async fn hold_kib(&self, kib: u64) -> Result<Held, ChainError> {
+        let share = u32::try_from(kib).unwrap_or(u32::MAX).clamp(1, RANGE_KIB);
+        let permit = tokio::time::timeout(
+            RANGE_WAIT,
+            Arc::clone(&self.range_kib).acquire_many_owned(share),
+        )
+        .await
+        .map_err(|_| ChainError::Busy("other ranges of blocks"))?
+        .ok();
+        Ok(Held { _permit: permit })
+    }
+
+    /// Every transaction of `block`, the coinbase first and the rest in the
+    /// order it lists them, fetched whole while holding the block's size of
+    /// [`RANGE_KIB`], which the answer keeps until it is dropped.
+    ///
+    /// Refused when the daemon does not send one of them: the block without
+    /// it would be a wrong answer, not a partial one.
+    pub async fn block_transactions(
+        &self,
+        block: &GetBlock,
+    ) -> Result<(FetchedTxs, Held), ChainError> {
+        let held = self
+            .hold_kib(block.block_header.block_size.div_ceil(1024))
+            .await?;
+        let listed = std::iter::once(&block.miner_tx_hash).chain(&block.tx_hashes);
+        let hashes: Vec<Hash32> = listed.clone().filter_map(|h| h.parse().ok()).collect();
+        let fetched = self.transactions(&hashes).await?;
+        let expected = listed.count();
+        if fetched.txs.len() != expected {
+            return Err(ChainError::BadAnswer {
+                what: "get_transactions",
+                detail: format!(
+                    "{} of block {}'s {expected} transactions came back",
+                    fetched.txs.len(),
+                    block.block_header.height
+                ),
+            });
+        }
+        Ok((fetched, held))
+    }
+
     /// The tip block's header.
     ///
     /// Its `major_version` is the active hard-fork version, which is why
@@ -878,8 +935,13 @@ impl RpcChainSource {
         Ok(self.rpc("get_last_block_header", None::<()>).await?)
     }
 
+    /// The fee estimate over `grace_blocks`, or over
+    /// [`MAX_GRACE_BLOCKS`](monerod_rpc::types::MAX_GRACE_BLOCKS) if that is
+    /// fewer.
     pub async fn fee_estimate(&self, grace_blocks: u64) -> Result<FeeEstimate, ChainError> {
-        let request = GetFeeEstimateRequest { grace_blocks };
+        let request = GetFeeEstimateRequest {
+            grace_blocks: grace_blocks.min(monerod_rpc::types::MAX_GRACE_BLOCKS),
+        };
         Ok(self.rpc("get_fee_estimate", Some(request)).await?)
     }
 
@@ -926,7 +988,10 @@ impl RpcChainSource {
     /// Blocked under `--restricted-rpc`, so a restricted daemon surfaces as
     /// [`ChainError::NeedsUnrestricted`] rather than as a generic failure --
     /// the page is unavailable by configuration, not broken.
-    pub async fn mempool(&self) -> Result<GetTransactionPool, ChainError> {
+    pub async fn mempool(&self) -> Result<Arc<GetTransactionPool>, ChainError> {
+        if let Some(hit) = self.pool.get(&()) {
+            return Ok(hit);
+        }
         let mut pool: GetTransactionPool = self
             .bare("get_transaction_pool", &serde_json::json!({}))
             .await
@@ -936,7 +1001,7 @@ impl RpcChainSource {
             })?;
 
         newest_first(&mut pool.transactions);
-        Ok(pool)
+        Ok(self.pool.insert((), pool))
     }
 
     /// The pool's aggregate figures, without the pool.
@@ -1090,10 +1155,22 @@ impl RpcChainSource {
         // A transaction's inputs are independent only in the failure case, so
         // paying a round trip each is paying for a case that almost never
         // happens: mainnet bf1b4e2b..c193 has 195 inputs and cost 195 calls.
-        if inputs.len() > 1
-            && let Some(resolved) = self.resolve_rings_together(&inputs).await
-        {
-            return resolved;
+        if inputs.len() > 1 {
+            match self.resolve_rings_together(&inputs).await {
+                Ok(resolved) => return resolved,
+                Err(Batch::Unanswered) => {
+                    return inputs
+                        .iter()
+                        .map(|k| ResolvedInput {
+                            amount: k.amount,
+                            key_image: k.k_image.parse().unwrap_or(Hash32::ZERO),
+                            ring: Vec::new(),
+                            ring_unavailable: true,
+                        })
+                        .collect();
+                }
+                Err(Batch::PerInput) => {}
+            }
         }
 
         futures_util::future::join_all(inputs.iter().map(|k| self.resolve_ring(k))).await
@@ -1112,24 +1189,28 @@ impl RpcChainSource {
 
     /// Every ring of one transaction in a single `get_outs`.
     ///
-    /// `None` means the batch is not usable and the caller must fall back to
-    /// one call per input: monerod fails the *whole* request if any single
-    /// index is out of range, so a batch cannot report which input was the bad
-    /// one, and the per-input path exists precisely so that one unresolvable
-    /// input does not blank every ring on the page.
+    /// [`Batch::PerInput`] means the caller must fall back to one call per
+    /// input: monerod fails the *whole* request if any single index is out of
+    /// range, so a batch cannot report which input was the bad one, and the
+    /// per-input path exists precisely so that one unresolvable input does
+    /// not blank every ring on the page.
     ///
     /// Nothing here reads a ring member back out of the cache after writing
     /// it. The cache is a bounded LRU shared with every other request, so an
     /// entry written at the top of this function can be evicted before the
     /// bottom of it, and a ring assembled from what survived would be reported
     /// as partly unavailable when it was in fact complete.
-    async fn resolve_rings_together(&self, inputs: &[&TxInToKey]) -> Option<Vec<ResolvedInput>> {
+    async fn resolve_rings_together(
+        &self,
+        inputs: &[&TxInToKey],
+    ) -> Result<Vec<ResolvedInput>, Batch> {
         let rings: Vec<Vec<OutKeyRequest>> = inputs
             .iter()
             .map(|k| k.ring_members())
-            .collect::<Option<_>>()?;
+            .collect::<Option<_>>()
+            .ok_or(Batch::PerInput)?;
         if rings.iter().any(Vec::is_empty) {
-            return None;
+            return Err(Batch::PerInput);
         }
 
         // Ask only for what is not already known, and only once for a decoy
@@ -1155,12 +1236,19 @@ impl RpcChainSource {
         if !wanted.is_empty() {
             let request = GetOutsRequest::new(wanted.clone(), true);
             let response: monerod_rpc::types::GetOutsResponse =
-                self.bare("get_outs", &request).await.ok()?;
+                match self.bare("get_outs", &request).await {
+                    Ok(r) => r,
+                    Err(RpcError::Status {
+                        status: monerod_rpc::Status::Failed,
+                        ..
+                    }) => return Err(Batch::PerInput),
+                    Err(_) => return Err(Batch::Unanswered),
+                };
 
             // A short array cannot be zipped positionally against the
             // requests: we would attribute one offset's output to another.
             if response.outs.len() != wanted.len() {
-                return None;
+                return Err(Batch::PerInput);
             }
             let tip = self.info().await.ok().map(|i| i.height);
             for (req, out) in wanted.iter().zip(response.outs) {
@@ -1169,34 +1257,42 @@ impl RpcChainSource {
             }
         }
 
-        Some(
-            inputs
-                .iter()
-                .zip(rings)
-                .map(|(input, members)| {
-                    let ring: Vec<RingMember> = members
-                        .iter()
-                        .filter_map(|m| {
-                            let out = known.get(&(m.amount(), m.index()))?;
-                            Some(RingMember {
-                                index: m.index(),
-                                block_height: out.height,
-                                public_key: out.key.parse().unwrap_or(Hash32::ZERO),
-                                tx_hash: out.txid.parse().unwrap_or(Hash32::ZERO),
-                            })
+        Ok(inputs
+            .iter()
+            .zip(rings)
+            .map(|(input, members)| {
+                let ring: Vec<RingMember> = members
+                    .iter()
+                    .filter_map(|m| {
+                        let out = known.get(&(m.amount(), m.index()))?;
+                        Some(RingMember {
+                            index: m.index(),
+                            block_height: out.height,
+                            public_key: out.key.parse().unwrap_or(Hash32::ZERO),
+                            tx_hash: out.txid.parse().unwrap_or(Hash32::ZERO),
                         })
-                        .collect();
-                    let whole = ring.len() == members.len();
-                    ResolvedInput {
-                        amount: input.amount,
-                        key_image: input.k_image.parse().unwrap_or(Hash32::ZERO),
-                        ring: if whole { ring } else { Vec::new() },
-                        ring_unavailable: !whole,
-                    }
-                })
-                .collect(),
-        )
+                    })
+                    .collect();
+                let whole = ring.len() == members.len();
+                ResolvedInput {
+                    amount: input.amount,
+                    key_image: input.k_image.parse().unwrap_or(Hash32::ZERO),
+                    ring: if whole { ring } else { Vec::new() },
+                    ring_unavailable: !whole,
+                }
+            })
+            .collect())
     }
+}
+
+/// Why one `get_outs` for a whole transaction gave no rings.
+enum Batch {
+    /// The batch cannot answer for every input and one call per input may:
+    /// an input's ring is empty or overflows, or the daemon refused an index.
+    PerInput,
+    /// The daemon did not answer: busy, failing, timed out or unreachable.
+    /// A call per input would multiply the load on a daemon already failing.
+    Unanswered,
 }
 
 /// Order pool transactions by arrival, newest first.
@@ -1773,125 +1869,148 @@ mod tests {
         assert_eq!(src.rpc_calls(), 1);
     }
 
-    // -----------------------------------------------------------------------
-    // A stand-in daemon, for the paths whose behaviour is which calls they make
-    // -----------------------------------------------------------------------
+    use crate::fake_daemon::FakeDaemon;
 
-    /// A loopback HTTP server answering like monerod for the few calls the
-    /// range and cache code makes, and recording each one. Bounded throughout:
-    /// the listener polls, every read has a timeout, and dropping it stops and
-    /// joins the thread, so a broken build fails instead of hanging.
-    struct FakeDaemon {
-        port: u16,
-        calls: Arc<std::sync::Mutex<Vec<String>>>,
-        stop: Arc<std::sync::atomic::AtomicBool>,
-        handle: Option<std::thread::JoinHandle<()>>,
-    }
-
-    type Answer = dyn Fn(&str, &serde_json::Value) -> serde_json::Value + Send + Sync;
-
-    impl FakeDaemon {
-        /// `answer` gets the method (for `/json_rpc`) or the endpoint, and the
-        /// request body, and returns the whole response body.
-        fn start(
-            answer: impl Fn(&str, &serde_json::Value) -> serde_json::Value + Send + Sync + 'static,
-        ) -> Self {
-            use std::io::{Read, Write};
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let answer: Arc<Answer> = Arc::new(answer);
-            let (c, st) = (Arc::clone(&calls), Arc::clone(&stop));
-            let handle = std::thread::spawn(move || {
-                while !st.load(Ordering::Relaxed) {
-                    let Ok((mut stream, _)) = listener.accept() else {
-                        std::thread::sleep(Duration::from_millis(2));
-                        continue;
-                    };
-                    stream.set_nonblocking(false).unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    let (head_end, length) = loop {
-                        let n = stream.read(&mut chunk).unwrap_or(0);
-                        if n == 0 {
-                            break (None, 0);
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
-                            let length = head
-                                .lines()
-                                .find_map(|l| l.strip_prefix("content-length:"))
-                                .and_then(|v| v.trim().parse::<usize>().ok())
-                                .unwrap_or(0);
-                            break (Some(i + 4), length);
-                        }
-                    };
-                    let Some(start) = head_end else { continue };
-                    while buf.len() < start + length {
-                        let n = stream.read(&mut chunk).unwrap_or(0);
-                        if n == 0 {
-                            break;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                    }
-                    let request_line = String::from_utf8_lossy(&buf[..start]).to_string();
-                    let path = request_line
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("")
-                        .trim_start_matches('/')
-                        .to_owned();
-                    let body: serde_json::Value =
-                        serde_json::from_slice(&buf[start..start + length]).unwrap_or_default();
-                    let what = if path == "json_rpc" {
-                        body["method"].as_str().unwrap_or("").to_owned()
-                    } else {
-                        path
-                    };
-                    c.lock().unwrap().push(what.clone());
-                    let reply = answer(&what, &body).to_string();
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-                        reply.len()
-                    );
+    /// A range whose daemon leaves out one of its blocks' transactions is
+    /// refused, not served with the block short.
+    #[tokio::test]
+    async fn a_range_missing_a_transaction_is_refused() {
+        let (coinbase, spend) = ("aa".repeat(32), "bb".repeat(32));
+        let mut header = Chain { tip: 9, fork: 99 }.header(5, false);
+        header["num_txes"] = 1.into();
+        header["miner_tx_hash"] = coinbase.clone().into();
+        let daemon = FakeDaemon::start(move |what, _| {
+            let ok = |r: serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": r});
+            match what {
+                "get_block_headers_range" => {
+                    ok(serde_json::json!({"headers": [header], "status": "OK"}))
                 }
-            });
-            Self {
-                port,
-                calls,
-                stop,
-                handle: Some(handle),
+                "get_block" => ok(serde_json::json!({
+                    "block_header": header, "miner_tx_hash": coinbase, "tx_hashes": [spend],
+                    "blob": "", "json": "{}", "status": "OK",
+                })),
+                "get_transactions" => serde_json::json!({"txs": [{
+                    "tx_hash": coinbase, "as_hex": "", "as_json": "{}", "block_height": 5,
+                    "block_timestamp": 0, "confirmations": 1, "in_pool": false,
+                    "double_spend_seen": false, "output_indices": [],
+                }], "missed_tx": [spend], "status": "OK"}),
+                _ => ok(Chain { tip: 9, fork: 99 }.info()),
             }
-        }
-
-        fn source(&self) -> RpcChainSource {
-            RpcChainSource::new(Client::new(format!("http://127.0.0.1:{}", self.port)).unwrap())
-        }
-
-        fn count(&self, what: &str) -> usize {
-            self.calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|c| *c == what)
-                .count()
-        }
+        });
+        assert!(matches!(
+            daemon.source().blocks_in_range(5, 5, false).await,
+            Err(ChainError::BadAnswer {
+                what: "get_transactions",
+                ..
+            })
+        ));
     }
 
-    impl Drop for FakeDaemon {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
-            }
+    /// Pages asking for the pool at once share one answer.
+    #[tokio::test]
+    async fn the_pool_is_asked_for_once_a_moment() {
+        let daemon =
+            FakeDaemon::start(|_, _| serde_json::json!({"transactions": [], "status": "OK"}));
+        let src = daemon.source();
+        for _ in 0..3 {
+            assert!(src.mempool().await.unwrap().transactions.is_empty());
         }
+        assert_eq!(daemon.count("get_transaction_pool"), 1);
+    }
+
+    /// A block's transactions are fetched under its size's share of the
+    /// range budget, held while the answer lives, and a block the daemon
+    /// sends only some of them for is refused rather than shown short.
+    #[tokio::test]
+    async fn a_blocks_transactions_hold_its_share_and_come_whole() {
+        let entry = |h: &str| {
+            serde_json::json!({
+                "tx_hash": h, "as_hex": "", "as_json": "{}", "block_height": 5,
+                "block_timestamp": 0, "confirmations": 1, "in_pool": false,
+                "double_spend_seen": false, "output_indices": [],
+            })
+        };
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let mut block: GetBlock = serde_json::from_value(serde_json::json!({
+            "block_header": Chain { tip: 9, fork: 99 }.header(5, false),
+            "miner_tx_hash": a, "tx_hashes": [b], "blob": "", "json": "{}",
+        }))
+        .unwrap();
+        block.block_header.block_size = 3 * 1024 * 1024;
+
+        let (ea, eb) = (entry(&a), entry(&b));
+        let whole = FakeDaemon::start(
+            move |_, _| serde_json::json!({"txs": [ea.clone(), eb.clone()], "status": "OK"}),
+        );
+        let src = whole.source();
+        let (fetched, held) = src.block_transactions(&block).await.unwrap();
+        assert_eq!(fetched.txs.len(), 2);
+        let all = RANGE_KIB as usize;
+        assert_eq!(src.range_kib.available_permits(), all - 3 * 1024);
+        drop(held);
+        assert_eq!(src.range_kib.available_permits(), all);
+
+        let ea = entry(&a);
+        let short = FakeDaemon::start(
+            move |_, _| serde_json::json!({"txs": [ea.clone()], "missed_tx": [b.clone()], "status": "OK"}),
+        );
+        let src = short.source();
+        assert!(matches!(
+            src.block_transactions(&block).await,
+            Err(ChainError::BadAnswer {
+                what: "get_transactions",
+                ..
+            })
+        ));
+        assert_eq!(src.range_kib.available_permits(), all);
+    }
+
+    /// A daemon that fails to answer a transaction's one `get_outs` is not
+    /// asked again once per input; one that answers and refuses an index is.
+    #[tokio::test]
+    async fn a_failing_daemon_is_asked_for_a_transactions_rings_once() {
+        let tx: TxJson = serde_json::from_value(serde_json::json!({
+            "version": 2, "unlock_time": 0, "extra": [], "vout": [],
+            "vin": (0..3).map(|i| serde_json::json!({"key": {
+                "amount": 0, "key_offsets": [i + 1, 1], "k_image": "ab".repeat(32),
+            }})).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+
+        let failing = FakeDaemon::start_raw(|_, _| (503, b"busy".to_vec()));
+        let resolved = failing.source().resolve_rings(&tx).await;
+        assert_eq!(resolved.len(), 3);
+        assert!(
+            resolved
+                .iter()
+                .all(|r| r.ring.is_empty() && r.ring_unavailable)
+        );
+        assert_eq!(failing.count("get_outs"), 1);
+
+        let refusing = FakeDaemon::start(|_, _| serde_json::json!({"status": "Failed"}));
+        let resolved = refusing.source().resolve_rings(&tx).await;
+        assert!(resolved.iter().all(|r| r.ring_unavailable));
+        assert_eq!(refusing.count("get_outs"), 1 + 3);
+    }
+
+    /// However wide a window a caller asks for, the daemon is asked for at
+    /// most MAX_GRACE_BLOCKS: it loops once per block of it, holding its
+    /// chain lock.
+    #[tokio::test]
+    async fn a_fee_estimate_never_asks_for_more_than_the_widest_window() {
+        let daemon = FakeDaemon::start(
+            |_, _| serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": {"fee": 1, "status": "OK"}}),
+        );
+        let src = daemon.source();
+        for g in [u64::MAX, 1001, 1000, 10] {
+            src.fee_estimate(g).await.unwrap();
+        }
+        let asked: Vec<_> = daemon
+            .bodies("get_fee_estimate")
+            .iter()
+            .map(|b| b["params"]["grace_blocks"].as_u64().unwrap())
+            .collect();
+        assert_eq!(asked, [1000, 1000, 1000, 10]);
     }
 
     /// A small chain for the stand-in: block `h` has hash `hash_of(h)`, the

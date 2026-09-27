@@ -27,6 +27,10 @@ monero-ed25519 = { version = "0.1", git = "https://github.com/monero-oxide/moner
 dalek-ff-group = "0.5"
 curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
 
+[features]
+# `fake_daemon`, a stand-in monerod for the web crate's tests.
+fake-daemon = ["monerod-rpc/test-support"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 

@@ -188,8 +188,10 @@ pub struct OutputPath {
 /// What every path found says about the root, against the block's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootCheck {
-    /// Every output is in the tree, and its path ends at the root the block
-    /// records.
+    /// Every output in the tree as of the block, and at least one is, has a
+    /// path ending at the root the block records. The paths, the outputs and
+    /// the root all come from the one daemon, so this says they agree with
+    /// each other, not that the daemon is honest.
     Matches,
     /// Some output's path is missing, does not hold, or ends at another root.
     Fails,
@@ -585,5 +587,221 @@ pub(crate) mod tests {
                 .read()
                 .is_err()
         );
+    }
+
+    /// The captured transaction as `gather` is handed it: mined in block
+    /// 801, its outputs joining the tree at 810.
+    fn captured_tx() -> (TxEntry, TxJson) {
+        let raw = include_str!("../../../fixtures/fcmp/paths/get_transactions.json");
+        let answer: monerod_rpc::types::GetTransactionsResponse =
+            serde_json::from_str(raw).unwrap();
+        let entry = answer.txs.into_iter().next().unwrap();
+        let tx = entry.parse_json().unwrap();
+        (entry, tx)
+    }
+
+    /// The daemon's paths as of block 814 for the captured outputs `which`,
+    /// cut from its answer for all four.
+    fn paths_of(which: Range<usize>) -> Vec<u8> {
+        use monerod_rpc::epee::{Root, Value, encode_root, read_root};
+        let bin = include_bytes!("../../../fixtures/fcmp/paths/get_path_by_unified_id_later.bin");
+        let root = read_root(bin, &["n_leaf_tuples", "paths", "status"]).unwrap();
+        let entries = root
+            .entries()
+            .iter()
+            .map(|(k, v)| match v {
+                Value::Array(paths) if k == "paths" => {
+                    (k.clone(), Value::Array(paths[which.clone()].to_vec()))
+                }
+                _ => (k.clone(), v.clone()),
+            })
+            .collect();
+        encode_root(&Root::new(entries)).unwrap()
+    }
+
+    /// A daemon on the captured chain with its tip at `tip`, answering for
+    /// the paths of the captured outputs `which`, and with block 806, which
+    /// carries the root of the tree as of 814.
+    fn daemon(
+        tip: Arc<std::sync::atomic::AtomicU64>,
+        which: Range<usize>,
+    ) -> explorer_core::fake_daemon::FakeDaemon {
+        let block = include_str!("../../../fixtures/fcmp/paths/get_block_root_later.json");
+        let paths = paths_of(which);
+        explorer_core::fake_daemon::FakeDaemon::start_raw(move |what, _| match what {
+            "get_info" => {
+                let height = tip.load(std::sync::atomic::Ordering::SeqCst) + 1;
+                let info = serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": {
+                    "height": height, "target_height": 0, "difficulty": 1,
+                    "difficulty_top64": 0, "target": 120, "tx_count": 0, "tx_pool_size": 0,
+                    "alt_blocks_count": 0, "outgoing_connections_count": 0,
+                    "incoming_connections_count": 0, "white_peerlist_size": 0,
+                    "grey_peerlist_size": 0, "testnet": false, "stagenet": false,
+                    "nettype": "regtest", "top_block_hash": "", "cumulative_difficulty": 1,
+                    "cumulative_difficulty_top64": 0, "block_size_limit": 0,
+                    "block_size_median": 0, "start_time": 0, "version": "test",
+                    "restricted": false, "status": "OK",
+                }});
+                (200, info.to_string().into_bytes())
+            }
+            "get_block" => (200, block.as_bytes().to_vec()),
+            "get_block_headers_range" => {
+                let block: serde_json::Value = serde_json::from_str(block).unwrap();
+                let range = serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": {
+                    "headers": [block["result"]["block_header"]], "status": "OK",
+                }});
+                (200, range.to_string().into_bytes())
+            }
+            PathQuery::ENDPOINT => (200, paths.clone()),
+            _ => (404, Vec::new()),
+        })
+    }
+
+    fn state_on(daemon: &explorer_core::fake_daemon::FakeDaemon) -> AppState {
+        AppState {
+            chain: daemon.source(),
+            limits: crate::config::Limits::default(),
+            paths: PathCache::default(),
+        }
+    }
+
+    fn tip_at(height: u64) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::new(std::sync::atomic::AtomicU64::new(height))
+    }
+
+    fn standings(paths: &TxPaths) -> Vec<Standing> {
+        paths.outputs.iter().map(|o| paths.standing(o)).collect()
+    }
+
+    /// As of the tip, every path is fetched and checked, and none is kept:
+    /// the reorg window still reaches the tree as of that block.
+    #[tokio::test]
+    async fn the_paths_as_of_the_tip_are_checked_and_not_kept() {
+        let (entry, tx) = captured_tx();
+        let d = daemon(tip_at(814), 0..4);
+        let state = state_on(&d);
+        for asked in 1..=2 {
+            let Ok(paths) = gather(&state, &entry, &tx, None, 0..4).await else {
+                panic!("paths")
+            };
+            assert_eq!(
+                (paths.as_of_block, paths.tip, paths.mined_in),
+                (814, 814, 801)
+            );
+            assert_eq!(paths.root_block, Some((806, captured().2.to_owned())));
+            let ids: Vec<_> = paths
+                .outputs
+                .iter()
+                .map(|o| (o.index, o.unified_id))
+                .collect();
+            assert_eq!(ids, [(0, 802), (1, 803), (2, 804), (3, 805)]);
+            assert!(paths.outputs.iter().all(|o| o.last_locked_block == 810));
+            assert_eq!(standings(&paths), [Standing::Reaches; 4]);
+            assert_eq!(paths.root_check(), RootCheck::Matches);
+            assert_eq!(state.paths.stats().len, 0);
+            assert_eq!(d.count(PathQuery::ENDPOINT), asked);
+        }
+    }
+
+    /// As of a block the reorg window no longer reaches, a path that leads
+    /// to the root is kept, and shown again without asking the daemon.
+    #[tokio::test]
+    async fn the_paths_as_of_a_buried_block_are_kept() {
+        let (entry, tx) = captured_tx();
+        let d = daemon(tip_at(814 + explorer_core::REORG_WINDOW), 0..4);
+        let state = state_on(&d);
+        for _ in 0..2 {
+            let Ok(paths) = gather(&state, &entry, &tx, Some(814), 0..4).await else {
+                panic!("paths")
+            };
+            assert_eq!(standings(&paths), [Standing::Reaches; 4]);
+            assert_eq!(paths.n_leaf_tuples, captured().0);
+        }
+        assert_eq!(state.paths.stats().len, 4);
+        assert_eq!(d.count(PathQuery::ENDPOINT), 1);
+    }
+
+    /// A window past the first output numbers its outputs from where it
+    /// starts, and matches each path to its own output.
+    #[tokio::test]
+    async fn a_window_matches_each_path_to_its_own_output() {
+        let (entry, tx) = captured_tx();
+        let d = daemon(tip_at(814), 2..4);
+        let Ok(paths) = gather(&state_on(&d), &entry, &tx, None, 2..4).await else {
+            panic!("paths")
+        };
+        let ids: Vec<_> = paths
+            .outputs
+            .iter()
+            .map(|o| (o.index, o.unified_id))
+            .collect();
+        assert_eq!(ids, [(2, 804), (3, 805)]);
+        assert_eq!(standings(&paths), [Standing::Reaches; 2]);
+    }
+
+    /// A block mined since the cached info was taken is not past the tip.
+    #[tokio::test]
+    async fn a_block_just_mined_is_asked_about_not_refused() {
+        let (entry, tx) = captured_tx();
+        let tip = tip_at(813);
+        let d = daemon(Arc::clone(&tip), 0..4);
+        let state = state_on(&d);
+        assert!(gather(&state, &entry, &tx, Some(813), 0..4).await.is_ok());
+        tip.store(814, std::sync::atomic::Ordering::SeqCst);
+        let Ok(paths) = gather(&state, &entry, &tx, Some(814), 0..4).await else {
+            panic!("the new tip")
+        };
+        assert_eq!(paths.tip, 814);
+        assert!(matches!(
+            gather(&state, &entry, &tx, Some(816), 0..4).await,
+            Err(PathsError::Ahead {
+                asked: 816,
+                tip: 814
+            })
+        ));
+    }
+
+    /// The tree commits to an amount in the clear with a mask of 1, and to
+    /// a hidden one with the commitment the transaction records; each
+    /// output of a window is read from its own place.
+    #[test]
+    fn each_output_is_read_with_the_commitment_the_tree_holds() {
+        let raw = include_str!("../../../fixtures/fcmp/get_transactions_coinbase.json");
+        let answer: monerod_rpc::types::GetTransactionsResponse =
+            serde_json::from_str(raw).unwrap();
+        let coinbase = answer.txs[0].parse_json().unwrap();
+        assert!(coinbase.is_coinbase() && !coinbase.vout.is_empty());
+        let read = outputs(&coinbase, 0, &vec![7; coinbase.vout.len()]);
+        for (o, v) in read.iter().zip(&coinbase.vout) {
+            assert_eq!(o.commitment, Some(visible_commitment(v.amount)));
+        }
+
+        let v1: TxJson = serde_json::from_value(serde_json::json!({
+            "version": 1, "unlock_time": 0, "extra": [],
+            "vin": [{"key": {"amount": 5, "key_offsets": [1], "k_image": "11".repeat(32)}}],
+            "vout": [{"amount": 5, "target": {"key": "22".repeat(32)}}],
+        }))
+        .unwrap();
+        assert!(v1.is_v1() && !v1.is_coinbase());
+        assert_eq!(
+            outputs(&v1, 0, &[7])[0].commitment,
+            Some(visible_commitment(5))
+        );
+
+        let (_, tx) = captured_tx();
+        let pk = tx.rct_signatures.as_ref().unwrap().out_pk.as_ref().unwrap();
+        let window = outputs(&tx, 2, &[804, 805]);
+        for (o, i) in window.iter().zip(2..) {
+            let mut key = [0u8; 32];
+            explorer_core::hex::decode_to_slice(tx.vout[i].target.public_key().unwrap(), &mut key)
+                .unwrap();
+            let mut commitment = [0u8; 32];
+            explorer_core::hex::decode_to_slice(&pk[i], &mut commitment).unwrap();
+            assert_eq!(
+                (o.key, o.commitment),
+                (Some(key), Some(commitment)),
+                "output {i}"
+            );
+        }
     }
 }

@@ -2,16 +2,16 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use explorer_core::fmt::{decimal, timestamp_utc};
 use explorer_core::{
     BlockId, BlockIdError, BlockTree, ChainError, Hash32, RpcChainSource, unexpanded_inputs,
 };
-use monerod_rpc::types::{GetTxidsLooseRequest, TxEntry, TxJson};
+use monerod_rpc::types::{GetTxidsLooseRequest, TxEntry, TxJson, wallet_grace_blocks};
 use serde::Serialize;
 
-use super::envelope::{ApiError, ApiOk};
+use super::envelope::{ApiError, ApiOk, ApiPath, ApiQuery};
 use super::shapes::{BlockDetail, TxDetail, TxSummary, normalise_hash};
 use crate::config::Limits;
 
@@ -129,7 +129,7 @@ fn decode_tx(hash: &Hash32, entry: &TxEntry) -> Result<TxJson, ApiError> {
 
 pub async fn transaction(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<TxDetail>, ApiError> {
     let (hash, entry) = fetch_tx(&state, &raw).await?;
     let entry = &entry;
@@ -228,8 +228,8 @@ pub struct LeafData {
 /// [`crate::tree_paths::MAX_OUTPUTS`] of them from `from`, counted from 0.
 pub async fn transaction_paths(
     State(state): Shared,
-    Path(raw): Path<String>,
-    axum::extract::Query(q): axum::extract::Query<crate::tree_paths::PathsParams>,
+    ApiPath(raw): ApiPath<String>,
+    ApiQuery(q): ApiQuery<crate::tree_paths::PathsParams>,
 ) -> Result<ApiOk<PathsData>, ApiError> {
     use crate::tree_paths::{PathsError, gather};
     use explorer_core::curve_tree::Curve;
@@ -357,7 +357,7 @@ fn block_not_found(id: BlockId) -> String {
 
 pub async fn block(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<BlockDetail>, ApiError> {
     let id = parse_block_id(&raw)?;
     Ok(ApiOk(build_block_detail(&state, id).await?))
@@ -374,19 +374,9 @@ async fn build_block_detail(state: &AppState, id: BlockId) -> Result<BlockDetail
         .await
         .map_err(|e| on_chain_error(&e, &block_not_found(id)))?;
 
-    // The miner transaction plus every other transaction in the block, in the
-    // order the block lists them, coinbase first.
-    let mut hashes: Vec<Hash32> = Vec::with_capacity(got.tx_hashes.len() + 1);
-    hashes.extend(got.miner_tx_hash.parse::<Hash32>());
-    hashes.extend(
-        got.tx_hashes
-            .iter()
-            .filter_map(|h| h.parse::<Hash32>().ok()),
-    );
-
-    let fetched = state
+    let (fetched, _held) = state
         .chain
-        .transactions(&hashes)
+        .block_transactions(&got)
         .await
         .map_err(|e| on_chain_error(&e, &block_not_found(id)))?;
 
@@ -413,7 +403,7 @@ async fn build_block_detail(state: &AppState, id: BlockId) -> Result<BlockDetail
 /// response here sorts its keys, so the string cannot be forwarded verbatim.
 pub async fn raw_block(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<serde_json::Value>, ApiError> {
     let id = parse_block_id(&raw)?;
 
@@ -430,7 +420,7 @@ pub async fn raw_block(
 
 pub async fn raw_transaction(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<serde_json::Value>, ApiError> {
     let (_, entry) = fetch_tx(&state, &raw).await?;
 
@@ -459,17 +449,21 @@ pub struct GraceQuery {
 
 pub async fn fee_estimate(
     State(state): Shared,
-    axum::extract::Query(q): axum::extract::Query<GraceQuery>,
+    ApiQuery(q): ApiQuery<GraceQuery>,
 ) -> Result<ApiOk<FeeData>, ApiError> {
-    // The parameter is honoured only when it is all digits. Anything else
-    // takes the default, because this one is a query hint rather than the
-    // subject of the request.
-    let grace_blocks = q
+    // The parameter is honoured only when it is all digits and at most
+    // MAX_GRACE_BLOCKS. Anything else takes the window wallets use, because
+    // this one is a query hint rather than the subject of the request.
+    let asked = q
         .grace_blocks
         .as_deref()
         .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(10);
+        .filter(|&g| g <= monerod_rpc::types::MAX_GRACE_BLOCKS);
+    let grace_blocks = match asked {
+        Some(g) => g,
+        None => wallet_grace_blocks(tip_hard_fork(&state).await),
+    };
 
     let estimate = state
         .chain
@@ -482,6 +476,16 @@ pub async fn fee_estimate(
         fee_per_kb: estimate.fee,
         grace_blocks,
     }))
+}
+
+/// The tip's hard-fork version, or 0 if the daemon cannot say. The tip
+/// block's `major_version` is the active version.
+async fn tip_hard_fork(state: &AppState) -> u8 {
+    state
+        .chain
+        .last_block_header()
+        .await
+        .map_or(0, |h| h.block_header.major_version)
 }
 
 // ---------------------------------------------------------------------------
@@ -566,7 +570,7 @@ pub struct TransactionsData {
 
 pub async fn transactions(
     State(state): Shared,
-    axum::extract::Query(q): axum::extract::Query<PageQuery>,
+    ApiQuery(q): ApiQuery<PageQuery>,
 ) -> Result<ApiOk<TransactionsData>, ApiError> {
     let (page, limit) = q.parse(25, MAX_TRANSACTIONS_LIMIT)?;
 
@@ -608,6 +612,7 @@ pub async fn transactions(
                 if e.is_not_found() {
                     ApiError::not_found(format!("Cant get block: {start}"))
                 } else {
+                    tracing::warn!("blocks {start} to {end}: {e}");
                     ApiError::daemon(format!("Cant get transactions in block: {start}"))
                 }
                 .with_partial(partial)
@@ -665,7 +670,7 @@ pub struct MempoolData {
 
 pub async fn mempool(
     State(state): Shared,
-    axum::extract::Query(q): axum::extract::Query<PageQuery>,
+    ApiQuery(q): ApiQuery<PageQuery>,
 ) -> Result<ApiOk<MempoolData>, ApiError> {
     // Capped by default rather than only when asked, for the reason on
     // MAX_MEMPOOL_LIMIT.
@@ -740,13 +745,13 @@ pub async fn mempool(
 /// never can be without one. Saying so is more useful than a bare failure.
 pub async fn search(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<serde_json::Value>, ApiError> {
     let shown = echo(&raw);
 
     match BlockId::parse(&raw) {
         Ok(BlockId::Height(height)) => {
-            let block = block(State(state), Path(height.to_string())).await?;
+            let block = block(State(state), ApiPath(height.to_string())).await?;
             return Ok(ApiOk(titled(block.0, "block")));
         }
         // A block hash and a transaction hash are the same shape, so the only
@@ -756,12 +761,12 @@ pub async fn search(
         // failed any other way has not said the hash is not a block, so its
         // error is the answer, rather than a 404 that says nothing matched.
         Ok(BlockId::Hash(_)) => {
-            match block(State(Arc::clone(&state)), Path(raw.clone())).await {
+            match block(State(Arc::clone(&state)), ApiPath(raw.clone())).await {
                 Ok(found) => return Ok(ApiOk(titled(found.0, "block"))),
                 Err(e) if e.status != StatusCode::NOT_FOUND => return Err(e),
                 Err(_) => {}
             }
-            match transaction(State(state), Path(raw.clone())).await {
+            match transaction(State(state), ApiPath(raw.clone())).await {
                 Ok(found) => return Ok(ApiOk(titled(found.0, "tx"))),
                 Err(e) if e.status != StatusCode::NOT_FOUND => return Err(e),
                 Err(_) => {}
@@ -840,16 +845,9 @@ pub async fn network_info(State(state): Shared) -> Result<ApiOk<NetworkInfoData>
         .await
         .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
 
-    let fee = state.chain.fee_estimate(10).await.ok();
-
-    // The tip block's major_version *is* the active hard-fork version, so this
-    // needs no separate hard_fork_info call.
-    let hf = state
-        .chain
-        .last_block_header()
-        .await
-        .ok()
-        .map(|h| h.block_header.major_version);
+    let hf = tip_hard_fork(&state).await;
+    let grace_blocks = wallet_grace_blocks(hf);
+    let fee = state.chain.fee_estimate(grace_blocks).await.ok();
 
     // Despite the name, this field carries **bytes**. The name is part of the
     // JSON API, so dividing by 1024 to honour it would hand every existing
@@ -871,13 +869,13 @@ pub async fn network_info(State(state): Shared) -> Result<ApiOk<NetworkInfoData>
         block_size_median: info.block_size_median,
         cumulative_difficulty: info.cumulative_difficulty().to_string(),
         current: true,
-        current_hf_version: hf.unwrap_or(0),
+        current_hf_version: hf,
         difficulty: info.difficulty().to_string(),
         // The real estimate, with the grace window beside it. Both are
         // reported, because a field that is always zero tells a client
         // nothing.
         fee_estimate: fee.as_ref().map_or(0, |f| f.fee),
-        fee_estimate_grace_blocks: 10,
+        fee_estimate_grace_blocks: grace_blocks,
         fee_per_kb: fee.as_ref().map_or(0, |f| f.fee),
         grey_peerlist_size: info.grey_peerlist_size,
         // Network hash rate is difficulty spread over the target block time.
@@ -1066,7 +1064,7 @@ pub struct PrivateTxData {
 
 pub async fn transaction_private(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<PrivateTxData>, ApiError> {
     // Hex is case insensitive and transaction hashes are rendered lowercase,
     // so the case is folded before matching. Nothing else about the argument
@@ -1138,6 +1136,13 @@ pub async fn transaction_private(
         )));
     }
 
+    // The matches are fetched whole, and as many as the widest range of
+    // blocks could hold, so they wait for that share of the same budget.
+    let _held = state
+        .chain
+        .hold_kib(explorer_core::rpc_source::MAX_RANGE_KIB)
+        .await
+        .map_err(|e| on_chain_error(&e, "Cant get matching transactions"))?;
     let fetched = state
         .chain
         .transactions(&matching)
@@ -1194,7 +1199,7 @@ pub async fn transaction_private(
 /// explorer-core; see `deploy/oxblocks.service`.
 pub async fn blocks_range(
     State(state): Shared,
-    Path((start_raw, end_raw)): Path<(String, String)>,
+    ApiPath((start_raw, end_raw)): ApiPath<(String, String)>,
 ) -> Result<ApiOk<Vec<BlockDetail>>, ApiError> {
     let start = decimal(&start_raw).ok_or_else(|| {
         ApiError::bad_request(format!("Cant parse block number: {}", echo(&start_raw)))
@@ -1595,6 +1600,92 @@ mod tests {
                 check_postfix(&"a".repeat(len), 0, Limits::default()),
                 Err(PostfixRefusal::TooLongToBeAnonymous { .. })
             ));
+        }
+    }
+
+    /// A daemon at hard fork `hf`, for the fee estimate and network info.
+    fn fee_daemon(hf: u8) -> explorer_core::fake_daemon::FakeDaemon {
+        explorer_core::fake_daemon::FakeDaemon::start(move |what, _| {
+            let result = match what {
+                "get_last_block_header" => serde_json::json!({"block_header": {
+                    "major_version": hf, "minor_version": hf, "timestamp": 0, "prev_hash": "",
+                    "nonce": 0, "orphan_status": false, "height": 9, "depth": 0, "hash": "",
+                    "difficulty": 1, "difficulty_top64": 0, "wide_difficulty": "0x1",
+                    "cumulative_difficulty": 1, "cumulative_difficulty_top64": 0,
+                    "wide_cumulative_difficulty": "0x1", "reward": 1, "block_size": 1,
+                    "num_txes": 0, "pow_hash": "", "miner_tx_hash": "",
+                }, "status": "OK"}),
+                "get_fee_estimate" => serde_json::json!({"fee": 20_000, "status": "OK"}),
+                "get_info" => serde_json::json!({
+                    "height": 10, "target_height": 0, "difficulty": 1, "difficulty_top64": 0,
+                    "target": 120, "tx_count": 0, "tx_pool_size": 0, "alt_blocks_count": 0,
+                    "outgoing_connections_count": 0, "incoming_connections_count": 0,
+                    "white_peerlist_size": 0, "grey_peerlist_size": 0, "testnet": false,
+                    "stagenet": false, "nettype": "regtest", "top_block_hash": "",
+                    "cumulative_difficulty": 1, "cumulative_difficulty_top64": 0,
+                    "block_size_limit": 0, "block_size_median": 0, "start_time": 0,
+                    "version": "test", "restricted": false, "status": "OK",
+                }),
+                _ => serde_json::json!({"status": "Failed"}),
+            };
+            serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": result})
+        })
+    }
+
+    fn state_on(daemon: &explorer_core::fake_daemon::FakeDaemon) -> Shared {
+        State(Arc::new(AppState {
+            chain: daemon.source(),
+            limits: Limits::default(),
+            paths: crate::tree_paths::PathCache::default(),
+        }))
+    }
+
+    /// The grace window the daemon was asked for, in order.
+    fn graces(daemon: &explorer_core::fake_daemon::FakeDaemon) -> Vec<u64> {
+        daemon
+            .bodies("get_fee_estimate")
+            .iter()
+            .map(|b| b["params"]["grace_blocks"].as_u64().unwrap())
+            .collect()
+    }
+
+    /// monerod loops once per grace block holding its chain lock, so a
+    /// window past MAX_GRACE_BLOCKS never reaches it, and one not asked for
+    /// is the window wallets use, which the 2026 fee scaling widened.
+    #[tokio::test]
+    async fn the_fee_estimate_asks_the_daemon_for_the_window_wallets_use() {
+        let asking = |g: &str| {
+            ApiQuery(GraceQuery {
+                grace_blocks: Some(g.to_owned()),
+            })
+        };
+        let daemon = fee_daemon(17);
+        for g in ["18446744073709551615", "1001", "", "x"] {
+            let ApiOk(fee) = fee_estimate(state_on(&daemon), asking(g)).await.unwrap();
+            assert_eq!((fee.fee, fee.grace_blocks), (20_000, 1000), "{g:?}");
+        }
+        let ApiOk(fee) = fee_estimate(state_on(&daemon), asking("1000"))
+            .await
+            .unwrap();
+        assert_eq!(fee.grace_blocks, 1000);
+        let ApiOk(fee) = fee_estimate(state_on(&daemon), asking("7")).await.unwrap();
+        assert_eq!(fee.grace_blocks, 7);
+        assert_eq!(graces(&daemon), [1000, 1000, 1000, 1000, 1000, 7]);
+
+        let before = fee_daemon(16);
+        let q = ApiQuery(GraceQuery { grace_blocks: None });
+        let ApiOk(fee) = fee_estimate(state_on(&before), q).await.unwrap();
+        assert_eq!(fee.grace_blocks, 10);
+        assert_eq!(graces(&before), [10]);
+
+        for (hf, grace) in [(16, 10), (17, 1000)] {
+            let daemon = fee_daemon(hf);
+            let ApiOk(info) = network_info(state_on(&daemon)).await.unwrap();
+            let info = serde_json::to_value(&info).unwrap();
+            assert_eq!(info["fee_estimate_grace_blocks"], grace);
+            assert_eq!(info["fee_estimate"], 20_000);
+            assert_eq!(info["current_hf_version"], hf);
+            assert_eq!(graces(&daemon), [grace]);
         }
     }
 }

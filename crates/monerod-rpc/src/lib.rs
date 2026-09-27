@@ -16,6 +16,6 @@ pub mod error;
 pub mod types;
 mod url;
 
-pub use client::{Client, ClientBuilder};
+pub use client::{Client, ClientBuilder, DEFAULT_MAX_RESPONSE_BYTES};
 pub use error::{RpcError, Status, TransportKind};
 pub use types::NestedJsonError;

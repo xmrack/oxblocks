@@ -26,5 +26,8 @@ clap = { version = "4", default-features = false, features = ["derive", "env", "
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 askama = "0.16"
 
+[dev-dependencies]
+explorer-core = { path = "../explorer-core", features = ["fake-daemon"] }
+
 [lints]
 workspace = true

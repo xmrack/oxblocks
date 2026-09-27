@@ -130,6 +130,21 @@ pub struct Config {
     #[arg(long, env = "OXBLOCKS_MAX_BODY", default_value_t = 8 * 1024)]
     pub max_body_bytes: usize,
 
+    /// Largest answer accepted from monerod, in MiB.
+    ///
+    /// A decoded answer takes several times its size in memory, and up to
+    /// `--max-inflight-rpc` are read at once, so against a daemon you do not
+    /// run, lower this. The largest real answers are `/get_transactions` for
+    /// a batch of big transactions. Calls whose answers are always small have
+    /// a ceiling of 1 MiB whatever this is.
+    #[arg(
+        long,
+        env = "OXBLOCKS_MAX_RESPONSE_MIB",
+        default_value_t = monerod_rpc::DEFAULT_MAX_RESPONSE_BYTES / (1024 * 1024),
+        value_parser = clap::value_parser!(u64).range(1..=4096)
+    )]
+    pub max_response_mib: u64,
+
     /// Shortest transaction-hash postfix `/api/transaction/private` accepts.
     ///
     /// A shorter postfix hides the caller in a larger set and makes the daemon
@@ -222,6 +237,10 @@ impl Config {
     pub fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_secs)
     }
+
+    pub const fn max_response_bytes(&self) -> u64 {
+        self.max_response_mib * 1024 * 1024
+    }
 }
 
 #[cfg(test)]
@@ -248,6 +267,22 @@ mod tests {
         let c = Config::parse_from(["oxblocks"]);
         assert_eq!(c.daemon_url, "http://127.0.0.1:18081");
         assert_eq!(c.bind.to_string(), "127.0.0.1:8081");
+    }
+
+    /// The response ceiling is the client's own unless lowered, and is
+    /// given in MiB within bounds.
+    #[test]
+    fn the_response_ceiling_is_in_mib() {
+        let c = Config::parse_from(["oxblocks"]);
+        assert_eq!(
+            c.max_response_bytes(),
+            monerod_rpc::DEFAULT_MAX_RESPONSE_BYTES
+        );
+        let c = Config::parse_from(["oxblocks", "--max-response-mib", "16"]);
+        assert_eq!(c.max_response_bytes(), 16 << 20);
+        for bad in ["0", "4097"] {
+            assert!(Config::try_parse_from(["oxblocks", "--max-response-mib", bad]).is_err());
+        }
     }
 
     /// The request deadline must stay under the RPC deadline, or a client
