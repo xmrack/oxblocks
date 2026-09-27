@@ -7,8 +7,10 @@
 {% macro close(steps, n) %}
 <div class="step-nav">{% for s in steps %}{% if s.n + 1 == n %}<a class="btn ghost" href="#s{{ s.n }}">&larr; Back</a>{% endif %}{% if s.n == n + 1 %}<a class="btn next" href="#s{{ s.n }}">Next: {{ s.title }} &rarr;</a>{% endif %}{% endfor %}{% if n == steps.len() %}<a class="btn next" href="#s1">Start again</a>{% endif %}</div>
 {% endmacro %}
-{% macro bar(map, n) %}
-{% if !map.is_empty() %}<svg class="proof-map" viewBox="0 0 {{ crate::html::MAP_WIDTH }} 18" role="img" aria-label="The proof drawn to scale, with this step's part lit">{% for g in map %}<a href="#s{{ g.step }}"><rect class="seg {{ g.class }}{% if g.step == n %} on{% endif %}" x="{{ g.x }}" y="0" width="{{ g.width }}" height="18" rx="3"><title>{{ g.label }}</title></rect></a>{% endfor %}</svg>
+{% macro bar(map, labels, n) %}
+{% if let Some(l) = labels %}<svg class="proof-map" width="100%" height="{{ l.height }}" role="img" aria-label="The proof drawn to scale, with this step's part lit">{% for g in map %}<a href="#s{{ g.step }}"><rect class="seg {{ g.class }}{% if g.step == n %} on{% endif %}" x="{{ g.x_pct() }}" y="{{ l.top }}" width="{{ g.width_pct() }}" height="{{ crate::html::map_labels::BAR_H }}" rx="4"><title>{{ g.label }}</title></rect></a>{% endfor %}
+{% for set in l.sets %}<g class="pm-{{ set.class }}">{% for t in set.inside %}<text class="pm-in{% if t.step == n %} on{% endif %}" x="{{ t.x }}" dx="8" y="{{ l.inside_y }}">{{ t.text }}</text>{% endfor %}{% for o in set.outside %}<g class="pm-out{% if o.step == n %} on{% endif %}">{% for x in o.ticks %}<line x1="{{ x }}" x2="{{ x }}" y1="{{ o.tick_y.0 }}" y2="{{ o.tick_y.1 }}"/>{% endfor %}{% if let Some((a, b)) = o.bracket %}<line x1="{{ a }}" x2="{{ b }}" y1="{{ o.tick_y.1 }}" y2="{{ o.tick_y.1 }}"/>{% endif %}<text x="{{ o.x }}" dx="{{ o.dx }}" y="{{ o.y }}" text-anchor="{{ o.anchor }}">{{ o.text }}</text></g>{% endfor %}</g>
+{% endfor %}</svg>
 <p class="map-note">This step's part of the proof, drawn to scale. Each part links to its step.</p>{% endif %}
 {% endmacro %}
 {% block content %}
@@ -34,7 +36,7 @@ leaf anyone can see, and a fourth point, R, commits to one of those masks for
 the checks that follow. The masks only come off inside the membership proof,
 where nobody can watch. The disguised amount doubles as the input's
 pseudo-output.</p>
-{% call bar(map, 2) %}{% endcall %}
+{% call bar(map, map_labels, 2) %}{% endcall %}
 <div class="facts"><div class="facts-h">In this transaction</div><dl>
 {% for i in inputs %}
 {% if let Some(d) = i.disguise %}
@@ -73,7 +75,7 @@ behind the disguised output, and that its key image was made with those same
 keys. A key image depends only on the output, not on how it was disguised, so
 spending one output twice shows up as the same key image twice. The proof also
 signs the transaction, so it cannot be moved onto another one.</p>
-{% call bar(map, 3) %}{% endcall %}
+{% call bar(map, map_labels, 3) %}{% endcall %}
 <div class="facts"><div class="facts-h">In this transaction</div><dl>
 {% for i in inputs %}<dt>Input {{ loop.index }} &middot; key image</dt><dd class="hash mark">{{ i.key_image }}</dd>{% endfor %}
 <dt>Size</dt><dd>{{ sal_len }} bytes per input</dd>
@@ -88,7 +90,8 @@ and its key image is</p>
 12 &times; 32 bytes. <var>P</var> commits to <var>x</var>, <var>r<sub>i</sub></var>
 and their product <var>z</var> = <var>x</var><var>r<sub>i</sub></var>. One
 challenge <var>e</var> ties four checks together. It is a hash of the
-transaction's signable hash, which covers its prefix and amounts, then
+transaction's signable hash, which covers its prefix, its fee, and its
+outputs' commitments and encrypted amounts, then
 <var>&Otilde;</var>, <var>&Itilde;</var>, <var>C&#x303;</var>, <var>R</var>,
 <var>L</var> and the six points. Two of the checks are</p>
 <p class="eq"><var>R<sub>O</sub></var> + <var>e</var>&middot;<var>&Otilde;</var> = <var>s<sub>&alpha;</sub></var>&middot;<var>G</var> + <var>s<sub>y</sub></var>&middot;<var>T</var><br>
@@ -117,7 +120,7 @@ the proof, so the climb cannot be matched against the tree. The layers
 alternate between two curves, Selene and Helios, paired so that a point on
 either can be fed to the other as numbers. So the climb is split between two
 proofs, one on each curve, each taking every other layer.</p>
-{% call bar(map, 4) %}{% endcall %}
+{% call bar(map, map_labels, 4) %}{% endcall %}
 <div class="facts"><div class="facts-h">In this transaction</div><dl>
 {% if let Some((bytes, share)) = membership %}<dt>Size</dt><dd>{{ bytes }} bytes, {{ share }}% of the proof</dd>{% endif %}
 <dt>Covers</dt><dd>{% if inputs.len() == 1 %}the one input{% else %}all {{ inputs.len() }} inputs at once{% endif %}</dd>
@@ -127,17 +130,39 @@ proofs, one on each curve, each taking every other layer.</p>
 <p>The proof is two Generalized Bulletproofs, arithmetic-circuit proofs, one
 over each curve.{% if let Some(s) = shape %} Here the Selene proof has
 {{ s.selene_rows }} rows, folded in {{ s.selene_rounds }} rounds, and the Helios
-proof {{ s.helios_rows }} rows in {{ s.helios_rounds }} rounds.{% endif %}</p>
+proof {{ s.helios_rows }} rows in {{ s.helios_rounds }} rounds.{% endif %}
+A row is one multiplication. The rows are rounded up to a power
+of two, and each round halves them and adds two points to the proof.</p>
+<p>For each input, the Selene proof first takes the masks off:</p>
 <p class="eq"><var>O</var> = <var>&Otilde;</var> &minus; <var>r<sub>o</sub></var>&middot;<var>T</var>,
 &ensp; <var>I</var> = <var>&Itilde;</var> &minus; <var>r<sub>i</sub></var>&middot;<var>U</var>,
-&ensp; <var>C</var> = <var>C&#x303;</var> &minus; <var>r<sub>c</sub></var>&middot;<var>G</var></p>
-<p>Taking each mask off is an elliptic-curve multiplication, which the circuit
+&ensp; <var>C</var> = <var>C&#x303;</var> &minus; <var>r<sub>c</sub></var>&middot;<var>G</var>,
+&ensp; <var>R</var> = <var>r<sub>i</sub></var>&middot;<var>V</var> + <var>r<sub>r<sub>i</sub></sub></var>&middot;<var>T</var></p>
+<p>with the same <var>r<sub>i</sub></var> in <var>I</var> and <var>R</var>. It
+then checks that the six coordinates of <var>O</var>, <var>I</var> and
+<var>C</var> are one of the leaves in a list it commits to. That list is
+committed as a node is, but with a mask:</p>
+<p class="eq"><var>N&prime;</var> = <var>H<sub>init</sub></var> + &Sigma;<sub><var>i</var></sub> <var>s<sub>i</sub></var>&middot;<var>G<sub>i</sub></var> + <var>b</var>&middot;<var>H</var> = <var>N</var> + <var>b</var>&middot;<var>H</var></p>
+<p>So <var>N&prime;</var> is the leaves' parent <var>N</var> hidden by a fresh
+mask <var>b</var> on a fixed point <var>H</var>. The Helios proof takes that
+mask off, <var>N</var> = <var>N&prime;</var> &minus; <var>b</var>&middot;<var>H</var>,
+and checks that <var>N</var>'s <var>x</var>-coordinate is in the next list, its
+parent's children, committed the same way. The climb goes on, alternating
+curves, up to the last list, the root's children, whose <var>N&prime;</var> is
+the next step's <var>root&prime;</var>. A short list is padded with zeros, as
+in the tree.</p>
+<p>To show that a value <var>v</var> is in a list <var>s<sub>1</sub></var>,
+&hellip;, <var>s<sub>k</sub></var>, the circuit shows</p>
+<p class="eq">(<var>s<sub>1</sub></var> &minus; <var>v</var>)(<var>s<sub>2</sub></var> &minus; <var>v</var>) &middot;&middot;&middot; (<var>s<sub>k</sub></var> &minus; <var>v</var>) = 0</p>
+<p>which holds only if <var>v</var> is one of them. For the leaves, a random
+challenge first folds each leaf's six numbers, and the output's, into one.
+Taking a mask off is an elliptic-curve multiplication, which the circuit
 checks with a divisor rather than working through it step by step. Ed25519's
-coordinates are Selene scalars, so the first step of the climb, from the
-outputs, is proved on Selene. Each proof takes the mask off the other curve's
-point from the layer below and checks that its <var>x</var>-coordinate is among
-its parent's children. The proof's size follows from the input count and the
-layer count alone.</p>
+coordinates are Selene scalars, so the leaves' step is proved on Selene, and
+from there each proof works on the other curve's points. A verifier sees only
+the masked <var>N&prime;</var>, never an <var>N</var>, a list, or which member
+matched. The proof's size follows from the input count and the layer count
+alone.</p>
 </details>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><path class="edge" d="M100 18L55 58M100 18L145 58M55 58L20 100M55 58L36 100M55 58L52 100M55 58L68 100M55 58L84 100M145 58L116 100M145 58L132 100M145 58L148 100M145 58L164 100M145 58L180 100"/><circle class="solid" cx="100" cy="18" r="5"/><circle class="node" cx="55" cy="58" r="5"/><circle class="node" cx="145" cy="58" r="5"/><circle class="node" cx="20" cy="100" r="3.5"/><circle class="node" cx="36" cy="100" r="3.5"/><circle class="node" cx="52" cy="100" r="3.5"/><circle class="node" cx="68" cy="100" r="3.5"/><circle class="node" cx="84" cy="100" r="3.5"/><circle class="node" cx="116" cy="100" r="3.5"/><circle class="node" cx="132" cy="100" r="3.5"/><circle class="node" cx="148" cy="100" r="3.5"/><circle class="node" cx="164" cy="100" r="3.5"/><circle class="node" cx="180" cy="100" r="3.5"/><text class="q" x="178" y="84">?</text></svg>
@@ -154,7 +179,7 @@ show that this copy is the real root plus that mask and nothing else. The
 verifier supplies the real
 root{% if let Some((b, _)) = root_block %}, the one block {{ b }} carries{% endif %},
 so a proof built on an invented tree fails.</p>
-{% call bar(map, 5) %}{% endcall %}
+{% call bar(map, map_labels, 5) %}{% endcall %}
 <div class="facts"><div class="facts-h">In this transaction</div><dl>
 <dt>Size</dt><dd>{{ root_pok_len }} bytes</dd>
 {% if let Some((b, root)) = root_block %}<dt>Root</dt><dd><span class="hash">{{ root }}</span>, in block <a href="/block/{{ b }}">{{ b }}</a></dd>{% endif %}
@@ -162,16 +187,19 @@ so a proof built on an invented tree fails.</p>
 </dl></div>
 <details class="maths"><summary>Show me the math</summary>
 <p class="eq"><var>root&prime;</var> = <var>root</var> + <var>b</var>&middot;<var>H</var><br>
-<var>R</var> + <var>c</var>&middot;(<var>root&prime;</var> &minus; <var>root</var>) = <var>s</var>&middot;<var>H</var></p>
+<var>R<sub>b</sub></var> + <var>c</var>&middot;(<var>root&prime;</var> &minus; <var>root</var>) = <var>s</var>&middot;<var>H</var></p>
 <p><var>root&prime;</var> is the proof's copy: <var>H<sub>init</sub></var> plus its
-commitment to the root's children, which carries a mask <var>b</var>.
-<var>R</var> and <var>s</var> are the {{ root_pok_len }} bytes, <var>c</var>
-is a challenge from the proof's transcript, and <var>H</var> is the blinding
-generator of the root's curve{% if let Some(c) = root_curve %}, {{ c }} here{% endif %}:
+commitment to the root's children, which carries a mask <var>b</var>, the top
+<var>N&prime;</var> of the climb. <var>R<sub>b</sub></var> and <var>s</var> are
+the {{ root_pok_len }} bytes, <var>c</var> is a challenge from the proof's
+transcript, which covers <var>R<sub>b</sub></var>, and <var>H</var> is the
+masking point of the root's curve{% if let Some(c) = root_curve %}, {{ c }} here{% endif %}:
 the root is on Selene when the tree has an odd number of layers and on Helios
 when it has an even number. This is a Schnorr proof that
 <var>root&prime;</var> &minus; <var>root</var> is a multiple of <var>H</var>
-the prover knows.</p>
+the prover knows. Were the proof's list not the real root's children,
+<var>root&prime;</var> &minus; <var>root</var> would also need other fixed
+points, and no multiple of <var>H</var> alone could make it.</p>
 </details>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><circle class="solid" cx="50" cy="60" r="9"/><path class="chain" d="M64 60H120"/><rect class="card" x="124" y="36" width="56" height="48" rx="5"/><text class="small" x="152" y="64" text-anchor="middle">block</text></svg>
@@ -197,7 +225,12 @@ but the fee.</p>
 for a mask <var>k</var> and an amount <var>a</var>. The left side sums the
 pseudo-outputs, the right the output commitments and the fee <var>f</var>. The
 sender chose the masks so that they cancel, which leaves the amounts to balance.
-The range proof shows each output amount lies in [0, 2<sup>64</sup>).</p>
+The range proof shows each output amount lies in [0, 2<sup>64</sup>). Without
+it, a negative amount, which wraps around to a huge number, could balance an
+output worth more than the inputs. The inputs need no range proof of their own:
+each <var>C&#x303;</var> is <var>C</var> + <var>r<sub>c</sub></var>&middot;<var>G</var>,
+as the membership proof showed, so it holds the amount of an output already on
+the chain.</p>
 </details>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><path class="line" d="M40 50H160M100 50V100M76 100H124"/><rect class="node" x="28" y="56" width="36" height="20" rx="3"/><text class="small" x="46" y="92" text-anchor="middle">in</text><rect class="node" x="130" y="56" width="26" height="20" rx="3"/><rect class="solid" x="158" y="56" width="10" height="20" rx="2"/><text class="small" x="149" y="92" text-anchor="middle">out + fee</text></svg>
@@ -222,11 +255,16 @@ by someone entitled to spend it, and only once. Not which ones.{% endif %}</p>
 <li>each input's signature, against the transaction's signable hash;</li>
 <li>that each key image is a point of the prime-order group other than the
 identity, and has not been seen before;</li>
-<li>the membership proof, against the root{% if let Some((b, _)) = root_block %} in block {{ b }}{% endif %};</li>
+<li>the membership proof, against the root{% if let Some((b, _)) = root_block %} in block {{ b }}{% endif %}
+and the tree's layer count{% if let Some(r) = reference_block %} as of block {{ r }}{% endif %};</li>
 <li>that the amounts balance, and the range proof.</li>
 </ol>
-<p>None of these depends on which leaf was spent, so passing them says nothing
-about it.</p>
+<p>Each input's signature and the membership proof are over the same
+<var>&Otilde;</var>, <var>&Itilde;</var>, <var>R</var> and <var>C&#x303;</var>,
+which both proofs' challenges hash. So the output shown to be in the tree is
+the one whose keys signed, whose key image is new, and whose amount balances.
+None of these checks depends on which leaf was spent, so passing them says
+nothing about it.</p>
 </details>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true">{% for y in 0..5 %}{% for x in 0..11 %}<circle class="node" cx="{{ 22 + x * 16 }}" cy="{{ 24 + y * 18 }}" r="5"/>{% endfor %}{% endfor %}</svg>
@@ -255,13 +293,21 @@ hash of <var>O</var> onto the curve, and its amount commitment
 <var>C</var>. A leaf is the <var>x</var> and <var>y</var> coordinates of all
 three, in Weierstrass form: six numbers, which are exactly Selene scalars. A node commits to its
 children as</p>
-<p class="eq"><var>H<sub>init</sub></var> + &Sigma;<sub><var>i</var></sub> <var>s<sub>i</sub></var>&middot;<var>G<sub>i</sub></var></p>
-<p>At the bottom the <var>s<sub>i</sub></var> are the leaves' six scalars each,
-38 leaves to a Selene node. Above that each <var>s<sub>i</sub></var> is a child
-node's <var>x</var>-coordinate: 18 Selene nodes to a Helios node, 38 Helios
-nodes to a Selene node, and so on. A Selene point's coordinates are Helios
-scalars and a Helios point's are Selene scalars, so each layer feeds the
-next.</p>
+<p class="eq"><var>N</var> = <var>H<sub>init</sub></var> + &Sigma;<sub><var>i</var></sub> <var>s<sub>i</sub></var>&middot;<var>G<sub>i</sub></var></p>
+<p>where <var>H<sub>init</sub></var> and the <var>G<sub>i</sub></var> are fixed
+points on the node's curve, with no known relation to each other, so no other
+list of children gives the same <var>N</var>. At the bottom the
+<var>s<sub>i</sub></var> are the leaves' six scalars each, 38 leaves to a Selene
+node. Above that each <var>s<sub>i</sub></var> is a child node's
+<var>x</var>-coordinate: 18 Selene nodes to a Helios node, 38 Helios nodes to a
+Selene node, and so on up to a single node, the root. A Selene point's
+coordinates are Helios scalars and a Helios point's are Selene scalars, so each
+layer feeds the next. Outputs join in order, so only the last node of a layer
+can have fewer children than the rest, and its missing children count as
+zero.</p>
+{% if !layer_sums.is_empty() %}<p class="eq">{% for l in layer_sums %}&lceil;{{ l.children }} &divide; {{ l.width }}&rceil; = {{ l.nodes }} {{ l.curve }} node{% if l.nodes != "1" %}s{% endif %}{% if loop.last %}, the root{% else %}<br>{% endif %}{% endfor %}</p>
+<p>That is this tree, one line for each of its {{ layer_sums.len() }}
+layer{% if layer_sums.len() != 1 %}s{% endif %}.</p>{% endif %}
 </details>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><path class="web" d="M96 38H104L120 56H80ZM80 64H120L170 82H30Z"/><rect class="solid" x="96" y="30" width="8" height="8" rx="2"/><rect class="node" x="80" y="56" width="40" height="8" rx="2"/><rect class="node" x="30" y="82" width="140" height="8" rx="2"/></svg>

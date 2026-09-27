@@ -22,6 +22,7 @@ use crate::api::handlers::{AppState, Shared, echo};
 use crate::config::Theme;
 
 mod leaf_grid;
+mod map_labels;
 mod paths;
 mod tree_field;
 pub use paths::tree_paths;
@@ -1526,7 +1527,41 @@ struct FcmpPage {
     root_curve: Option<&'static str>,
     /// The proof drawn to scale, one segment per part.
     map: Vec<ProofSegment>,
+    map_labels: Option<map_labels::MapLabels>,
     tree: Option<[tree_field::TreeField; 2]>,
+    /// How the tree's size gives each layer's, from the leaves up. Empty
+    /// where the size is not known.
+    layer_sums: Vec<LayerSum>,
+}
+
+/// One layer of a curve tree as a division: `children` members, `width` to
+/// a parent, make `nodes` nodes on `curve`.
+struct LayerSum {
+    children: String,
+    width: u64,
+    nodes: String,
+    curve: &'static str,
+}
+
+/// The layers of a tree of `leaves` outputs as `LayerSum`s.
+fn layer_sums(leaves: u64) -> Vec<LayerSum> {
+    use explorer_core::curve_tree::{Curve, group_width};
+
+    let mut children = leaves;
+    monerod_rpc::types::tree_layers(leaves)
+        .into_iter()
+        .enumerate()
+        .map(|(below, nodes)| {
+            let sum = LayerSum {
+                children: grouped(children),
+                width: group_width(below),
+                nodes: grouped(nodes),
+                curve: Curve::of_layer(below + 1).name(),
+            };
+            children = nodes;
+            sum
+        })
+        .collect()
 }
 
 struct ShapeView {
@@ -1538,12 +1573,24 @@ struct ShapeView {
 
 /// One part of the proof along the walkthrough's bar.
 struct ProofSegment {
+    /// Left and width in thousandths of the bar.
     x: u32,
     width: u32,
     class: &'static str,
     /// The step that explains this part.
     step: usize,
+    bytes: usize,
     label: String,
+}
+
+impl ProofSegment {
+    fn x_pct(&self) -> String {
+        format!("{}%", f64::from(self.x) / 10.0)
+    }
+
+    fn width_pct(&self) -> String {
+        format!("{}%", f64::from(self.width) / 10.0)
+    }
 }
 
 /// The bar's coordinate space, and the narrowest a part is drawn so it can
@@ -1607,7 +1654,7 @@ fn proof_map(inputs: usize, membership_len: usize) -> Vec<ProofSegment> {
     parts
         .into_iter()
         .zip(drawn)
-        .map(|((_, class, step, label), w)| {
+        .map(|((bytes, class, step, label), w)| {
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
@@ -1624,6 +1671,7 @@ fn proof_map(inputs: usize, membership_len: usize) -> Vec<ProofSegment> {
                 width: (end - x).saturating_sub(2),
                 class,
                 step,
+                bytes,
                 label,
             }
         })
@@ -1765,8 +1813,10 @@ fn fcmp_page(
         shape,
         root_curve: layers
             .map(|l| explorer_core::curve_tree::Curve::of_layer(usize::from(l)).name()),
+        map_labels: map_labels::map_labels(&map),
         map,
         tree,
+        layer_sums: anonymity_set.map(layer_sums).unwrap_or_default(),
     }
 }
 
@@ -4098,6 +4148,10 @@ mod tests {
         ), "{html}");
         assert!(html.contains("<dt>Root is on</dt><dd>Helios</dd>"));
         assert!(html.contains(r#"aria-label="Curve tree of 62 outputs in 2 layers"#));
+        assert!(html.contains(
+            "&lceil;62 &divide; 38&rceil; = 2 Selene nodes<br>&lceil;2 &divide; 18&rceil; = 1 Helios node, the root"
+        ));
+        assert!(html.contains("one line for each of its 2\nlayers."));
         // Step 1 keeps its picture beside the words, the tree among them.
         let first = &html[html.find(r#"id="s1""#).expect("step 1")..];
         let tree = first
@@ -4125,6 +4179,10 @@ mod tests {
         assert!(odd.tree.is_none());
         let html = odd.render().expect("renders");
         assert!(!html.contains("rows, folded in"));
+        assert!(
+            !html.contains("&lceil;"),
+            "no sums for a tree of unknown size"
+        );
         assert!(
             html.contains(r#"<path class="web" d="M96 38H104"#),
             "the drawing is there without the tree"

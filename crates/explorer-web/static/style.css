@@ -614,11 +614,26 @@ dl.kv.spaced { margin-top: 0.8rem; }
 .pic .small { fill: var(--fg-muted); font-size: 11px; }
 .pic .q { fill: var(--accent); font-size: 28px; font-weight: 700; }
 
-.proof-map { display: block; width: 100%; height: auto; margin: 0.2rem 0 0.1rem; }
-.proof-map .seg { fill: var(--accent); opacity: 0.22; }
-.proof-map .seg.sal { opacity: 0.32; }
+/* The proof bar's parts stretch with the column and its labels do not; the
+   column's width picks the labels laid out for it (`map_labels.rs`). */
+.step-card .copy { container-type: inline-size; }
+.proof-map { display: block; width: 100%; margin: 0.3rem 0 0.1rem; overflow: visible; }
+.proof-map .seg { fill: var(--accent); opacity: 0.16; }
+.proof-map .seg.sal { opacity: 0.26; }
 .proof-map .seg.on { opacity: 1; }
 .proof-map a:hover .seg { opacity: 0.7; }
+.proof-map text { pointer-events: none; }
+.proof-map .pm-in { font-size: 12px; fill: var(--fg-muted); }
+.proof-map .pm-in.on { fill: var(--accent-fg); font-weight: 600; }
+.proof-map .pm-out text { font-size: 11.5px; fill: var(--fg-faint); }
+.proof-map .pm-out line { stroke: var(--fg-faint); stroke-width: 1; opacity: 0.6; }
+.proof-map .pm-out.on text { fill: var(--accent); font-weight: 600; }
+.proof-map .pm-out.on line { stroke: var(--accent); opacity: 1; }
+.proof-map .pm-n { display: none; }
+@container (max-width: 519.98px) {
+  .proof-map .pm-w { display: none; }
+  .proof-map .pm-n { display: inline; }
+}
 
 .step-card .curve-tree { border: 0; padding: 0; margin: 1rem 0 0; background: none; }
 
