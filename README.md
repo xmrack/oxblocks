@@ -272,8 +272,11 @@ the tip or of a block given as `?block=`. A path is what a wallet holds to
 spend the output: the group of up to 38 outputs it sits in, then at each layer
 above, the group of up to 18 or 38 nodes holding its ancestor, up to the root.
 The page shows one output's path, or all of a transaction's paths together
-with the groups they share, draws them over the tree, and says what a wallet
-would store for them.
+with the groups they share, and says what a wallet would store for them. It
+draws the part of the tree the paths climb through as a grid: each row is a
+group of outputs and ends in the layer-1 node it hashes to, and each layer
+above is a column of its group, bracketed to the node it hashes to, up to
+the root.
 
 The same endpoint gives the paths. oxblocks asks for up to 50 outputs a call,
 the most a restricted node answers. It first checks that the leaf each path

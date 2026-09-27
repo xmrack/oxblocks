@@ -8,6 +8,5 @@
       <text class="label" x="0" y="{{ r.label_y }}">{{ r.name }}{% if let Some(curve) = r.curve %}<tspan class="curve"> · {{ curve }}</tspan>{% endif %}</text>
       {% if let Some(count) = r.count %}<text class="count" x="{{ t.count_x }}" y="{{ r.label_y }}" text-anchor="{{ t.count_anchor }}">{{ count }}</text>{% endif %}
       {% endfor %}
-      {% for m in t.marks %}<polyline class="path" points="{{ m.points }}"/>{% for (x, y) in m.dots %}<circle class="path-dot" cx="{{ x }}" cy="{{ y }}" r="3.5"/>{% endfor %}{% endfor %}
       {% if let Some(root) = t.root %}<text class="root-hash" x="{{ t.root_x }}" y="{{ t.root_y }}" text-anchor="middle">{{ root }}</text>{% endif %}
     </svg>

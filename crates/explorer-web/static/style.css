@@ -589,8 +589,17 @@ form.as-of button {
 
 /* A path over the funnel: a line through its ancestor on every bar, in the
    text colour so it reads against the accent bars. */
-.curve-tree .path { fill: none; stroke: var(--fg); stroke-width: 1.5; stroke-linejoin: round; opacity: 0.8; }
-.curve-tree .path-dot { fill: var(--fg); }
+.leaf-grid { display: block; width: 100%; max-width: 480px; height: auto; margin: 0.4rem auto 0; overflow: visible; }
+.leaf-grid .cell.on { fill: var(--accent); }
+.leaf-grid .cell.kept { fill: var(--accent); opacity: 0.42; }
+.leaf-grid .base { fill: var(--accent); opacity: 0.14; }
+.leaf-grid .cell.other { fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1; }
+.leaf-grid .bracket { fill: none; stroke: var(--accent); stroke-width: 1.1; stroke-linejoin: round; opacity: 0.8; }
+.leaf-grid .glabel { fill: var(--fg-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.grid-legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.3rem 1rem; margin: 0.7rem 0 0; font-size: 0.8rem; color: var(--fg-muted); }
+.grid-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 0.35rem; vertical-align: -1px; background: var(--accent); }
+.grid-legend i.kept { opacity: 0.42; }
+.grid-legend i.other { background: var(--bg-raised); border: 1px solid var(--accent); }
 
 table.path-status { margin-bottom: 0.6rem; }
 .path-layer h2 .curve { color: var(--fg-faint); font-weight: 400; font-size: 0.75em; margin-left: 0.3rem; }

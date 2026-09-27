@@ -21,6 +21,7 @@ use monerod_rpc::types::{TxEntry, TxJson};
 use crate::api::handlers::{AppState, Shared, echo};
 use crate::config::Theme;
 
+mod leaf_grid;
 mod paths;
 pub use paths::tree_paths;
 
@@ -368,15 +369,6 @@ struct TreeFunnel {
     count_anchor: &'static str,
     leaves: String,
     layers: usize,
-    /// Paths drawn over the tree, one line each from an output up to the
-    /// root. None on a spend's tree: nothing there says which output it spent.
-    marks: Vec<FunnelMark>,
-}
-
-/// One path over a funnel: a line through a point on each bar.
-struct FunnelMark {
-    points: String,
-    dots: Vec<(u32, u32)>,
 }
 
 struct FunnelRow {
@@ -532,41 +524,7 @@ fn tree_funnel(leaves: u64, root: Option<&str>, layout: &FunnelLayout) -> Option
         root: root.and_then(|r| r.get(..16)).map(|r| format!("{r}…")),
         leaves: grouped(leaves),
         layers: depth,
-        marks: Vec::new(),
     })
-}
-
-/// Draw `paths` over `funnel`, each given as its groups from the leaves up
-/// (see [`explorer_core::curve_tree::path_groups`]). Each passes through its
-/// ancestor's place along every bar: the member's index across the layer,
-/// scaled to the bar's width.
-fn mark_paths(funnel: &mut TreeFunnel, paths: &[&[explorer_core::curve_tree::Group]]) {
-    let depth = funnel.layers;
-    let marks = paths
-        .iter()
-        .filter(|groups| groups.len() == depth + 1)
-        .map(|groups| {
-            let dots: Vec<(u32, u32)> = groups
-                .iter()
-                .filter_map(|g| {
-                    let row = funnel.rows.get(depth.checked_sub(g.layer)?)?;
-                    let across = (2 * u128::from(g.member) + 1) * u128::from(row.width)
-                        / (2 * u128::from(g.layer_size.max(1)));
-                    let x = row.x + u32::try_from(across).ok()?.min(row.width);
-                    Some((x, row.y + FUNNEL_BAR / 2))
-                })
-                .collect();
-            FunnelMark {
-                points: dots
-                    .iter()
-                    .map(|(x, y)| format!("{x},{y}"))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                dots,
-            }
-        })
-        .collect();
-    funnel.marks = marks;
 }
 
 /// A bar's width: the log of its node count against the log of the outputs',

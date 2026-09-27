@@ -53,19 +53,27 @@ the ones whose hashes do not hold.</div>
 {% if !windows.is_empty() %}<nav class="tabs" aria-label="Outputs, fifty at a time">{% for w in windows %}<a href="{{ w.href }}"{% if w.on %} class="on" aria-current="page"{% endif %}>{{ w.label }}</a>{% endfor %}</nav>{% endif %}
 <nav class="tabs" aria-label="Which paths">{% for t in tabs %}<a href="{{ t.href }}"{% if t.on %} class="on" aria-current="page"{% endif %}>{{ t.label }}</a>{% endfor %}</nav>
 
-{% if let Some(picture) = tree %}
+{% if let Some(g) = grid %}
 <figure class="curve-tree">
   <figcaption>{% if showing.is_some() %}This output's path{% else %}The paths together{% endif %}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
-    <p>The whole tree, one bar per layer, with the outputs at the bottom and
-    the root at the top. Each bar's width is logarithmic in its size. The line
-    climbs from the output through its ancestor in every layer, placed along
-    each bar by its position in that layer. Outputs of one transaction join
-    the tree side by side, so their lines mostly run together.</p></details>
+    <p>The part of the tree these paths climb through. Each row is one group
+    of up to 38 outputs, the tree's leaves in the order they joined it, and
+    the cell at the row's end is the node of layer 1 the row hashes to. That
+    column of nodes is itself a group, which hashes to one node of the layer
+    above, and so on to the root. The solid cells are on the paths shown.
+    The tinted rest of each of their groups is what a wallet keeps with them:
+    to prove an output is in the tree, it needs every member of every group
+    on the output's path.</p></details>
   </figcaption>
-  <div class="scroll">
-  {% for t in picture %}{% include "funnel.html" %}{% endfor %}
-  </div>
+  <svg class="leaf-grid" viewBox="0 0 {{ g.width }} {{ g.height }}" role="img" aria-label="{{ g.summary }}">
+    <defs><pattern id="leaf-cells" width="{{ crate::html::leaf_grid::PITCH }}" height="{{ crate::html::leaf_grid::PITCH }}" patternUnits="userSpaceOnUse"><rect class="base" width="{{ crate::html::leaf_grid::CELL }}" height="{{ crate::html::leaf_grid::CELL }}" rx="1"/></pattern></defs>
+    {% for l in g.labels %}<text class="glabel" x="{{ l.x }}" y="13">{{ l.text }}</text>{% endfor %}
+    {% for b in g.bars %}<rect x="0" y="{{ b.y }}" width="{{ b.width }}" height="{{ crate::html::leaf_grid::CELL }}" fill="url(#leaf-cells)"/>{% endfor %}
+    {% for c in g.cells %}<rect class="cell {{ c.class }}" x="{{ c.x }}" y="{{ c.y }}" width="{{ crate::html::leaf_grid::CELL }}" height="{{ crate::html::leaf_grid::CELL }}" rx="1"><title>{{ c.title }}</title></rect>{% endfor %}
+    {% for d in g.brackets %}<path class="bracket" d="{{ d }}"/>{% endfor %}
+  </svg>
+  <p class="grid-legend"><span><i class="on"></i>On {% if showing.is_some() %}this path{% else %}these paths{% endif %}</span><span><i class="kept"></i>The rest of their groups, kept too</span>{% if g.has_others %}<span><i class="other"></i>The transaction's other outputs</span>{% endif %}</p>
 </figure>
 {% endif %}
 

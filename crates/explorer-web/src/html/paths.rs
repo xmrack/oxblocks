@@ -7,11 +7,12 @@ use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use explorer_core::curve_tree::{Curve, Group, PathCheck, PlacedPath, group_width};
+
+use super::leaf_grid::{LeafGrid, leaf_grid};
 use monerod_rpc::types::{LeafKind, PathLeaf};
 
 use super::{
-    ChainStatus, Page, TreeFunnel, VERSION, chain_error_page, error_page, fetch_tx, grouped,
-    mark_paths, render, status_of, tree_picture,
+    ChainStatus, Page, VERSION, chain_error_page, error_page, fetch_tx, grouped, render, status_of,
 };
 use crate::api::handlers::Shared;
 use crate::tree_paths::{MAX_OUTPUTS, PathsError, PathsParams, RootCheck, TxPaths, gather};
@@ -46,7 +47,8 @@ struct PathsPage {
     tabs: Vec<Tab>,
     windows: Vec<Tab>,
     statuses: Vec<StatusRow>,
-    tree: Option<[TreeFunnel; 2]>,
+    /// The part of the tree the paths climb through. See [`leaf_grid`].
+    grid: Option<LeafGrid>,
     /// From the root down, the leaves' parents last.
     layers: Vec<LayerView>,
     leaf_groups: Vec<LeafGroupView>,
@@ -187,19 +189,25 @@ pub async fn tree_paths(
         }
     };
 
-    render(StatusCode::OK, &page(chain, hash, total, q.output, &paths))
+    render(
+        StatusCode::OK,
+        &page(chain, hash, total, q.output, &paths, &entry.unified_ids),
+    )
 }
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
+/// `unified_ids` are every output's of the transaction, in order, for the
+/// ones in a group shown but not among the outputs shown.
 fn page(
     chain: Option<ChainStatus>,
     hash: String,
     total: usize,
     showing: Option<usize>,
     paths: &TxPaths,
+    unified_ids: &[u64],
 ) -> PathsPage {
     let block = (paths.as_of_block != paths.tip).then_some(paths.as_of_block);
     let base = format!("/tx/{hash}/paths");
@@ -284,20 +292,8 @@ fn page(
         .map(|o| (o.unified_id, o.index + 1))
         .collect();
 
-    let mut tree = (paths.n_leaf_tuples > 0)
-        .then(|| {
-            tree_picture(
-                paths.n_leaf_tuples,
-                paths.root_block.as_ref().map(|(_, r)| r.as_str()),
-            )
-        })
-        .flatten();
-    if let Some(picture) = tree.as_mut() {
-        let groups: Vec<&[Group]> = placed.iter().map(|p| p.groups.as_slice()).collect();
-        for funnel in picture.iter_mut() {
-            mark_paths(funnel, &groups);
-        }
-    }
+    let every_output: BTreeMap<u64, usize> = unified_ids.iter().copied().zip(1..).collect();
+    let grid = leaf_grid(&placed, paths.n_leaf_tuples, &every_output);
 
     let (layers, leaf_groups) = union(&placed, &outputs_by_id);
     let (stored, stored_apart) = stored_bytes(&placed);
@@ -324,7 +320,7 @@ fn page(
         tabs,
         windows,
         statuses,
-        tree,
+        grid,
         layers,
         leaf_groups,
         stored,
@@ -533,7 +529,7 @@ mod tests {
     fn every_path_of_the_captured_transaction_leads_to_its_blocks_root() {
         let paths = later();
         assert_eq!(paths.root_check(), RootCheck::Matches);
-        let p = page(None, "ab".to_owned(), 4, None, &paths);
+        let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
         assert_eq!(p.root_check, "matches");
         assert_eq!(p.n_layers, 3);
         assert_eq!(p.statuses.len(), 4);
@@ -566,30 +562,68 @@ mod tests {
         let html = p.render().unwrap();
         assert!(html.contains("every path leads here"));
         assert!(html.contains("What a wallet keeps"));
-        assert_eq!(
-            html.matches("class=\"path\"").count(),
-            2 * 4,
-            "four paths, wide and narrow"
-        );
+        assert!(html.contains("class=\"leaf-grid\""));
     }
 
+    /// The cells of one grid, by what they are.
+    fn classes(g: &super::super::leaf_grid::LeafGrid, leaves: bool) -> Vec<&'static str> {
+        use super::super::leaf_grid::PITCH;
+        g.cells
+            .iter()
+            .filter(|c| (c.x < 38 * PITCH) == leaves)
+            .map(|c| c.class)
+            .collect()
+    }
+
+    /// Together, the four outputs are solid in their row of leaves, their
+    /// one node of each layer above is solid in its column, and brackets
+    /// join layer 1 to layer 2 and layer 2 to the root.
     #[test]
-    fn a_path_is_drawn_through_its_ancestor_on_every_bar() {
-        // Shown alone, an output is the only one fetched.
+    fn the_grid_draws_the_groups_the_paths_climb_through() {
+        use super::super::leaf_grid::PITCH;
+        let paths = later();
+        let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
+        let g = p.grid.as_ref().unwrap();
+
+        let leaves = classes(g, true);
+        assert_eq!(leaves.iter().filter(|&&c| c == "on").count(), 4);
+        assert!(leaves.iter().all(|&c| c == "on" || c == "kept"));
+        let above = classes(g, false);
+        // One node lit in each of layer 1, layer 2 and the root.
+        assert_eq!(above.iter().filter(|&&c| c == "on").count(), 3);
+        assert_eq!(g.brackets.len(), 2);
+        assert!(!g.has_others);
+        let labels: Vec<&str> = g.labels.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(&labels[1..], ["L1", "L2", "Root"]);
+        assert!(labels[0].starts_with("Leaves "), "{}", labels[0]);
+
+        // Rows the paths miss are drawn with a pattern whose cells fall
+        // every pitch, so every row starts on one.
+        assert!(g.bars.iter().all(|b| b.y % PITCH == 0));
+        assert!(
+            g.cells
+                .iter()
+                .filter(|c| c.x < 38 * PITCH)
+                .all(|c| c.y % PITCH == 0 && c.x % PITCH == 0)
+        );
+        assert!(g.cells.iter().all(|c| c.x < g.width && c.y < g.height));
+    }
+
+    /// Shown alone, an output is solid and the transaction's others in its
+    /// group are outlined.
+    #[test]
+    fn one_output_shown_alone_outlines_the_others() {
         let mut paths = later();
         paths.outputs.truncate(1);
-        let p = page(None, "ab".to_owned(), 4, Some(1), &paths);
-        let [wide, _] = p.tree.as_ref().unwrap();
-        let [mark] = &wide.marks[..] else {
-            panic!("one path")
-        };
-        // Root first in the funnel, leaves last: one dot per bar.
-        assert_eq!(mark.dots.len(), 4);
-        let root = &wide.rows[0];
-        assert_eq!(mark.dots[3].0, root.x + root.width / 2, "the root's middle");
-        // The leaf is near the right end of the outputs' bar.
-        let leaves = &wide.rows[3];
-        assert!(mark.dots[0].0 > leaves.x + leaves.width * 9 / 10);
+        let p = page(None, "ab".to_owned(), 4, Some(1), &paths, &IDS);
+        let g = p.grid.as_ref().unwrap();
+        let leaves = classes(g, true);
+        assert_eq!(leaves.iter().filter(|&&c| c == "on").count(), 1);
+        assert_eq!(leaves.iter().filter(|&&c| c == "other").count(), 3);
+        assert!(g.has_others);
+        let html = p.render().unwrap();
+        assert!(html.contains("The transaction's other outputs"));
+        assert!(html.contains("<title>Leaf "));
     }
 
     #[test]
@@ -600,7 +634,7 @@ mod tests {
             ROOT_806,
         );
         assert_eq!(paths.root_check(), RootCheck::Unchecked);
-        let p = page(None, "ab".to_owned(), 4, None, &paths);
+        let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
         assert!(
             p.statuses
                 .iter()
@@ -619,7 +653,7 @@ mod tests {
             &"00".repeat(32),
         );
         assert_eq!(paths.root_check(), RootCheck::Fails);
-        let html = page(None, "ab".to_owned(), 4, None, &paths)
+        let html = page(None, "ab".to_owned(), 4, None, &paths, &IDS)
             .render()
             .unwrap();
         assert!(html.contains("a path does not lead here"));
@@ -629,7 +663,7 @@ mod tests {
     fn links_keep_the_block_and_the_output() {
         let mut paths = later();
         paths.tip = 900;
-        let p = page(None, "ab".to_owned(), 4, Some(2), &paths);
+        let p = page(None, "ab".to_owned(), 4, Some(2), &paths, &IDS);
         let hrefs: Vec<&str> = p.tabs.iter().map(|t| t.href.as_str()).collect();
         assert_eq!(
             hrefs,
