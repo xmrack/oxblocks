@@ -454,6 +454,84 @@ dl.kv.spaced { margin-top: 0.8rem; }
   .curve-tree > .walk { position: static; display: inline-block; margin: 0 0 0.5rem; }
 }
 .walk-row { margin: 0.2rem 0 0.9rem; }
+
+/* The FCMP++ walkthrough's curve tree: every output a strand, gathering group
+   by group up to the root. The narrow picture reuses the wide one's strokes
+   through <use>, so a stroke's rule names only its own classes. */
+.tree-field { padding: 0.4rem 0.4rem 0.2rem; }
+.tree-field .tf-fig { display: block; width: 100%; height: auto; overflow: visible; }
+.tree-field .tf-wide { max-width: 840px; margin: 0 auto; }
+.tree-field .tf-narrow { display: none; max-width: 420px; margin: 0 auto; }
+@media (max-width: 840px) {
+  /* Hidden without display: none, which would stop the strokes the narrow
+     picture reuses from painting. */
+  .tree-field .tf-wide { position: absolute; width: 0; height: 0; visibility: hidden; }
+  .tree-field .tf-narrow { display: block; }
+  .tf-tooth { stroke-width: 0.16; }
+  .tf-glow.tf-g2 { stroke-width: 6; }
+  .tf-glow.tf-g3 { stroke-width: 11; }
+}
+.tf { fill: none; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.tf-strand.tf-s, .tf-fibre.tf-s, .tf-glow.tf-s, .tf-comb.tf-s, .tf-rule.tf-s, .tf-rule.tf-o, .tf-tooth { stroke: var(--accent); }
+.tf-strand.tf-h, .tf-fibre.tf-h, .tf-glow.tf-h, .tf-comb.tf-h, .tf-rule.tf-h, .tf-drop { stroke: var(--tree-helios); }
+.tf-strand { stroke-width: 0.4; opacity: var(--tree-strand); }
+.tf-strand.tf-mid { stroke-width: 0.6; opacity: calc(var(--tree-strand) * 1.45); }
+.tf-strand.tf-sparse { stroke-width: 0.9; opacity: 0.72; }
+.tf-fibre { stroke-width: 0.45; opacity: var(--tree-fibre); }
+.tf-glow { opacity: var(--tree-glow); }
+.tf-glow.tf-g1 { stroke-width: 4; }
+.tf-glow.tf-g2 { stroke-width: 10; opacity: calc(var(--tree-glow) * 0.8); }
+.tf-glow.tf-g3 { stroke-width: 22; opacity: calc(var(--tree-glow) * 0.6); }
+.tf-drop { stroke-width: 0.6; opacity: 0.48; }
+.tf-tooth, .tf-comb { stroke-width: 0.5; stroke-linecap: butt; }
+.tf-tooth.tf-mid { stroke-width: 0.9; }
+.tf-tooth.tf-t0 { opacity: 0.92; }
+.tf-tooth.tf-t1 { opacity: 0.55; }
+.tf-rule { stroke-linecap: butt; opacity: 0.8; }
+.tf-rule.tf-w1 { stroke-width: 1; }
+.tf-rule.tf-w2 { stroke-width: 1.6; }
+.tf-rule.tf-w3 { stroke-width: 2.4; }
+.tf-rule.tf-w4 { stroke-width: 3.4; }
+.tf-rule.tf-w5 { stroke-width: 4.6; }
+.tree-field .tf-dot { fill: var(--accent); }
+.tree-field .tf-ringnode { fill: var(--bg-raised); stroke: var(--tree-helios); stroke-width: 1.3; }
+.tree-field .tf-leafdot { fill: var(--accent); opacity: 0.88; }
+.tree-field .tf-halo { opacity: 0.14; }
+.tree-field .tf-halo.tf-s { fill: var(--accent); }
+.tree-field .tf-halo.tf-h { fill: var(--tree-helios); }
+.tf-b0 { stop-color: var(--accent); stop-opacity: var(--tree-bloom); }
+.tf-b1 { stop-color: var(--accent); stop-opacity: calc(var(--tree-bloom) * 0.3); }
+.tf-b2 { stop-color: var(--accent); stop-opacity: 0; }
+.tree-field .tf-ring { fill: none; stroke-width: 1; }
+.tree-field .tf-ring.tf-s { stroke: var(--accent); }
+.tree-field .tf-ring.tf-h { stroke: var(--tree-helios); }
+.tree-field .tf-core { fill: var(--accent); stroke: var(--bg-raised); stroke-width: 1.5; }
+.tree-field .tf-axis { stroke: var(--line); stroke-width: 1; fill: none; }
+.tree-field .tf-tick { stroke: var(--fg-faint); stroke-width: 1; fill: none; }
+.tree-field .tf-lead { stroke: var(--fg-faint); stroke-width: 1; stroke-dasharray: 1 3; opacity: 0.7; fill: none; }
+.tree-field .tf-key { stroke-width: 1.4; }
+.tree-field .tf-ks { fill: var(--accent); stroke: none; }
+.tree-field .tf-kh { fill: none; stroke: var(--tree-helios); }
+.tree-field .tf-ko { stroke: var(--fg); stroke-width: 1; fill: none; opacity: 0.75; }
+.tree-field .tf-name { fill: var(--fg); font-size: 13px; font-weight: 600; }
+.tree-field .tf-cv { fill: var(--fg-muted); font-weight: 400; }
+.tree-field .tf-sub { fill: var(--fg-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.tree-field .tf-hash {
+  fill: var(--fg-muted);
+  font: 10.5px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+.tree-field .tf-lnk { fill: var(--accent); }
+.tree-field .tf-name.tf-sm { font-size: 11.5px; }
+.tree-field .tf-sub.tf-sm { font-size: 10.5px; }
+.tree-field .tf-hash.tf-sm { font-size: 9px; }
+.tree-field .tf-brk { stroke: var(--fg-faint); stroke-width: 1; fill: none; }
+.tree-field .tf-meas { fill: var(--fg-muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.tree-field .tf-short { fill: var(--accent); font-weight: 600; }
+.tree-field .tf-pp { fill: var(--fg-faint); }
+@media (prefers-reduced-motion: no-preference) {
+  .tree-field .tf-bloom { animation: tf-breathe 6s ease-in-out infinite alternate; }
+}
+@keyframes tf-breathe { from { opacity: 1; } to { opacity: 0.72; } }
 .curve-tree .root-hash {
   fill: var(--fg-faint);
   font: 9.5px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;

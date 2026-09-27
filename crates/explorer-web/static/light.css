@@ -19,4 +19,11 @@
   --coinbase: #2f6f4f;
   --warn-bg: #fdf3e3;
   --warn-line: #e0b877;
+  /* The walkthrough's curve tree: Helios strands, and how strongly the
+     strands, fibres, glows and the root's bloom show. */
+  --tree-helios: #127ea6;
+  --tree-strand: .3;
+  --tree-fibre: .26;
+  --tree-glow: .045;
+  --tree-bloom: .22;
 }

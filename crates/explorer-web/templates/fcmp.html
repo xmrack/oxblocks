@@ -46,7 +46,7 @@ pseudo-output.</p>
 {% endfor %}
 <dt>Size</dt><dd>{{ tuple_len }} bytes per input</dd>
 </dl></div>
-<details class="maths"><summary>Show the maths</summary>
+<details class="maths"><summary>Show me the math</summary>
 <p class="eq"><var>&Otilde;</var> = <var>O</var> + <var>r<sub>o</sub></var>&middot;<var>T</var><br>
 <var>&Itilde;</var> = <var>I</var> + <var>r<sub>i</sub></var>&middot;<var>U</var><br>
 <var>R</var> = <var>r<sub>i</sub></var>&middot;<var>V</var> + <var>r<sub>r<sub>i</sub></sub></var>&middot;<var>T</var><br>
@@ -78,7 +78,7 @@ signs the transaction, so it cannot be moved onto another one.</p>
 {% for i in inputs %}<dt>Input {{ loop.index }} &middot; key image</dt><dd class="hash mark">{{ i.key_image }}</dd>{% endfor %}
 <dt>Size</dt><dd>{{ sal_len }} bytes per input</dd>
 </dl></div>
-<details class="maths"><summary>Show the maths</summary>
+<details class="maths"><summary>Show me the math</summary>
 <p>The output's own key is <var>O</var> = <var>x</var>&middot;<var>G</var> + <var>y</var>&middot;<var>T</var>,
 and its key image is</p>
 <p class="eq"><var>L</var> = <var>x</var>&middot;<var>&Itilde;</var> &minus; (<var>x</var><var>r<sub>i</sub></var>)&middot;<var>U</var> = <var>x</var>&middot;<var>I</var></p>
@@ -123,7 +123,7 @@ proofs, one on each curve, each taking every other layer.</p>
 <dt>Covers</dt><dd>{% if inputs.len() == 1 %}the one input{% else %}all {{ inputs.len() }} inputs at once{% endif %}</dd>
 {% if let Some(n) = n_tree_layers %}<dt>Tree layers</dt><dd>{{ n }}</dd>{% endif %}
 </dl></div>
-<details class="maths"><summary>Show the maths</summary>
+<details class="maths"><summary>Show me the math</summary>
 <p>The proof is two Generalized Bulletproofs, arithmetic-circuit proofs, one
 over each curve.{% if let Some(s) = shape %} Here the Selene proof has
 {{ s.selene_rows }} rows, folded in {{ s.selene_rounds }} rounds, and the Helios
@@ -160,7 +160,7 @@ so a proof built on an invented tree fails.</p>
 {% if let Some((b, root)) = root_block %}<dt>Root</dt><dd><span class="hash">{{ root }}</span>, in block <a href="/block/{{ b }}">{{ b }}</a></dd>{% endif %}
 {% if let Some(c) = root_curve %}<dt>Root is on</dt><dd>{{ c }}</dd>{% endif %}
 </dl></div>
-<details class="maths"><summary>Show the maths</summary>
+<details class="maths"><summary>Show me the math</summary>
 <p class="eq"><var>root&prime;</var> = <var>root</var> + <var>b</var>&middot;<var>H</var><br>
 <var>R</var> + <var>c</var>&middot;(<var>root&prime;</var> &minus; <var>root</var>) = <var>s</var>&middot;<var>H</var></p>
 <p><var>root&prime;</var> is the proof's copy: <var>H<sub>init</sub></var> plus its
@@ -191,7 +191,7 @@ but the fee.</p>
 <dt>Fee</dt><dd>{{ fee }} XMR, the only amount in the clear</dd>
 {% if range_proofs > 0 %}<dt>Range proof</dt><dd>{{ range_proofs }} Bulletproofs+ proof{% if range_proofs != 1 %}s{% endif %} over the outputs</dd>{% endif %}
 </dl></div>
-<details class="maths"><summary>Show the maths</summary>
+<details class="maths"><summary>Show me the math</summary>
 <p class="eq">&Sigma;<sub><var>i</var></sub> <var>C&#x303;<sub>i</sub></var> = &Sigma;<sub><var>j</var></sub> <var>C<sub>j</sub></var> + <var>f</var>&middot;<var>H</var></p>
 <p>Each commitment is <var>k</var>&middot;<var>G</var> + <var>a</var>&middot;<var>H</var>
 for a mask <var>k</var> and an amount <var>a</var>. The left side sums the
@@ -216,7 +216,7 @@ by someone entitled to spend it, and only once. Not which ones.{% endif %}</p>
 <dt>Spent before?</dt><dd>No. The {% if in_pool %}pool{% else %}chain{% endif %} accepted its key images as new.</dd>
 <dt>Amounts</dt><dd>They balance, and only the fee is shown.</dd>
 </dl></div>
-<details class="maths"><summary>Show the maths</summary>
+<details class="maths"><summary>Show me the math</summary>
 <p>A verifier checks, for this transaction:</p>
 <ol>
 <li>each input's signature, against the transaction's signable hash;</li>
@@ -247,8 +247,8 @@ whole tree is summed up by one short value at the top, its root.
 {% if let Some(r) = reference_block %}<dt>As of block</dt><dd><a href="/block/{{ r }}">{{ r }}</a></dd>{% endif %}
 {% if let Some((b, root)) = root_block %}<dt>Root</dt><dd><span class="hash">{{ root }}</span>, in block <a href="/block/{{ b }}">{{ b }}</a></dd>{% endif %}
 </dl></div>
-{% if let Some(picture) = tree %}<figure class="curve-tree"><div class="scroll">{% for t in picture %}{% include "funnel.html" %}{% endfor %}</div></figure>{% endif %}
-<details class="maths"><summary>Show the maths</summary>
+{% if let Some(picture) = tree %}<figure class="curve-tree tree-field">{% for t in picture %}{% include "tree_field.html" %}{% endfor %}</figure>{% endif %}
+<details class="maths"><summary>Show me the math</summary>
 <p>An output is three points: its key <var>O</var> = <var>x</var>&middot;<var>G</var> + <var>y</var>&middot;<var>T</var>,
 its key image generator <var>I</var> = <var>H<sub>p</sub></var>(<var>O</var>), a
 hash of <var>O</var> onto the curve, and its amount commitment

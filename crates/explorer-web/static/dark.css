@@ -20,4 +20,9 @@
   --coinbase: #6bbd92;
   --warn-bg: #2a2317;
   --warn-line: #6b5427;
+  --tree-helios: #3ec0e6;
+  --tree-strand: .4;
+  --tree-fibre: .3;
+  --tree-glow: .07;
+  --tree-bloom: .6;
 }

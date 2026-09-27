@@ -23,6 +23,7 @@ use crate::config::Theme;
 
 mod leaf_grid;
 mod paths;
+mod tree_field;
 pub use paths::tree_paths;
 
 /// The chain summary strip shown on every page.
@@ -1525,7 +1526,7 @@ struct FcmpPage {
     root_curve: Option<&'static str>,
     /// The proof drawn to scale, one segment per part.
     map: Vec<ProofSegment>,
-    tree: Option<[TreeFunnel; 2]>,
+    tree: Option<[tree_field::TreeField; 2]>,
 }
 
 struct ShapeView {
@@ -1722,8 +1723,14 @@ fn fcmp_page(
         .as_ref()
         .map(|p| proof_map(p.inputs.len(), p.membership_len))
         .unwrap_or_default();
-    let tree = anonymity_set
-        .and_then(|n| tree_picture(n, root_block.as_ref().map(|(_, root)| root.as_str())));
+    let tree = anonymity_set.and_then(|n| {
+        tree_field::tree_field(
+            n,
+            root_block.as_ref().map(|(_, root)| root.as_str()),
+            tx.reference_block(),
+            root_block.as_ref().map(|(b, _)| *b),
+        )
+    });
 
     // Without the root anchor, which step 5 counts, as the bar does.
     let membership = parts.as_ref().zip(proof_len).map(|(p, total)| {
@@ -4066,9 +4073,9 @@ mod tests {
     }
 
     /// The proof's shape, the tree, the root's curve and the bar all come
-    /// from this transaction, and every step's maths starts closed.
+    /// from this transaction, and every step's math starts closed.
     #[test]
-    fn the_walkthrough_draws_this_proof_and_hides_the_maths() {
+    fn the_walkthrough_draws_this_proof_and_hides_the_math() {
         let (entry, mut tx) = fcmp_fixture("full").remove(0);
         let page = fcmp_page(None, &entry, &tx, Some(62), Some((112, "9".repeat(64))));
         let s = page
@@ -4094,10 +4101,11 @@ mod tests {
         // Step 1 keeps its picture beside the words, the tree among them.
         let first = &html[html.find(r#"id="s1""#).expect("step 1")..];
         let tree = first
-            .find(r#"<figure class="curve-tree">"#)
+            .find(r#"<figure class="curve-tree tree-field">"#)
             .expect("the tree");
         let pic = first.find(r#"<svg class="pic""#).expect("the picture");
-        assert!(tree < first.find("Show the maths").expect("maths") && tree < pic);
+        assert!(tree < first.find("Show me the math").expect("math") && tree < pic);
+        assert!(!html.contains(" style="), "the CSP drops inline styles");
         assert!(!html.contains(r#"class="maths" open"#));
         assert_eq!(html.matches(r#"aria-current="step""#).count(), 7);
         // Step 2 lights both inputs' tuples, step 4 the membership proof,
