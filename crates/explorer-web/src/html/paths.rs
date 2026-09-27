@@ -726,7 +726,8 @@ mod tests {
         // The root says every path holds, so no path says it again.
         assert!(!p.show_holds && !html.contains("hashes hold"));
         // An output's tag sits beside its leaf, not after the hashes.
-        assert!(html.contains("<span class=\"tag\">output 1</span> 752</td>"));
+        assert!(html.contains("<td class=\"num\">752</td>"));
+        assert!(html.contains("<td><span class=\"tag\">output 1</span></td>"));
     }
 
     /// The cells of one grid, by what they are.

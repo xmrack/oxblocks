@@ -615,7 +615,13 @@ table.kept tfoot td { font-weight: 600; border-bottom: 0; }
 details.path-data { margin-top: 1.4rem; border-top: 1px solid var(--line); padding-top: 0.8rem; }
 details.path-data > summary { cursor: pointer; color: var(--accent); font-weight: 600; }
 details.path-data[open] > summary { margin-bottom: 0.4rem; }
-table.leaves td:first-child { white-space: nowrap; }
+/* Small tables, sized to what they hold rather than stretched across. */
+table.path-status, table.kept, table.leaves { width: auto; min-width: min(100%, 36rem); }
+/* A leaf's key over its commitment, each wrapping in two on a narrow
+   screen rather than to a sliver. */
+table.leaves td.pair { min-width: 33ch; }
+table.leaves td.pair .hash { display: block; white-space: normal; overflow-wrap: anywhere; }
+table.leaves td.pair .hash + .hash { color: var(--fg-muted); }
 .path-layer h2 .curve { color: var(--fg-faint); font-weight: 400; font-size: 0.75em; margin-left: 0.3rem; }
 .group-h { font-size: 0.84rem; color: var(--fg-muted); margin: 0.5rem 0 0.35rem; }
 .chips { display: flex; flex-wrap: wrap; gap: 0.3rem; }

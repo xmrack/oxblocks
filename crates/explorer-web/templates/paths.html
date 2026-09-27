@@ -149,15 +149,15 @@ Kept path by path, the same paths come to {{ apart }} bytes: they share groups.{
 <p class="group-h">{{ g.caption }}</p>
 <div class="scroll">
 <table class="leaves">
-  <thead><tr><th class="num">Leaf</th><th class="num">Unified ID</th><th>Kind</th><th>Output key</th><th>Commitment</th></tr></thead>
+  <thead><tr><th class="num">Leaf</th><th class="num">Unified ID</th><th>Output</th><th>Kind</th><th>Key and commitment</th></tr></thead>
   <tbody>
   {% for r in g.rows %}
   <tr{% if r.output.is_some() %} class="on"{% endif %}>
-    <td class="num">{% if let Some(k) = r.output %}<span class="tag">output {{ k }}</span> {% endif %}{{ r.position }}</td>
+    <td class="num">{{ r.position }}</td>
     <td class="num">{{ r.unified_id }}</td>
+    <td>{% if let Some(k) = r.output %}<span class="tag">output {{ k }}</span>{% endif %}</td>
     <td>{{ r.kind }}</td>
-    <td><span class="hash">{{ r.key }}</span></td>
-    <td><span class="hash">{{ r.commitment }}</span></td>
+    <td class="pair"><span class="hash">{{ r.key }}</span><span class="hash">{{ r.commitment }}</span></td>
   </tr>
   {% endfor %}
   </tbody>
