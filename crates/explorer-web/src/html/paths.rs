@@ -40,6 +40,10 @@ struct PathsPage {
     /// The window of outputs shown together, counted from 0, for the form to
     /// keep. 0 when one output is shown.
     from: usize,
+    mined_in: u64,
+    /// The first block whose tree holds the outputs. They share the
+    /// transaction's lock, so they join together.
+    joins: Option<u64>,
     leaves: String,
     n_layers: usize,
     root_block: Option<(u64, String)>,
@@ -378,6 +382,8 @@ fn page(
         tip: paths.tip,
         block,
         from: if showing.is_some() { 0 } else { from },
+        mined_in: paths.mined_in,
+        joins: paths.outputs.iter().map(|o| o.last_locked_block).min(),
         leaves: grouped(paths.n_leaf_tuples),
         n_layers: monerod_rpc::types::tree_layers(paths.n_leaf_tuples).len(),
         root_block: paths.root_block.clone(),
@@ -645,6 +651,7 @@ mod tests {
         );
         TxPaths {
             as_of_block: as_of,
+            mined_in: 801,
             tip: 814,
             n_leaf_tuples: n,
             root_block: Some((as_of - 8, root.to_owned())),
@@ -720,7 +727,6 @@ mod tests {
         );
 
         let html = p.render().unwrap();
-        assert!(html.contains("every path leads here"));
         assert!(html.contains("What a wallet keeps"));
         assert!(html.contains("class=\"leaf-grid\""));
         // The root says every path holds, so no path says it again.
@@ -816,6 +822,8 @@ mod tests {
         assert!(html.contains("These outputs join\nthe curve tree as of block 810."));
         assert!(html.contains("Show their paths as of block 810"));
         assert!(html.contains("joins as of block 810"));
+        assert!(html.contains("mined in block</dt><dd><a href=\"/block/801\">801</a>"));
+        assert!(html.contains("Added to the tree in block</dt><dd><a href=\"/block/810\">810</a>"));
 
         // With the tip short of block 810, it says how long there is to go.
         let mut early = paths;
@@ -829,6 +837,9 @@ mod tests {
         let html = p.render().unwrap();
         assert!(html.contains("Not in the tree yet"));
         assert!(html.contains("5 blocks after the tip,\nin about 10 minutes"));
+        assert!(
+            html.contains("Added to the tree in block</dt><dd>810, 5 blocks after the tip</dd>")
+        );
     }
 
     #[test]

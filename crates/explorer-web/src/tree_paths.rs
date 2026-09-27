@@ -147,6 +147,8 @@ impl PathsParams {
 /// Paths as of one block, for some of one transaction's outputs.
 pub struct TxPaths {
     pub as_of_block: u64,
+    /// The block the transaction is in.
+    pub mined_in: u64,
     /// The chain's tip when asked, the newest block a path can be taken as of.
     pub tip: u64,
     pub n_leaf_tuples: u64,
@@ -322,6 +324,7 @@ pub async fn gather(
         .collect();
     Ok(TxPaths {
         as_of_block,
+        mined_in: entry.block_height,
         tip,
         n_leaf_tuples,
         root_block,
