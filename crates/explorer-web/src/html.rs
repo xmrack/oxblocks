@@ -719,6 +719,9 @@ const MEMPOOL_ROWS: usize = crate::api::handlers::MAX_MEMPOOL_LIMIT as usize;
 struct PoolRow {
     hash: String,
     age: String,
+    /// The outputs it spends.
+    inputs: usize,
+    outputs: usize,
     fee: String,
     ring: usize,
     full_chain: bool,
@@ -872,6 +875,8 @@ fn pool_rows(
             Some(PoolRow {
                 hash: t.id_hash.to_lowercase(),
                 age: age(asked_at, t.receive_time),
+                inputs: spends(&tx),
+                outputs: tx.vout.len(),
                 fee: xmr_aligned(f.fee),
                 ring: f.ring_size,
                 full_chain: f.fcmp_pp.is_some(),
@@ -3448,6 +3453,8 @@ mod tests {
         PoolRow {
             hash: "e".repeat(64),
             age: "00:00:00".to_owned(),
+            inputs: 2,
+            outputs: 3,
             fee: "0.0".to_owned(),
             ring: 16,
             full_chain: false,
@@ -3617,6 +3624,39 @@ mod tests {
             rows(SortKey::Fee, SortDir::Asc)
                 .iter()
                 .all(|r| r.ring == 16)
+        );
+    }
+
+    /// Each pool row counts the outputs its transaction spends and makes,
+    /// from the transaction itself.
+    #[test]
+    fn the_mempool_table_counts_each_transactions_inputs_and_outputs() {
+        let mut tx = pool_tx(0, 1, 1);
+        tx.tx_json = serde_json::json!({
+            "version": 2, "unlock_time": 0, "extra": [],
+            "vin": (0..3).map(|_| serde_json::json!({"key": {
+                "amount": 0, "key_offsets": [1], "k_image": "ab".repeat(32),
+            }})).collect::<Vec<_>>(),
+            "vout": (0..5).map(|_| serde_json::json!({
+                "amount": 0, "target": {"key": "cd".repeat(32)},
+            })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let rows = pool_rows(&[tx], None, 0);
+        assert_eq!((rows[0].inputs, rows[0].outputs), (3, 5));
+
+        let html = mempool_page(None).render().expect("renders");
+        assert!(html.contains(
+            r#"<th class="num">Inputs</th>
+      <th class="num">Outputs</th>"#
+        ));
+        assert_eq!(
+            html.matches(
+                r#"<td class="num">2</td>
+      <td class="num">3</td>"#
+            )
+            .count(),
+            3
         );
     }
 

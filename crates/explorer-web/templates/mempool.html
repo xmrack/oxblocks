@@ -17,6 +17,8 @@ order the table is sorted.</p>
     <tr>
       <th>Hash</th>
       <th>{% call sort::header("Waiting [h:m:s]", waiting_sort) %}{% endcall %}</th>
+      <th class="num">Inputs</th>
+      <th class="num">Outputs</th>
       <th class="num">{% call sort::header("Fee", fee_sort) %}{% endcall %}</th>
       <th class="num">Ring</th>
       <th class="num">{% call sort::header("Size", size_sort) %}{% endcall %}</th>
@@ -27,6 +29,8 @@ order the table is sorted.</p>
     <tr>
       <td><a class="hash" href="/tx/{{ t.hash }}">{{ t.hash }}</a></td>
       <td>{{ t.age }}</td>
+      <td class="num">{{ t.inputs }}</td>
+      <td class="num">{{ t.outputs }}</td>
       <td class="num">{{ t.fee }}</td>
       <td class="num">{% if t.full_chain %}<span title="FCMP++: every output in the curve tree the proof names">all</span>{% else %}{{ t.ring }}{% endif %}</td>
       <td class="num">{{ t.size }}</td>
