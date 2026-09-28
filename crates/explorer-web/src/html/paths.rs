@@ -540,7 +540,7 @@ fn union(
 /// Groups count from 1 and places in a layer from 0, as unified ids do.
 fn group_caption(g: &Group, what: &str) -> String {
     if g.layer_size == 1 {
-        return "The root, alone at the top".to_owned();
+        return "The root".to_owned();
     }
     let members = members_text(g, what);
     let groups = g.groups_in_layer();
@@ -888,6 +888,6 @@ mod tests {
             len: 1,
             member: 0,
         };
-        assert_eq!(group_caption(&root, "node"), "The root, alone at the top");
+        assert_eq!(group_caption(&root, "node"), "The root");
     }
 }
