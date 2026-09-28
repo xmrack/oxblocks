@@ -525,7 +525,6 @@ dl.kv.spaced { margin-top: 0.8rem; }
 .tree-field .tf-brk { stroke: var(--fg-faint); stroke-width: 1; fill: none; }
 .tree-field .tf-meas { fill: var(--fg-muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .tree-field .tf-short { fill: var(--accent); font-weight: 600; }
-.tree-field .tf-pp { fill: var(--fg-faint); }
 @media (prefers-reduced-motion: no-preference) {
   .tree-field .tf-bloom { animation: tf-breathe 6s ease-in-out infinite alternate; }
 }

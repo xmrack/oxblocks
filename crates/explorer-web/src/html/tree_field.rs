@@ -4,9 +4,8 @@
 //! Every output is a strand at the bottom, and they gather 38 to a Selene
 //! node, those 18 to a Helios node, and so on up to the root at the top. The
 //! shape follows from the tree's size alone. A layer with too many nodes to
-//! draw one by one is a rule instead, broken where the subtrees above it end
-//! and labelled with how many nodes a pixel of it stands for. The root hash
-//! only seeds the fibres' bow, never the structure.
+//! draw one by one is a rule instead, broken where the subtrees above it end.
+//! The root hash only seeds the fibres' bow, never the structure.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -126,8 +125,6 @@ pub struct Line {
     pub class: &'static str,
     pub y: String,
     pub text: String,
-    /// Said faintly: how much a pixel of a rule stands for.
-    pub faint: bool,
     /// A block the line ends with, linked.
     pub block: Option<u64>,
 }
@@ -763,44 +760,41 @@ fn labels(l: &Layout, f: &Frame, about: &About<'_>) -> Vec<RowLabel> {
                 _ if lv == l.top => ("Root".to_owned(), wide.then(|| curve.to_owned())),
                 _ => (format!("Layer {lv}"), wide.then(|| curve.to_owned())),
             };
-            let mut texts: Vec<(&'static str, String, bool, Option<u64>)> = Vec::new();
+            let mut texts: Vec<(&'static str, String, Option<u64>)> = Vec::new();
             if lv == l.top {
                 if !wide {
-                    texts.push(("sub", curve.to_owned(), false, None));
+                    texts.push(("sub", curve.to_owned(), None));
                 }
                 if let Some(root) = about.root {
                     let chars: Vec<char> = root.chars().collect();
                     for line in chars.chunks(16) {
-                        texts.push(("hash", line.iter().collect(), false, None));
+                        texts.push(("hash", line.iter().collect(), None));
                     }
                 }
                 if let Some(b) = about.root_block {
-                    texts.push(("sub", "in block ".to_owned(), false, Some(b)));
+                    texts.push(("sub", "in block ".to_owned(), Some(b)));
                 }
             } else if lv == 0 {
                 if !wide {
-                    texts.push(("sub", grouped(l.n), false, None));
+                    texts.push(("sub", grouped(l.n), None));
                 }
                 if let Some(b) = about.as_of {
-                    texts.push(("sub", "as of block ".to_owned(), false, Some(b)));
+                    texts.push(("sub", "as of block ".to_owned(), Some(b)));
                 }
             } else {
                 let size = l.size(lv);
                 let nodes = format!("{} node{}", grouped(size), plural(size));
                 let groups = format!("groups of {}", children(lv));
                 if wide {
-                    texts.push(("sub", format!("{nodes} · {groups}"), false, None));
+                    texts.push(("sub", format!("{nodes} · {groups}"), None));
                 } else if lv < l.low {
-                    texts.push(("sub", format!("{curve} · {}", grouped(size)), false, None));
-                    texts.push(("sub", groups, false, None));
+                    texts.push(("sub", format!("{curve} · {}", grouped(size)), None));
+                    texts.push(("sub", groups, None));
                 } else {
-                    texts.push(("sub", curve.to_owned(), false, None));
-                    texts.push(("sub", nodes, false, None));
-                    texts.push(("sub", groups, false, None));
+                    texts.push(("sub", curve.to_owned(), None));
+                    texts.push(("sub", nodes, None));
+                    texts.push(("sub", groups, None));
                 }
-            }
-            if lv < l.low {
-                texts.push(("sub", per_pixel(l, f, lv), true, None));
             }
 
             // Hash lines follow closer together, and the root's block a
@@ -809,7 +803,7 @@ fn labels(l: &Layout, f: &Frame, about: &About<'_>) -> Vec<RowLabel> {
             let mut was_hash = false;
             let lines = texts
                 .into_iter()
-                .map(|(class, text, faint, block)| {
+                .map(|(class, text, block)| {
                     if was_hash && class != "hash" {
                         at_y += 2.0;
                     }
@@ -817,7 +811,6 @@ fn labels(l: &Layout, f: &Frame, about: &About<'_>) -> Vec<RowLabel> {
                         class,
                         y: num(at_y),
                         text,
-                        faint,
                         block,
                     };
                     at_y += if class == "hash" { hash_step } else { step };
@@ -860,25 +853,6 @@ fn labels(l: &Layout, f: &Frame, about: &About<'_>) -> Vec<RowLabel> {
             }
         })
         .collect()
-}
-
-/// How many nodes of the rule of `level` each pixel of it stands for, in
-/// this picture.
-fn per_pixel(l: &Layout, f: &Frame, level: usize) -> String {
-    let (x0, x1) = l.ends();
-    let per = l.size(level) as f64 / ((x1 - x0) * l.widening(level) * f.scale()).max(1.0);
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "a positive count of nodes, rounded for a label"
-    )]
-    let shown = if per >= 100.0 {
-        let unit = 10f64.powf(per.log10().floor() - 1.0);
-        grouped(((per / unit).round() * unit) as u64)
-    } else {
-        format!("{per:.0}")
-    };
-    format!("≈ {shown} per pixel")
 }
 
 /// The outputs measured: their first group bracketed and its size, and the
@@ -1114,7 +1088,7 @@ mod tests {
         );
         assert_eq!(
             lines(label(&wide, "Layer 1")),
-            ["4,899,428 nodes · groups of 38", "≈ 8,200 per pixel"]
+            ["4,899,428 nodes · groups of 38"]
         );
         let m = &wide.measures[0];
         assert_eq!(
