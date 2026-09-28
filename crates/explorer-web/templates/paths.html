@@ -81,7 +81,7 @@ unlock time of its own at the block that time names.</p>
   <tr>
     <td>{% if showing.is_some() %}{{ s.label }}{% else %}<a href="{{ s.href }}">{{ s.label }}</a>{% endif %}</td>
     <td class="num">{{ s.unified_id }}</td>
-    <td>{% if let Some(leaf) = s.leaf %}leaf {{ leaf }} {% else if let Some(b) = s.joins %}joins as of block {{ b }}{% endif %}{% if !s.check.is_empty() %}<span class="tag {% if s.ok %}ok{% else %}bad{% endif %}">{{ s.check }}</span>{% endif %}</td>
+    <td>{% if let Some(leaf) = s.leaf %}leaf {{ leaf }}{% else if let Some(b) = s.joins %}joins as of block {{ b }}{% endif %}{% if !s.check.is_empty() %} <span class="tag bad">{{ s.check }}</span>{% endif %}</td>
   </tr>
   {% endfor %}
   </tbody>

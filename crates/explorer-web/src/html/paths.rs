@@ -106,9 +106,9 @@ struct StatusRow {
     leaf: Option<String>,
     /// The first block whose tree holds it, when it is not in this one.
     joins: Option<u64>,
-    /// What checking its path found, and whether that is good news.
+    /// What is wrong with its path, or nothing when the check passes or
+    /// there is no path yet.
     check: &'static str,
-    ok: bool,
 }
 
 struct LayerView {
@@ -308,15 +308,12 @@ fn page(
             leaf: o.placed.as_ref().map(|p| grouped(p.path.leaf_idx)),
             joins: (standing == Standing::Waiting).then_some(o.last_locked_block),
             check: match standing {
-                Standing::Waiting => "",
+                Standing::Waiting | Standing::Reaches | Standing::Holds => "",
                 Standing::Missing => "no path from the daemon",
                 Standing::Fails(PathCheck::NotTheOutput) => "not this output's leaf",
                 Standing::Fails(check) => check.as_str(),
                 Standing::OtherRoot => "leads to another root",
-                Standing::Reaches => "leads to the root",
-                Standing::Holds => "hashes hold",
             },
-            ok: matches!(standing, Standing::Reaches | Standing::Holds),
         })
         .collect();
 
@@ -665,11 +662,7 @@ mod tests {
             .filter_map(|s| s.leaf.as_deref())
             .collect();
         assert_eq!(leaves, ["752", "753", "754", "755"]);
-        assert!(
-            p.statuses
-                .iter()
-                .all(|s| s.check == "leads to the root" && s.ok)
-        );
+        assert!(p.statuses.iter().all(|s| s.check.is_empty()));
 
         // The four sit side by side in one group of leaves, so the union has
         // one group per layer, each with one member lit except the leaves.
@@ -707,7 +700,9 @@ mod tests {
         );
 
         let html = p.render().unwrap();
-        assert!(html.contains("leaf 752 <span class=\"tag ok\">leads to the root</span>"));
+        // A path that passes carries no tag.
+        assert!(html.contains("<td>leaf 752</td>"), "{html}");
+        assert!(!html.contains("leads to the root") && !html.contains("tag ok"));
         // An output's tag sits beside its leaf, not after the hashes.
         assert!(html.contains("<td class=\"num\">752</td>"));
         assert!(html.contains("<td><span class=\"tag\">output 1</span></td>"));
@@ -818,7 +813,7 @@ mod tests {
         assert!(
             p.statuses
                 .iter()
-                .all(|s| s.check == "leads to another root" && !s.ok)
+                .all(|s| s.check == "leads to another root")
         );
         assert!(p.render().unwrap().contains("a path does not lead here"));
     }

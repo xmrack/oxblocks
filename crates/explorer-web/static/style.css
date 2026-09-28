@@ -649,7 +649,6 @@ dl.kv.spaced { margin-top: 0.8rem; }
 
 /* ---------- curve tree paths ---------- */
 
-.tag.ok { color: var(--coinbase); border-color: currentColor; }
 .tag.bad { color: var(--fg); background: var(--warn-bg); border-color: var(--warn-line); }
 .keeps { font-size: 0.89rem; max-width: 78ch; margin: 0.35rem 0 0; }
 .facts .keeps { margin: 0; }
