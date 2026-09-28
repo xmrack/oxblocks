@@ -16,12 +16,6 @@
   spend with FCMP++. Every hash and amount in them is one that chain holds.
 </p>
 
-<p>
-  Each endpoint carries a <code class="lit">curl</code> line. The lines name
-  <code class="lit">$OXBLOCKS</code> instead of a host. Set it to the base URL
-  of this explorer, scheme included, and the examples run as written.
-</p>
-
 <h2>The envelope</h2>
 
 <p>
@@ -36,9 +30,7 @@
   <code class="lit">fail</code> means the caller asked for something this
   explorer will not answer, such as an argument that does not parse or a height
   past the tip. <code class="lit">error</code> means this explorer or its daemon
-  could not answer. Messages say little about internals. A daemon the explorer
-  cannot reach gives you &ldquo;the explorer could not reach its daemon&rdquo;
-  and no address.
+  could not answer.
 </p>
 
 <h3>Status codes</h3>
@@ -62,41 +54,11 @@
 </div>
 
 <p>
-  Keys are sorted alphabetically at every level. Enveloped responses carry
-  <code class="lit">Content-Type: application/json</code> and
-  <code class="lit">Access-Control-Allow-Origin: *</code>. The server compresses
-  them with gzip, deflate or brotli when the request offers one.
-</p>
-
-<p>
   <strong>Three answers are not enveloped</strong>, because the layers above
   this API produce them. A request that outlives its deadline gets a bare
   <code class="lit">504</code>. A request body over the limit gets a
   <code class="lit">413</code>. A panic caught in a handler gets a
-  <code class="lit">500</code>. All three are
-  <code class="lit">text/plain</code> and carry no
-  <code class="lit">status</code> member. All three still carry the security
-  headers.
-</p>
-
-<p>
-  <code class="lit">HEAD</code> works wherever <code class="lit">GET</code>
-  works, without the body. Any other method gets a bare
-  <code class="lit">405</code> with <code class="lit">Allow: GET,HEAD</code> and
-  <strong>no</strong> <code class="lit">Access-Control-*</code> headers. There
-  is no preflight handler, so a cross-origin request that needs one fails. A
-  simple cross-origin <code class="lit">GET</code> works.
-</p>
-
-<h2>How arguments are read</h2>
-
-<p>
-  The explorer reads arguments as given. A height is decimal digits. A hash is
-  64 hex characters in either case. A postfix is hex. Anything else gets a
-  <code class="lit">400</code>, and so does a <code class="lit">page</code> or
-  <code class="lit">limit</code> that is not a plain number. The explorer strips
-  nothing and repairs nothing, so <code class="lit">/api/block/1,23</code> gets
-  a <code class="lit">400</code> rather than block 123.
+  <code class="lit">500</code>.
 </p>
 
 <h2>Endpoints</h2>
