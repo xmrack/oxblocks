@@ -4910,4 +4910,36 @@ mod tests {
             "{html}"
         );
     }
+
+    /// A lone ring input's card opens on its members; a lone FCMP++ input
+    /// has none to show, so its card starts closed.
+    #[test]
+    fn a_lone_input_opens_only_when_it_has_a_ring_to_show() {
+        let card = r#"<details class="input-card">"#;
+        let open = r#"<details class="input-card" open>"#;
+
+        let mut ring = tx_page();
+        ring.inputs.truncate(1);
+        let html = ring.render().expect("renders");
+        assert_eq!(
+            (html.matches(open).count(), html.matches(card).count()),
+            (1, 0)
+        );
+
+        let mut fcmp = fcmp_tx_page();
+        fcmp.inputs.truncate(1);
+        let html = fcmp.render().expect("renders");
+        assert_eq!(
+            (html.matches(open).count(), html.matches(card).count()),
+            (0, 1)
+        );
+        assert!(html.contains("This input has no ring."));
+
+        // Several inputs start closed either way.
+        let html = tx_page().render().expect("renders");
+        assert_eq!(
+            (html.matches(open).count(), html.matches(card).count()),
+            (0, 2)
+        );
+    }
 }

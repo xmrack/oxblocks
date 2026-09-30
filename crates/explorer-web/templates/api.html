@@ -33,6 +33,14 @@
   could not answer.
 </p>
 
+<p>
+  <strong>Three answers are not enveloped</strong>, because the layers above
+  this API produce them. A request that outlives its deadline gets a bare
+  <code class="lit">504</code>. A request body over the limit gets a
+  <code class="lit">413</code>. A panic caught in a handler gets a
+  <code class="lit">500</code>.
+</p>
+
 <h3>Status codes</h3>
 
 <p>
@@ -52,14 +60,6 @@
   </tbody>
 </table>
 </div>
-
-<p>
-  <strong>Three answers are not enveloped</strong>, because the layers above
-  this API produce them. A request that outlives its deadline gets a bare
-  <code class="lit">504</code>. A request body over the limit gets a
-  <code class="lit">413</code>. A panic caught in a handler gets a
-  <code class="lit">500</code>.
-</p>
 
 <h2>Endpoints</h2>
 
@@ -380,10 +380,6 @@
     window, so the request says nothing about which transaction the caller
     wants. Rings stay unresolved, for the same reason as
     <a href="#private">the private lookup</a>.
-  </p>
-  <p>
-    The block window is fixed. The pool is not. During a flood of unconfirmed
-    transactions this is the most expensive endpoint here.
   </p>
   <p><a href="/api/transactions/recent">/api/transactions/recent</a></p>
   <pre class="blob">curl -s "$OXBLOCKS/api/transactions/recent"</pre>

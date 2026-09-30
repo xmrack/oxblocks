@@ -146,7 +146,7 @@
   <p class="walk-row"><a class="walk" href="/tx/{{ hash }}/fcmp">How this spend stays private &rarr;</a></p>
   {% endif %}
   {% for i in inputs %}
-  <details class="input-card"{% if inputs.len() == 1 %} open{% endif %}>
+  <details class="input-card"{% if inputs.len() == 1 && !fcmp_pp %} open{% endif %}>
     <summary>
       <span>Input {{ loop.index }}</span>
       <span>Key image <span class="hash mark">{{ i.key_image }}</span></span>

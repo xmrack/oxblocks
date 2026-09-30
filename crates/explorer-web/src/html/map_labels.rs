@@ -21,7 +21,7 @@ use super::{MAP_WIDTH, ProofSegment, grouped};
 
 /// The bar's height, and the room above it for the labels there.
 pub const BAR_H: f64 = 26.0;
-const ABOVE: f64 = 18.0;
+const ABOVE: f64 = 26.0;
 /// Font sizes, which style.css sets to match.
 const INSIDE_PX: f64 = 12.0;
 const OUTSIDE_PX: f64 = 11.5;
@@ -248,9 +248,9 @@ fn lay_out(kinds: &[Kind], variant: &Variant, top: f64) -> LabelSet {
             continue;
         };
         let (edge, reach, y) = if p.above {
-            (top - 1.0, top - 5.0, top - 8.0)
+            (top - 3.0, top - 8.0, top - 14.0)
         } else {
-            (top + BAR_H + 1.0, top + BAR_H + 5.0, top + BAR_H + 16.0)
+            (top + BAR_H + 3.0, top + BAR_H + 8.0, top + BAR_H + 22.0)
         };
         let ticks: Vec<String> = kind.centres().map(pct).collect();
         let bracket = (ticks.len() > 1).then(|| {
@@ -311,7 +311,7 @@ pub fn map_labels(map: &[ProofSegment]) -> Option<MapLabels> {
             .any(|o| o.above == above)
     };
     let top = if used(true) { ABOVE } else { 2.0 };
-    let bottom = if used(false) { 22.0 } else { 2.0 };
+    let bottom = if used(false) { 30.0 } else { 2.0 };
     Some(MapLabels {
         top: num(top),
         height: num(top + BAR_H + bottom),
@@ -448,12 +448,12 @@ mod tests {
         assert_eq!(
             outside,
             [
-                ("Disguised output 96 B", "start", "60"),
-                ("Signature 384 B", "start", "10"),
-                ("Root anchor 64 B", "end", "60")
+                ("Disguised output 96 B", "start", "74"),
+                ("Signature 384 B", "start", "12"),
+                ("Root anchor 64 B", "end", "74")
             ]
         );
-        assert_eq!((labels.top.as_str(), labels.height.as_str()), ("18", "66"));
+        assert_eq!((labels.top.as_str(), labels.height.as_str()), ("26", "82"));
         assert_eq!(narrow.inside[0].text, "Membership · 4,096 B");
         assert_eq!(narrow.outside.len(), 3, "the phone keeps every label");
         // Too near the edge on a phone to start before its tick, the first
