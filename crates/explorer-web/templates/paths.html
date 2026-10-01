@@ -69,7 +69,7 @@ unlock time of its own at the block that time names.</p>
     {% for c in g.cells %}<rect class="cell {{ c.class }}" x="{{ c.x }}" y="{{ c.y }}" width="{{ crate::html::leaf_grid::CELL }}" height="{{ crate::html::leaf_grid::CELL }}" rx="1"><title>{{ c.title }}</title></rect>{% endfor %}
     {% for d in g.brackets %}<path class="bracket" d="{{ d }}"/>{% endfor %}
   </svg>
-  <p class="grid-legend"><span><i class="on"></i>On {% if showing.is_some() %}this path{% else %}these paths{% endif %}</span><span><i class="kept"></i>The rest of their groups, kept too</span>{% if g.has_others %}<span><i class="other"></i>The transaction's other outputs</span>{% endif %}</p>
+  <p class="grid-legend"><span><i class="on"></i>On {% if showing.is_some() %}this path{% else %}these paths{% endif %}</span><span><i class="kept"></i>Rest of each group, also stored</span>{% if g.has_others %}<span><i class="other"></i>The transaction's other outputs</span>{% endif %}</p>
 </figure>
 {% endif %}
 

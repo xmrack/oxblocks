@@ -4179,8 +4179,8 @@ mod tests {
         assert!(html.contains("<title>1 node</title>"));
     }
 
-    /// The walkthrough is linked from the head of the tree it explains, or on
-    /// its own above the inputs when there is no tree to draw.
+    /// The walkthrough is linked under the inputs' heading, above the tree
+    /// when there is one.
     #[test]
     fn the_walkthrough_is_linked_from_the_tree() {
         let link = r#"<a class="walk" href="/tx/abc/fcmp">How this spend stays private &rarr;</a>"#;
@@ -4190,14 +4190,11 @@ mod tests {
         let html = page.render().expect("renders");
         assert_eq!(html.matches(link).count(), 1);
         let at = html.find(link);
-        assert!(at > html.find("</figcaption>"), "after the caption");
+        let heading = html.find(" Input").expect("the inputs' heading");
+        assert!(at > Some(heading), "under the heading");
         assert!(
-            at < html.find(r#"<div class="scroll">"#),
-            "above the drawing"
-        );
-        assert!(
-            at > html.find(r#"<figure class="curve-tree">"#),
-            "in the tree's box"
+            at < html.find(r#"<figure class="curve-tree">"#),
+            "above the tree"
         );
         assert!(!html.contains("how it works"));
 
@@ -4676,9 +4673,13 @@ mod tests {
         );
         // The output column says so in words rather than printing a zero.
         assert_eq!(
-            html.matches(r#"<span class="tag">hidden</span>"#).count(),
+            html.matches(">hidden</span>").count(),
             1,
             "exactly one of the two outputs is a hidden RingCT amount"
+        );
+        assert!(
+            html.contains(r#"title="Hidden in a Pedersen commitment. A Bulletproofs+ range proof"#),
+            "hovering says what hides the amount"
         );
         assert!(
             html.contains("3.0"),

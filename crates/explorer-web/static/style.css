@@ -91,10 +91,7 @@ form.search button {
 }
 .status b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
 
-/* The bottom padding is deliberately generous: it is what separates a page
-   with no pager, like a transaction, from the footer, and it has to match
-   the gap a pager's own margin-top adds on the pages that have one. */
-main.wrap { padding-top: 1.6rem; padding-bottom: 4.9rem; }
+main.wrap { padding-top: 1.6rem; padding-bottom: 2.2rem; }
 
 h1 { font-size: 1.35rem; margin: 0 0 1rem; letter-spacing: -0.02em; }
 h2 { font-size: 1.05rem; margin: 2rem 0 0.75rem; letter-spacing: -0.01em; }
@@ -273,8 +270,29 @@ code.lit {
 }
 
 /* The endpoint index at the top of the page. */
-.toc { columns: 2 16rem; column-gap: 2rem; margin: 0 0 0.5rem; padding: 0; list-style: none; }
-.toc li { break-inside: avoid; padding: 0.16rem 0; font-size: 0.89rem; }
+.toc {
+  margin: 0 0 1.4rem;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  overflow: hidden;
+}
+.toc li + li { border-top: 1px solid var(--line); }
+.toc a {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2rem 0.8rem;
+  padding: 0.5rem 0.9rem;
+  font-size: 0.89rem;
+  text-decoration: none;
+}
+.toc a:hover { background: var(--bg-sunken); }
+.toc .verb { color: var(--fg-faint); font-size: 0.78rem; font-weight: 600; width: 2.4rem; }
+.toc code { color: var(--accent); word-break: break-all; }
+.toc .what { margin-left: auto; color: var(--fg-muted); }
 
 /* ---------- notices ---------- */
 
@@ -382,7 +400,6 @@ details.hint > p {
   text-transform: none;
   white-space: normal;
   color: var(--fg-muted);
-  max-width: 46rem;
 }
 
 /* ---------- ring age chart ---------- */
@@ -443,14 +460,7 @@ dl.kv.spaced { margin-top: 0.8rem; }
 .curve-tree .label { fill: var(--accent); font-size: 13px; }
 .curve-tree .curve { fill: var(--fg-faint); }
 .curve-tree .count { fill: var(--fg-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
-/* The way into the FCMP++ walkthrough, at the head of the tree it explains:
-   in the caption's line, clear of the hint that opens below it, and on a line
-   of its own where the two would not fit side by side. */
 .walk { font-weight: 600; font-size: 0.85rem; }
-.curve-tree > .walk { position: absolute; top: 0.55rem; right: 0.75rem; }
-@media (max-width: 420px) {
-  .curve-tree > .walk { position: static; display: inline-block; margin: 0 0 0.5rem; }
-}
 .walk-row { margin: 0.2rem 0 0.9rem; }
 
 /* The FCMP++ walkthrough's curve tree: every output a strand, gathering group
@@ -645,10 +655,10 @@ dl.kv.spaced { margin-top: 0.8rem; }
 }
 .maths var { font-style: italic; font-family: Georgia, "Times New Roman", serif; }
 .maths .eq var { font-family: inherit; }
-.map-note { margin: 0.1rem 0 0; font-size: 0.78rem; color: var(--fg-faint); }
 
 /* ---------- curve tree paths ---------- */
 
+.tag[title] { cursor: help; }
 .tag.bad { color: var(--fg); background: var(--warn-bg); border-color: var(--warn-line); }
 .keeps { font-size: 0.89rem; max-width: 78ch; margin: 0.35rem 0 0; }
 .facts .keeps { margin: 0; }
@@ -703,7 +713,7 @@ table.kept td.layer .curve { display: block; color: var(--fg-faint); font-size: 
 table.kept td.place { white-space: normal; font-variant-numeric: tabular-nums; }
 table.kept tfoot td { font-weight: 600; border-bottom: 0; }
 details.path-data {
-  margin: 1.6rem 0 2.6rem;
+  margin: 1.6rem 0 0;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--bg-raised);

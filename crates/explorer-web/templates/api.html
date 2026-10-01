@@ -64,21 +64,21 @@
 <h2>Endpoints</h2>
 
 <ul class="toc">
-  <li><a href="#version">/api/version</a></li>
-  <li><a href="#networkinfo">/api/networkinfo</a></li>
-  <li><a href="#block">/api/block/&lt;id&gt;</a></li>
-  <li><a href="#rawblock">/api/rawblock/&lt;id&gt;</a></li>
-  <li><a href="#blocks">/api/blocks/&lt;start&gt;/&lt;end&gt;</a></li>
-  <li><a href="#transaction">/api/transaction/&lt;hash&gt;</a></li>
-  <li><a href="#paths">/api/transaction/&lt;hash&gt;/paths</a></li>
-  <li><a href="#rawtransaction">/api/rawtransaction/&lt;hash&gt;</a></li>
-  <li><a href="#private">/api/transaction/private/&lt;postfix&gt;</a></li>
-  <li><a href="#transactions">/api/transactions</a></li>
-  <li><a href="#mempool">/api/mempool</a></li>
-  <li><a href="#recent">/api/transactions/recent</a></li>
-  <li><a href="#search">/api/search/&lt;query&gt;</a></li>
-  <li><a href="#feeestimate">/api/feeestimate</a></li>
-  <li><a href="#health">/health</a></li>
+  <li><a href="#version"><span class="verb">GET</span><code>/api/version</code><span class="what">API and daemon versions</span></a></li>
+  <li><a href="#networkinfo"><span class="verb">GET</span><code>/api/networkinfo</code><span class="what">Chain and node state</span></a></li>
+  <li><a href="#block"><span class="verb">GET</span><code>/api/block/&lt;id&gt;</code><span class="what">One block and its transactions</span></a></li>
+  <li><a href="#rawblock"><span class="verb">GET</span><code>/api/rawblock/&lt;id&gt;</code><span class="what">A block as monerod decoded it</span></a></li>
+  <li><a href="#blocks"><span class="verb">GET</span><code>/api/blocks/&lt;start&gt;/&lt;end&gt;</code><span class="what">A range of blocks</span></a></li>
+  <li><a href="#transaction"><span class="verb">GET</span><code>/api/transaction/&lt;hash&gt;</code><span class="what">One transaction, rings resolved</span></a></li>
+  <li><a href="#paths"><span class="verb">GET</span><code>/api/transaction/&lt;hash&gt;/paths</code><span class="what">Its outputs' paths in the curve tree</span></a></li>
+  <li><a href="#rawtransaction"><span class="verb">GET</span><code>/api/rawtransaction/&lt;hash&gt;</code><span class="what">A transaction as monerod decoded it</span></a></li>
+  <li><a href="#private"><span class="verb">GET</span><code>/api/transaction/private/&lt;postfix&gt;</code><span class="what">Transactions by hash suffix</span></a></li>
+  <li><a href="#transactions"><span class="verb">GET</span><code>/api/transactions</code><span class="what">Recent blocks, page by page</span></a></li>
+  <li><a href="#mempool"><span class="verb">GET</span><code>/api/mempool</code><span class="what">Transactions waiting to be mined</span></a></li>
+  <li><a href="#recent"><span class="verb">GET</span><code>/api/transactions/recent</code><span class="what">Recent blocks and the pool at once</span></a></li>
+  <li><a href="#search"><span class="verb">GET</span><code>/api/search/&lt;query&gt;</code><span class="what">A height or hash, looked up</span></a></li>
+  <li><a href="#feeestimate"><span class="verb">GET</span><code>/api/feeestimate</code><span class="what">The daemon's fee estimate</span></a></li>
+  <li><a href="#health"><span class="verb">GET</span><code>/health</code><span class="what">Liveness and cache occupancy</span></a></li>
 </ul>
 
 <section class="endpoint" id="version">
@@ -625,8 +625,7 @@
   <code class="lit">/myoutputs</code>, <code class="lit">/prove</code>,
   <code class="lit">/rawtx</code> and <code class="lit">/checkandpush</code>
   pages that use them. They need a secret view key or raw transaction hex in a
-  request to a server that could log it. Leaving them out removes that risk
-  instead of managing it.
+  request to a server that could log it.
 </p>
 
 <p>

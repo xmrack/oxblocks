@@ -122,8 +122,9 @@
 
 <h2>{% if coinbase %}Inputs{% else %}{{ inputs.len() }} Input{% if inputs.len() != 1 %}s{% endif %}{% endif %}</h2>
 {% if coinbase %}
-<p class="empty">A coinbase transaction has no inputs; it creates new coins.</p>
+<p class="empty">A coinbase transaction has no inputs because it creates new coins rather than spending existing ones.</p>
 {% else %}
+  {% if fcmp_pp %}<p class="walk-row"><a class="walk" href="/tx/{{ hash }}/fcmp">How this spend stays private &rarr;</a></p>{% endif %}
   {% if let Some(picture) = tree %}
   <figure class="curve-tree">
     <figcaption>Curve tree
@@ -137,13 +138,10 @@
       and the last is short. Every input spends one of the outputs at the
       bottom, and nothing here says which.</p></details>
     </figcaption>
-    <a class="walk" href="/tx/{{ hash }}/fcmp">How this spend stays private &rarr;</a>
     <div class="scroll">
     {% for t in picture %}{% include "funnel.html" %}{% endfor %}
     </div>
   </figure>
-  {% else if fcmp_pp %}
-  <p class="walk-row"><a class="walk" href="/tx/{{ hash }}/fcmp">How this spend stays private &rarr;</a></p>
   {% endif %}
   {% for i in inputs %}
   <details class="input-card"{% if inputs.len() == 1 && !fcmp_pp %} open{% endif %}>
@@ -270,7 +268,7 @@
     <tr>
       <td class="num ring-index">{{ loop.index }}</td>
       <td><span class="hash">{{ o.public_key }}</span></td>
-      <td class="num">{% if let Some(amount) = o.amount %}{{ amount }}{% else %}<span class="tag">hidden</span>{% endif %}</td>
+      <td class="num">{% if let Some(amount) = o.amount %}{{ amount }}{% else %}<span class="tag" title="Hidden in a Pedersen commitment. {% if rct_type >= 6 %}A Bulletproofs+{% else if rct_type >= 3 %}A Bulletproof{% else %}A Borromean{% endif %} range proof shows it is not negative without revealing it.">hidden</span>{% endif %}</td>
       {% if has_view_tags %}<td><code>{{ o.view_tag }}</code></td>{% endif %}
       {% if carrot %}<td><span class="hash">{{ o.anchor }}</span></td>{% endif %}
       {% if has_unified_ids %}<td class="num">{% if let Some(id) = o.unified_id %}<a href="/tx/{{ hash }}/paths?output={{ loop.index }}" title="This output's path through the curve tree">{{ id }}</a>{% endif %}</td>{% endif %}

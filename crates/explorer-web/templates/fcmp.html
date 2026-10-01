@@ -10,8 +10,7 @@
 {% macro bar(map, labels, n) %}
 {% if let Some(l) = labels %}<svg class="proof-map" width="100%" height="{{ l.height }}" role="img" aria-label="The proof drawn to scale, with this step's part lit">{% for g in map %}<a href="#s{{ g.step }}"><rect class="seg {{ g.class }}{% if g.step == n %} on{% endif %}" x="{{ g.x_pct() }}" y="{{ l.top }}" width="{{ g.width_pct() }}" height="{{ crate::html::map_labels::BAR_H }}" rx="4"><title>{{ g.label }}</title></rect></a>{% endfor %}
 {% for set in l.sets %}<g class="pm-{{ set.class }}">{% for t in set.inside %}<text class="pm-in{% if t.step == n %} on{% endif %}" x="{{ t.x }}" dx="8" y="{{ l.inside_y }}">{{ t.text }}</text>{% endfor %}{% for o in set.outside %}<g class="pm-out{% if o.step == n %} on{% endif %}">{% for x in o.ticks %}<line x1="{{ x }}" x2="{{ x }}" y1="{{ o.tick_y.0 }}" y2="{{ o.tick_y.1 }}"/>{% endfor %}{% if let Some((a, b)) = o.bracket %}<line x1="{{ a }}" x2="{{ b }}" y1="{{ o.tick_y.1 }}" y2="{{ o.tick_y.1 }}"/>{% endif %}<text x="{{ o.x }}" dx="{{ o.dx }}" y="{{ o.y }}" text-anchor="{{ o.anchor }}">{{ o.text }}</text></g>{% endfor %}</g>
-{% endfor %}</svg>
-<p class="map-note">This step's part of the proof, drawn to scale. Each part links to its step.</p>{% endif %}
+{% endfor %}</svg>{% endif %}
 {% endmacro %}
 {% block content %}
 <p class="crumb"><a href="/tx/{{ hash }}">Transaction</a> <span class="hash">{{ hash }}</span></p>
