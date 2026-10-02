@@ -32,7 +32,7 @@ order the table is sorted.</p>
       <td class="num">{{ t.inputs }}</td>
       <td class="num">{{ t.outputs }}</td>
       <td class="num">{{ t.fee }}</td>
-      <td class="num">{% if t.full_chain %}{% if let Some(n) = t.tree %}<span title="FCMP++: proves it spends one of the {{ n }} outputs in the curve tree as of its reference block, without saying which">{{ n }}</span>{% else %}<span title="FCMP++: proves it spends one of the outputs in the curve tree as of its reference block, without saying which">whole tree</span>{% endif %}{% else %}{{ t.ring }}{% endif %}</td>
+      <td class="num">{% if t.full_chain %}{% if let Some(n) = t.tree %}<span title="FCMP++: proves it spends one of the {{ n }} outputs in the curve tree as of its reference block, without saying which">{{ n }}</span>{% else %}<span title="FCMP++: proves it spends one of the outputs in the curve tree as of its reference block, without saying which">whole tree</span>{% endif %}{% else %}{{ t.ring }}{% if t.ring_max != t.ring %} to {{ t.ring_max }}{% endif %}{% endif %}</td>
       <td class="num">{{ t.size }}</td>
     </tr>
   {% endfor %}

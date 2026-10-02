@@ -72,14 +72,19 @@
   </dd>
   {% endif %}
   {% else %}
-  <dt>Ring size</dt><dd>{% if coinbase %}&mdash;{% else %}{{ ring_size }}{% endif %}
+  <dt>Ring size</dt><dd>{% if coinbase %}&mdash;{% else %}{{ ring_min }}{% if ring_max != ring_min %} to {{ ring_max }}{% endif %}{% if ring_max == 1 %} <span class="tag">no decoys</span>{% endif %}{% endif %}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
     <p>How many outputs each input could have spent. One of them is the real one
     and the rest are decoys drawn from the chain. Nothing on the chain says
     which is which. That set is the anonymity set for the input.
-    Consensus fixes the size for everyone, because a transaction that chose
-    its own would stand out. It has been 16 since August 2022. A coinbase
-    creates coins instead of spending them, so it has no ring.</p></details>
+    Consensus has fixed the size for everyone since October 2018, because a
+    transaction that chose its own would stand out. It was 11, and has been
+    16 since August 2022. Before that the sender chose it, above a minimum
+    that rose over time, and until November 2019 one input's ring could be
+    larger than another's. The earliest
+    transactions often used a ring of one, which has no decoys and shows the
+    output spent. A coinbase creates coins instead of spending them, so it
+    has no ring.</p></details>
   </dd>
   {% endif %}
   <dt>Unlock time</dt><dd>{{ unlock_time }}
@@ -148,7 +153,7 @@
     <summary>
       <span>Input {{ loop.index }}</span>
       <span>Key image <span class="hash mark">{{ i.key_image }}</span></span>
-      {% if fcmp_pp %}<span class="tag">FCMP++</span>{% else %}<span class="tag">{{ i.ring.len() }} ring members</span>{% endif %}
+      {% if fcmp_pp %}<span class="tag">FCMP++</span>{% else %}<span class="tag">{{ i.size }} ring member{% if i.size != 1 %}s{% endif %}</span>{% endif %}
       {% if let Some(amount) = i.amount %}<span class="tag">{{ amount }} XMR</span>{% endif %}
     </summary>
     <div class="body">
@@ -162,6 +167,11 @@
       <p class="empty indented">
         The daemon refused this ring lookup, so its members are not shown.
         The other inputs on this page are unaffected.
+      </p>
+      {% else %}
+      {% if i.size == 1 %}
+      <p class="empty indented">
+        This input has no decoys, so the output below is the one it spent.
       </p>
       {% else %}
       <figure class="ring-ages">
@@ -189,6 +199,7 @@
         </svg>
         </div>
       </figure>
+      {% endif %}
       <div class="scroll">
       <table>
         <thead><tr><th class="num">#</th><th class="num">Height</th><th>Output key</th><th>In transaction</th></tr></thead>

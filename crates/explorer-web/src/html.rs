@@ -117,7 +117,10 @@ struct BlockTxRow {
     outputs: usize,
     fee: String,
     fee_atomic: u64,
+    /// The smallest ring among the inputs, and the largest, which differ
+    /// only before v12.
     ring: usize,
+    ring_max: usize,
     /// An FCMP++ spend, whose ring column names the curve tree rather than a
     /// 0 that would say it has no anonymity set.
     full_chain: bool,
@@ -147,7 +150,10 @@ struct TxPage {
     size: u64,
     version_no: u64,
     rct_type: u8,
-    ring_size: usize,
+    /// The smallest and largest ring among the inputs. Until v12 each input
+    /// could have its own.
+    ring_min: usize,
+    ring_max: usize,
     /// The inputs prove membership in the curve tree, so there is
     /// no ring to show.
     fcmp_pp: bool,
@@ -195,6 +201,9 @@ impl TxPage {
 struct InputView {
     key_image: String,
     amount: Option<String>,
+    /// The ring's size as the input states it, which holds when the members
+    /// could not be fetched.
+    size: usize,
     unavailable: bool,
     ring: Vec<RingView>,
     ages: AgeStrip,
@@ -235,6 +244,14 @@ struct AgeTick {
 /// one, which creates coins instead.
 fn spends(tx: &TxJson) -> usize {
     tx.vin.iter().filter(|v| v.as_key().is_some()).count()
+}
+
+/// The ring size of each input that spends an output, in order.
+fn ring_lens(tx: &TxJson) -> Vec<usize> {
+    tx.vin
+        .iter()
+        .filter_map(|v| v.as_key().map(|k| k.key_offsets.len()))
+        .collect()
 }
 
 /// Whether a coinbase was paid out by p2pool.
@@ -753,6 +770,7 @@ struct PoolRow {
     outputs: usize,
     fee: String,
     ring: usize,
+    ring_max: usize,
     full_chain: bool,
     reference: Option<u64>,
     tree: Option<String>,
@@ -898,6 +916,7 @@ struct RowFacts {
     outputs: usize,
     fee: u64,
     ring: usize,
+    ring_max: usize,
     full_chain: bool,
     reference: Option<u64>,
     size: u64,
@@ -905,6 +924,7 @@ struct RowFacts {
 
 impl RowFacts {
     fn of(tx: &TxJson, f: &TxFacts) -> Self {
+        let lens = ring_lens(tx);
         Self {
             coinbase: f.coinbase,
             p2pool: is_p2pool(
@@ -915,7 +935,8 @@ impl RowFacts {
             inputs: spends(tx),
             outputs: tx.vout.len(),
             fee: f.fee,
-            ring: f.ring_size,
+            ring: lens.iter().copied().min().unwrap_or(0),
+            ring_max: lens.iter().copied().max().unwrap_or(0),
             full_chain: f.fcmp_pp.is_some(),
             reference: tx.reference_block(),
             size: f.size,
@@ -988,6 +1009,7 @@ fn pool_rows(
                 outputs: f.outputs,
                 fee: xmr_aligned(f.fee),
                 ring: f.ring,
+                ring_max: f.ring_max,
                 full_chain: f.full_chain,
                 reference: f.reference,
                 tree: None,
@@ -1458,6 +1480,7 @@ pub async fn block(
                 fee: xmr_aligned(f.fee),
                 fee_atomic: f.fee,
                 ring: f.ring,
+                ring_max: f.ring_max,
                 full_chain: f.full_chain,
                 reference: f.reference,
                 tree: None,
@@ -1676,9 +1699,11 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
         spent_at,
     );
 
+    let lens = ring_lens(&tx);
     let inputs: Vec<InputView> = rings
         .iter()
-        .map(|r| {
+        .zip(lens.iter().copied().chain(std::iter::repeat(0)))
+        .map(|(r, size)| {
             let ring: Vec<RingView> = r
                 .ring
                 .iter()
@@ -1691,6 +1716,7 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
             InputView {
                 key_image: r.key_image.to_hex(),
                 amount: visible_amount(r.amount),
+                size,
                 unavailable: r.ring_unavailable,
                 ages: age_strip(&ring, spent_at, oldest),
                 ring,
@@ -1784,7 +1810,8 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
             size: f.size,
             version_no: f.version,
             rct_type: f.rct_type,
-            ring_size: f.ring_size,
+            ring_min: lens.iter().copied().min().unwrap_or(0),
+            ring_max: lens.iter().copied().max().unwrap_or(0),
             fcmp_pp: f.fcmp_pp.is_some(),
             reference_block: f.fcmp_pp.and_then(|x| x.reference_block),
             n_tree_layers: f.fcmp_pp.and_then(|x| x.n_tree_layers),
@@ -3578,6 +3605,7 @@ mod tests {
             fee: if coinbase { "0.0" } else { "0.00071136" }.to_owned(),
             fee_atomic: if coinbase { 0 } else { 711_360_000 },
             ring: if coinbase { 0 } else { 16 },
+            ring_max: if coinbase { 0 } else { 16 },
             full_chain: false,
             reference: None,
             tree: None,
@@ -3625,6 +3653,7 @@ mod tests {
             outputs: 3,
             fee: "0.0".to_owned(),
             ring: 16,
+            ring_max: 16,
             full_chain: false,
             reference: None,
             tree: None,
@@ -4048,7 +4077,8 @@ mod tests {
             size: 2_223,
             version_no: 2,
             rct_type: 6,
-            ring_size: 16,
+            ring_min: 16,
+            ring_max: 16,
             fcmp_pp: false,
             reference_block: None,
             n_tree_layers: None,
@@ -4064,6 +4094,7 @@ mod tests {
                 InputView {
                     key_image: "1".repeat(64),
                     amount: visible_amount(0),
+                    size: 1,
                     unavailable: false,
                     ring: vec![RingView {
                         height: 3_100_000,
@@ -4075,6 +4106,7 @@ mod tests {
                 InputView {
                     key_image: "4".repeat(64),
                     amount: visible_amount(2_000_000_000_000),
+                    size: 16,
                     unavailable: false,
                     ring: Vec::new(),
                     ages: age_strip(&[], 0, 0),
@@ -4109,7 +4141,8 @@ mod tests {
     fn fcmp_tx_page() -> TxPage {
         let mut page = tx_page();
         page.rct_type = 7;
-        page.ring_size = 0;
+        page.ring_min = 0;
+        page.ring_max = 0;
         page.fcmp_pp = true;
         page.reference_block = Some(3_012_345);
         page.n_tree_layers = Some(6);
@@ -4151,6 +4184,65 @@ mod tests {
         );
         assert!(html.contains("FCMP++ (type 7)"));
         assert!(!html.contains("RingCT type 7"));
+    }
+
+    /// Before v12 each input chose its ring, so the row gives the range, and a
+    /// ring of one is said to have no decoys rather than drawn as if it had.
+    #[test]
+    fn early_rings_show_their_range_and_a_ring_of_one_has_no_decoys() {
+        let html = tx_page().render().expect("renders");
+        assert!(html.contains("<dt>Ring size</dt><dd>16\n"), "{html}");
+        assert!(!html.contains(r#"<span class="tag">no decoys</span>"#));
+
+        let mut page = tx_page();
+        page.ring_min = 3;
+        page.ring_max = 5;
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Ring size</dt><dd>3 to 5\n"), "{html}");
+
+        let mut page = tx_page();
+        page.ring_min = 1;
+        page.ring_max = 1;
+        page.inputs.truncate(1);
+        let html = page.render().expect("renders");
+        assert!(
+            html.contains(r#"1 <span class="tag">no decoys</span>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<span class="tag">1 ring member</span>"#),
+            "{html}"
+        );
+        assert!(html.contains("This input has no decoys"));
+        assert!(!html.contains("Ring member ages"));
+        assert!(html.contains(&"2".repeat(64)), "the member is still listed");
+    }
+
+    /// An input's ring size is what it states, not how many members came back.
+    #[test]
+    fn an_unresolved_ring_keeps_its_size() {
+        let mut page = tx_page();
+        page.inputs[1].unavailable = true;
+        let html = page.render().expect("renders");
+        assert!(
+            html.contains(r#"<span class="tag">16 ring members</span>"#),
+            "{html}"
+        );
+        assert!(!html.contains("0 ring members"));
+    }
+
+    #[test]
+    fn ring_lens_are_per_spending_input() {
+        let tx: TxJson = serde_json::from_str(
+            r#"{"version":1,"unlock_time":0,"vin":[{"key":{"amount":5,"key_offsets":[1,2,3],"k_image":"aa"}},{"key":{"amount":5,"key_offsets":[4,5,6,7,8],"k_image":"bb"}}],"vout":[],"extra":[]}"#,
+        )
+        .expect("a v1 spend");
+        assert_eq!(ring_lens(&tx), vec![3, 5]);
+        let coinbase: TxJson = serde_json::from_str(
+            r#"{"version":2,"unlock_time":60,"vin":[{"gen":{"height":5}}],"vout":[],"extra":[],"rct_signatures":{"type":0}}"#,
+        )
+        .expect("a coinbase");
+        assert!(ring_lens(&coinbase).is_empty());
     }
 
     /// With the tree's size known, the row gives the count; the proof size and
@@ -4838,6 +4930,36 @@ mod tests {
         )
         .expect("a coinbase");
         assert_eq!(spends(&coinbase), 0);
+    }
+
+    /// A row whose inputs have rings of different sizes gives the range, as
+    /// the transaction's own page does, in the block table and the pool's.
+    #[test]
+    fn a_row_with_mixed_rings_gives_the_range() {
+        let mut page = block_page();
+        page.txs[1].ring = 3;
+        page.txs[1].ring_max = 5;
+        let html = page.render().expect("renders");
+        assert!(html.contains(r#"<td class="num">3 to 5</td>"#), "{html}");
+        assert!(html.contains(r#"<td class="num">16</td>"#), "{html}");
+
+        let mut pool = mempool_page(None);
+        pool.txs[0].ring = 3;
+        pool.txs[0].ring_max = 5;
+        let html = pool.render().expect("renders");
+        assert!(html.contains(r#"<td class="num">3 to 5</td>"#), "{html}");
+
+        let mut tx = pool_tx(0, 7, 900);
+        tx.tx_json = serde_json::json!({
+            "version": 1, "unlock_time": 0, "extra": [], "vout": [],
+            "vin": [
+                {"key": {"amount": 5, "key_offsets": [1, 2, 3, 4, 5], "k_image": "ab".repeat(32)}},
+                {"key": {"amount": 5, "key_offsets": [1, 2, 3], "k_image": "cd".repeat(32)}},
+            ],
+        })
+        .to_string();
+        let f = RowCache::default().of_pool_tx(&tx).expect("figures");
+        assert_eq!((f.ring, f.ring_max), (3, 5));
     }
 
     /// An FCMP++ row's column holds its tree's size when that is known, never

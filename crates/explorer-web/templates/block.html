@@ -28,9 +28,9 @@ listed below.</div>
   <dd>{{ major_version }}.{{ minor_version }}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
     <p>The rule set the block was mined under. Monero changes its rules only at a
-    network upgrade, and each upgrade raises the major version. Version 16
+    network upgrade, and each upgrade raises the major version. Version 15
     arrived in August 2022 and brought ring size 16, Bulletproofs+ and view
-    tags. Version 17 brings FCMP++, which replaces rings with a proof over
+    tags, and version 16 followed a day later. Version 17 brings FCMP++, which replaces rings with a proof over
     every spendable output, and Carrot, a new way to address outputs. The
     minor version is the version a miner signals it is ready for. It
     tracks the major version once an upgrade is live. Neither number names
@@ -88,7 +88,7 @@ listed below.</div>
       <td class="num">{% if t.coinbase %}&mdash;{% else %}{{ t.inputs }}{% endif %}</td>
       <td class="num">{{ t.outputs }}</td>
       <td class="num">{{ t.fee }}</td>
-      <td class="num">{% if t.coinbase %}&mdash;{% else if t.full_chain %}{% if let Some(n) = t.tree %}<span title="FCMP++: proves it spends one of the {{ n }} outputs in the curve tree as of its reference block, without saying which">{{ n }}</span>{% else %}<span title="FCMP++: proves it spends one of the outputs in the curve tree as of its reference block, without saying which">whole tree</span>{% endif %}{% else %}{{ t.ring }}{% endif %}</td>
+      <td class="num">{% if t.coinbase %}&mdash;{% else if t.full_chain %}{% if let Some(n) = t.tree %}<span title="FCMP++: proves it spends one of the {{ n }} outputs in the curve tree as of its reference block, without saying which">{{ n }}</span>{% else %}<span title="FCMP++: proves it spends one of the outputs in the curve tree as of its reference block, without saying which">whole tree</span>{% endif %}{% else %}{{ t.ring }}{% if t.ring_max != t.ring %} to {{ t.ring_max }}{% endif %}{% endif %}</td>
       <td class="num">{{ t.size }}</td>
     </tr>
   {% endfor %}
