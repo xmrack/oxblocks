@@ -50,6 +50,17 @@ listed below.</div>
     against this root. The layer count grows as the tree does, and the proof
     grows with it.</p></details>
   </dd>
+  {% if let Some((outputs, added)) = tree_growth %}
+  <dt>Tree size</dt>
+  <dd>{% if outputs.as_str() == "0" %}No outputs yet{% else %}{{ outputs }} outputs, {{ added }} more than the block before{% endif %}
+    <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+    <p>How many outputs the tree under this block's root holds, and how many
+    it gained over the previous block's. An output joins the tree when it
+    unlocks: ten blocks after it is mined for most, sixty for a coinbase. Each
+    one that joins adds to the anonymity set of every FCMP++ spend checked
+    against this root or a later one.</p></details>
+  </dd>
+  {% endif %}
   {% endif %}
 </dl>
 
@@ -62,7 +73,7 @@ listed below.</div>
       <th class="num">Inputs</th>
       <th class="num">Outputs</th>
       <th class="num">{% call sort::header("Fee", fee_sort) %}{% endcall %}</th>
-      <th class="num">Ring</th>
+      <th class="num">{% if self.anon_set() %}Anon set{% else %}Ring{% endif %}</th>
       <th class="num">{% call sort::header("Size", size_sort) %}{% endcall %}</th>
     </tr>
   </thead>
@@ -77,7 +88,7 @@ listed below.</div>
       <td class="num">{% if t.coinbase %}&mdash;{% else %}{{ t.inputs }}{% endif %}</td>
       <td class="num">{{ t.outputs }}</td>
       <td class="num">{{ t.fee }}</td>
-      <td class="num">{% if t.coinbase %}&mdash;{% else if t.full_chain %}<span title="FCMP++: every output in the curve tree the proof names">all</span>{% else %}{{ t.ring }}{% endif %}</td>
+      <td class="num">{% if t.coinbase %}&mdash;{% else if t.full_chain %}{% if let Some(n) = t.tree %}<span title="FCMP++: proves it spends one of the {{ n }} outputs in the curve tree as of its reference block, without saying which">{{ n }}</span>{% else %}<span title="FCMP++: proves it spends one of the outputs in the curve tree as of its reference block, without saying which">whole tree</span>{% endif %}{% else %}{{ t.ring }}{% endif %}</td>
       <td class="num">{{ t.size }}</td>
     </tr>
   {% endfor %}

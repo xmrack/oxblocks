@@ -16,7 +16,8 @@ use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use explorer_core::fmt::{age, decimal, now, timestamp_utc};
 use explorer_core::{Amount, BlockId, BlockTree, ChainError, Hash32, TxFacts};
-use monerod_rpc::types::{PoolTxInfo, TxEntry, TxJson};
+use monerod_rpc::types::{PoolTxInfo, TREE_ROOT_LAG, TxEntry, TxJson};
+use std::collections::HashMap;
 
 use crate::api::handlers::{AppState, Shared, echo};
 use crate::config::Theme;
@@ -98,6 +99,9 @@ struct BlockPage {
     /// below the fork, and when the block's own JSON did not decode.
     tree_root: Option<String>,
     tree_layers: Option<u8>,
+    /// The outputs in the tree whose root this block carries, and how many
+    /// more than in the previous block's.
+    tree_growth: Option<(String, String)>,
     fee_sort: ColumnSort,
     size_sort: ColumnSort,
     txs: Vec<BlockTxRow>,
@@ -114,9 +118,12 @@ struct BlockTxRow {
     fee: String,
     fee_atomic: u64,
     ring: usize,
-    /// An FCMP++ spend, whose ring column reads "all" rather than a 0 that
-    /// would say it has no anonymity set.
+    /// An FCMP++ spend, whose ring column names the curve tree rather than a
+    /// 0 that would say it has no anonymity set.
     full_chain: bool,
+    /// Its reference block, and the tree's size as of it when known.
+    reference: Option<u64>,
+    tree: Option<String>,
     size: u64,
 }
 
@@ -711,6 +718,21 @@ struct MempoolPage {
     txs: Vec<PoolRow>,
 }
 
+impl MempoolPage {
+    /// Whether any row is an FCMP++ spend, whose column holds a tree's size
+    /// rather than a ring's.
+    fn anon_set(&self) -> bool {
+        self.txs.iter().any(|t| t.full_chain)
+    }
+}
+
+impl BlockPage {
+    /// As [`MempoolPage::anon_set`].
+    fn anon_set(&self) -> bool {
+        self.txs.iter().any(|t| t.full_chain)
+    }
+}
+
 /// The most rows the mempool page shows: as many as `/api/mempool` sends at
 /// once.
 #[allow(clippy::cast_possible_truncation, reason = "500 fits any usize")]
@@ -725,6 +747,8 @@ struct PoolRow {
     fee: String,
     ring: usize,
     full_chain: bool,
+    reference: Option<u64>,
+    tree: Option<String>,
     size: u64,
 }
 
@@ -857,7 +881,86 @@ fn sort_rows<T>(rows: &mut [T], dir: SortDir, value: impl Fn(&T) -> u64) {
 /// [`MEMPOOL_ROWS`] before any transaction is decoded, so a pool of
 /// thousands costs the rows shown. A transaction that does not decode has no
 /// row.
+/// What a table row shows of a transaction. Its hash fixes all of it, so
+/// it is worked out once rather than parsed again on every view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowFacts {
+    coinbase: bool,
+    p2pool: bool,
+    inputs: usize,
+    outputs: usize,
+    fee: u64,
+    ring: usize,
+    full_chain: bool,
+    reference: Option<u64>,
+    size: u64,
+}
+
+impl RowFacts {
+    fn of(tx: &TxJson, f: &TxFacts) -> Self {
+        Self {
+            coinbase: f.coinbase,
+            p2pool: is_p2pool(
+                f.coinbase,
+                tx.vout.len(),
+                f.extra.merge_mining_tag().is_some(),
+            ),
+            inputs: spends(tx),
+            outputs: tx.vout.len(),
+            fee: f.fee,
+            ring: f.ring_size,
+            full_chain: f.fcmp_pp.is_some(),
+            reference: tx.reference_block(),
+            size: f.size,
+        }
+    }
+}
+
+/// [`RowFacts`] by transaction hash, and whether they are a pool row's: the
+/// pool states a transaction's size and fee itself, a block row measures and
+/// derives them.
+pub struct RowCache(explorer_core::cache::Cache<(String, bool), RowFacts>);
+
+impl Default for RowCache {
+    fn default() -> Self {
+        Self(explorer_core::cache::Cache::permanent(16_384))
+    }
+}
+
+impl RowCache {
+    #[must_use]
+    pub fn stats(&self) -> explorer_core::cache::Stats {
+        self.0.stats()
+    }
+
+    fn of_block_tx(&self, e: &TxEntry) -> Option<RowFacts> {
+        let key = (e.tx_hash.to_lowercase(), false);
+        if let Some(hit) = self.0.get(&key) {
+            return Some(*hit);
+        }
+        let tx = e.parse_json().ok()?;
+        let facts = RowFacts::of(&tx, &TxFacts::from_entry(e, &tx));
+        // A pruned entry measures short; it is shown as it is, not kept.
+        if !e.prunable_missing(&tx) {
+            self.0.insert(key, facts);
+        }
+        Some(facts)
+    }
+
+    fn of_pool_tx(&self, t: &PoolTxInfo) -> Option<RowFacts> {
+        let key = (t.id_hash.to_lowercase(), true);
+        if let Some(hit) = self.0.get(&key) {
+            return Some(*hit);
+        }
+        let tx = t.parse_json().ok()?;
+        let facts = RowFacts::of(&tx, &TxFacts::from_pool(t, &tx));
+        self.0.insert(key, facts);
+        Some(facts)
+    }
+}
+
 fn pool_rows(
+    rows: &RowCache,
     pool: &[PoolTxInfo],
     active: Option<(SortKey, SortDir)>,
     asked_at: u64,
@@ -870,20 +973,39 @@ fn pool_rows(
         .into_iter()
         .take(MEMPOOL_ROWS)
         .filter_map(|t| {
-            let tx = t.parse_json().ok()?;
-            let f = TxFacts::from_pool(t, &tx);
+            let f = rows.of_pool_tx(t)?;
             Some(PoolRow {
                 hash: t.id_hash.to_lowercase(),
                 age: age(asked_at, t.receive_time),
-                inputs: spends(&tx),
-                outputs: tx.vout.len(),
+                inputs: f.inputs,
+                outputs: f.outputs,
                 fee: xmr_aligned(f.fee),
-                ring: f.ring_size,
-                full_chain: f.fcmp_pp.is_some(),
+                ring: f.ring,
+                full_chain: f.full_chain,
+                reference: f.reference,
+                tree: None,
                 size: f.size,
             })
         })
         .collect()
+}
+
+/// The outputs in the tree as of a row's reference block, from `sizes`.
+fn tree_of(reference: Option<u64>, sizes: &HashMap<u64, u64>) -> Option<String> {
+    sizes
+        .get(&reference?)
+        .filter(|n| **n > 0)
+        .map(|n| grouped(*n))
+}
+
+/// The size of the tree whose root block `height` carries, and how many
+/// outputs it gained over the previous block's: both are as of
+/// `TREE_ROOT_LAG` blocks on.
+fn tree_growth(height: u64, sizes: &HashMap<u64, u64>) -> Option<(String, String)> {
+    let at = height.checked_add(TREE_ROOT_LAG)?;
+    let now = *sizes.get(&at)?;
+    let before = *sizes.get(&(at - 1))?;
+    Some((grouped(now), grouped(now.saturating_sub(before))))
 }
 
 /// Orders a block's rows. A block has no `Waiting` column, so that key is
@@ -1319,22 +1441,19 @@ pub async fn block(
         .txs
         .iter()
         .filter_map(|e| {
-            let tx = e.parse_json().ok()?;
-            let f = TxFacts::from_entry(e, &tx);
+            let f = state.rows.of_block_tx(e)?;
             Some(BlockTxRow {
                 hash: e.tx_hash.to_lowercase(),
                 coinbase: f.coinbase,
-                p2pool: is_p2pool(
-                    f.coinbase,
-                    tx.vout.len(),
-                    f.extra.merge_mining_tag().is_some(),
-                ),
-                inputs: spends(&tx),
-                outputs: tx.vout.len(),
+                p2pool: f.p2pool,
+                inputs: f.inputs,
+                outputs: f.outputs,
                 fee: xmr_aligned(f.fee),
                 fee_atomic: f.fee,
-                ring: f.ring_size,
-                full_chain: f.fcmp_pp.is_some(),
+                ring: f.ring,
+                full_chain: f.full_chain,
+                reference: f.reference,
+                tree: None,
                 size: f.size,
             })
         })
@@ -1351,6 +1470,32 @@ pub async fn block(
     // everything above it came from the header.
     let tree = BlockTree::of(&got);
     let depth = state.chain.depth_now(&header).await;
+
+    // The coinbase's output is newer than every tree asked about here. An
+    // orphan's sizes would be the main chain's, so it is asked nothing.
+    let probe = fetched
+        .txs
+        .first()
+        .and_then(|e| e.unified_ids.first().copied())
+        .filter(|_| !header.orphan_status);
+    let sizes = match probe {
+        Some(probe) => {
+            let grew = tree
+                .is_some()
+                .then(|| header.height.checked_add(TREE_ROOT_LAG))
+                .flatten();
+            let heights = txs
+                .iter()
+                .filter_map(|r| r.reference)
+                .chain(grew.into_iter().flat_map(|h| [h - 1, h]));
+            let chain_height = header.height.saturating_add(depth).saturating_add(1);
+            state.chain.tree_sizes(heights, probe, chain_height).await
+        }
+        None => HashMap::new(),
+    };
+    for r in &mut txs {
+        r.tree = tree_of(r.reference, &sizes);
+    }
 
     render(
         StatusCode::OK,
@@ -1375,6 +1520,9 @@ pub async fn block(
             nonce: header.nonce,
             major_version: header.major_version,
             minor_version: header.minor_version,
+            tree_growth: tree
+                .as_ref()
+                .and_then(|_| tree_growth(header.height, &sizes)),
             tree_layers: tree.as_ref().map(|t| t.n_layers),
             tree_root: tree.map(|t| t.root),
             fee_sort: column_sort(&page, SortKey::Fee, active),
@@ -2035,7 +2183,16 @@ pub async fn mempool(State(state): Shared, Query(q): Query<SortQuery>) -> Page {
     // pool: the latter always shows the newest transaction as having waited no
     // time at all, even on a pool nothing has arrived in for an hour.
     let asked_at = now();
-    let txs = pool_rows(&pool.transactions, active, asked_at);
+    let mut txs = pool_rows(&state.rows, &pool.transactions, active, asked_at);
+    if txs.iter().any(|r| r.reference.is_some())
+        && let (Some(probe), Ok(info)) = (state.chain.tip_probe().await, state.chain.info().await)
+    {
+        let heights = txs.iter().filter_map(|r| r.reference);
+        let sizes = state.chain.tree_sizes(heights, probe, info.height).await;
+        for r in &mut txs {
+            r.tree = tree_of(r.reference, &sizes);
+        }
+    }
 
     render(
         StatusCode::OK,
@@ -3414,6 +3571,8 @@ mod tests {
             fee_atomic: if coinbase { 0 } else { 711_360_000 },
             ring: if coinbase { 0 } else { 16 },
             full_chain: false,
+            reference: None,
+            tree: None,
             size: 2_223,
         }
     }
@@ -3443,6 +3602,7 @@ mod tests {
             minor_version: 16,
             tree_root: None,
             tree_layers: None,
+            tree_growth: None,
             fee_sort: column_sort("/block/3185430", SortKey::Fee, None),
             size_sort: column_sort("/block/3185430", SortKey::Size, None),
             txs,
@@ -3458,6 +3618,8 @@ mod tests {
             fee: "0.0".to_owned(),
             ring: 16,
             full_chain: false,
+            reference: None,
+            tree: None,
             size,
         }
     }
@@ -3606,7 +3768,7 @@ mod tests {
             pool_tx(970, 100, 1_000),
             pool_tx(980, 200, 3_000),
         ];
-        let rows = |key, dir| pool_rows(&pool, Some((key, dir)), 1_000);
+        let rows = |key, dir| pool_rows(&RowCache::default(), &pool, Some((key, dir)), 1_000);
 
         assert_eq!(fees(&rows(SortKey::Fee, SortDir::Asc)), [100, 200, 300]);
         // Waiting 30, 20 and 10 seconds.
@@ -3627,6 +3789,42 @@ mod tests {
         );
     }
 
+    /// A row's figures are worked out once per transaction: a second view
+    /// takes them from the cache, not from parsing the transaction again;
+    /// and a pool row's are kept apart from the same transaction's block row.
+    #[test]
+    fn a_rows_figures_are_worked_out_once() {
+        let rows = RowCache::default();
+        let mut tx = pool_tx(0, 7, 900);
+        let first = rows.of_pool_tx(&tx).expect("figures");
+        assert_eq!((first.size, first.fee, first.ring), (900, 7, 16));
+        tx.tx_json = "not json".to_owned();
+        assert_eq!(rows.of_pool_tx(&tx), Some(first), "not parsed again");
+
+        let mined: TxEntry = serde_json::from_value(serde_json::json!({
+            "tx_hash": format!("{:064x}", 7), "as_hex": "00".repeat(50),
+            "as_json": r#"{"version":2,"unlock_time":0,"extra":[],"vout":[],"vin":[{"gen":{"height":5}}]}"#,
+            "block_height": 5, "block_timestamp": 0, "confirmations": 1, "in_pool": false,
+            "double_spend_seen": false, "output_indices": [],
+        }))
+        .expect("a mined entry");
+        let block = rows.of_block_tx(&mined).expect("figures");
+        assert!(block.coinbase && block.size == 50, "{block:?}");
+
+        // A pruned entry is shown as it is, and not kept.
+        let mut pruned: TxEntry = serde_json::from_value(serde_json::json!({
+            "tx_hash": format!("{:064x}", 8), "as_hex": "", "pruned_as_hex": "00".repeat(40),
+            "prunable_as_hex": "",
+            "as_json": r#"{"version":2,"unlock_time":0,"extra":[],"vout":[],"vin":[{"key":{"amount":0,"key_offsets":[1],"k_image":"ab"}}]}"#,
+            "block_height": 5, "block_timestamp": 0, "confirmations": 1, "in_pool": false,
+            "double_spend_seen": false, "output_indices": [],
+        }))
+        .expect("a pruned entry");
+        assert!(rows.of_block_tx(&pruned).is_some());
+        pruned.as_json = "not json".to_owned();
+        assert_eq!(rows.of_block_tx(&pruned), None, "parsed again");
+    }
+
     /// Each pool row counts the outputs its transaction spends and makes,
     /// from the transaction itself.
     #[test]
@@ -3642,7 +3840,7 @@ mod tests {
             })).collect::<Vec<_>>(),
         })
         .to_string();
-        let rows = pool_rows(&[tx], None, 0);
+        let rows = pool_rows(&RowCache::default(), &[tx], None, 0);
         assert_eq!((rows[0].inputs, rows[0].outputs), (3, 5));
 
         let html = mempool_page(None).render().expect("renders");
@@ -3667,12 +3865,17 @@ mod tests {
         let pool: Vec<PoolTxInfo> = (1..=MEMPOOL_ROWS as u64 + 20)
             .map(|fee| pool_tx(0, fee, 1))
             .collect();
-        let rows = pool_rows(&pool, Some((SortKey::Fee, SortDir::Desc)), 0);
+        let rows = pool_rows(
+            &RowCache::default(),
+            &pool,
+            Some((SortKey::Fee, SortDir::Desc)),
+            0,
+        );
         assert_eq!(rows.len(), MEMPOOL_ROWS);
         let fees = fees(&rows);
         assert_eq!(fees.first(), Some(&(MEMPOOL_ROWS as u64 + 20)));
         assert_eq!(fees.last(), Some(&21));
-        let unsorted = pool_rows(&pool, None, 0);
+        let unsorted = pool_rows(&RowCache::default(), &pool, None, 0);
         assert_eq!(
             unsorted[0].hash,
             format!("{:064x}", 1),
@@ -3769,7 +3972,12 @@ mod tests {
     fn rows_tied_on_the_sort_key_keep_their_original_order() {
         let pool = [pool_tx(5, 100, 1), pool_tx(5, 200, 2), pool_tx(5, 300, 3)];
         for dir in [SortDir::Desc, SortDir::Asc] {
-            let rows = pool_rows(&pool, Some((SortKey::Waiting, dir)), 10);
+            let rows = pool_rows(
+                &RowCache::default(),
+                &pool,
+                Some((SortKey::Waiting, dir)),
+                10,
+            );
             assert_eq!(fees(&rows), [100, 200, 300]);
         }
     }
@@ -4596,33 +4804,92 @@ mod tests {
         assert_eq!(spends(&coinbase), 0);
     }
 
-    /// An FCMP++ row's ring column reads "all", never the 0 its ring size is.
+    /// An FCMP++ row's column holds its tree's size when that is known, never
+    /// the 0 its ring size is, and a table with one heads it "Anon set".
     #[test]
-    fn an_fcmp_pp_row_reads_all_in_the_ring_column() {
-        let mut page = block_page();
-        page.txs.push(BlockTxRow {
+    fn an_fcmp_pp_row_names_its_tree_in_the_ring_column() {
+        let fcmp = || BlockTxRow {
             ring: 0,
             full_chain: true,
+            reference: Some(300),
             ..block_tx(false)
+        };
+        let ring_only = block_page().render().expect("renders");
+        assert!(ring_only.contains(r#"<th class="num">Ring</th>"#));
+        assert!(!ring_only.contains("Anon set"));
+        let ring_pool = mempool_page(None).render().expect("renders");
+        assert!(ring_pool.contains(r#"<th class="num">Ring</th>"#));
+
+        let mut page = block_page();
+        page.txs.push(BlockTxRow {
+            tree: Some("6,213".to_owned()),
+            ..fcmp()
         });
+        page.txs.push(fcmp());
         let html = page.render().expect("renders");
-        assert_eq!(
-            html.matches(
-                r#"<span title="FCMP++: every output in the curve tree the proof names">all</span>"#
-            )
-            .count(),
-            1,
-            "{html}"
-        );
+        assert_eq!(html.matches(">6,213</span>").count(), 1, "{html}");
+        assert!(html.contains(r#"<th class="num">Anon set</th>"#), "{html}");
+        assert!(html.contains("one of the 6,213 outputs in the curve tree"));
+        assert_eq!(html.matches(">whole tree</span>").count(), 1, "{html}");
+        assert!(!html.contains(">0</td>"), "{html}");
 
         let mut pool = mempool_page(None);
         pool.txs.push(PoolRow {
             ring: 0,
             full_chain: true,
+            tree: Some("7,001".to_owned()),
             ..pool_row(5)
         });
         let html = pool.render().expect("renders");
-        assert!(html.contains(">all</span>"));
+        assert!(html.contains(">7,001</span>"), "{html}");
+        assert!(html.contains(r#"<th class="num">Anon set</th>"#), "{html}");
+    }
+
+    /// A row's tree is the one as of its own reference block, and an empty
+    /// tree, which no proof was built against, is not a size to show.
+    #[test]
+    fn a_rows_tree_is_the_one_as_of_its_reference_block() {
+        let sizes = HashMap::from([(300, 6_213), (301, 6_250), (302, 0)]);
+        assert_eq!(tree_of(Some(301), &sizes).as_deref(), Some("6,250"));
+        assert_eq!(tree_of(Some(300), &sizes).as_deref(), Some("6,213"));
+        assert_eq!(tree_of(Some(302), &sizes), None);
+        assert_eq!(tree_of(Some(303), &sizes), None);
+        assert_eq!(tree_of(None, &sizes), None);
+    }
+
+    /// A block's root is the tree as of eight blocks on, so its growth is
+    /// that tree's size against the one a block before it.
+    #[test]
+    fn a_blocks_growth_is_its_roots_tree_against_the_previous_one() {
+        let sizes = HashMap::from([(366, 6_970), (367, 6_988), (359, 6_800)]);
+        assert_eq!(
+            tree_growth(359, &sizes),
+            Some(("6,988".to_owned(), "18".to_owned()))
+        );
+        assert_eq!(tree_growth(358, &sizes), None, "no size as of 367 - 1");
+        let first = HashMap::from([(107, 0), (108, 38)]);
+        assert_eq!(
+            tree_growth(100, &first),
+            Some(("38".to_owned(), "38".to_owned())),
+            "an empty tree before it is a real 0"
+        );
+    }
+
+    #[test]
+    fn a_block_shows_its_trees_growth_only_when_known() {
+        let mut page = block_page();
+        page.tree_root = Some("9".repeat(64));
+        page.tree_layers = Some(3);
+        assert!(!page.render().expect("renders").contains("Tree size"));
+        page.tree_growth = Some(("6,988".to_owned(), "18".to_owned()));
+        let html = page.render().expect("renders");
+        assert!(
+            html.contains("<dd>6,988 outputs, 18 more than the block before"),
+            "{html}"
+        );
+        page.tree_growth = Some(("0".to_owned(), "0".to_owned()));
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dd>No outputs yet"), "{html}");
     }
 
     /// A RingCT amount is hidden, not zero, and the two must not render alike.

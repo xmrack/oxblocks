@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
-use crate::cache::{Cache, REORG_WINDOW, safe_to_cache_by_height};
+use crate::cache::{Cache, Flights, REORG_WINDOW, safe_to_cache_by_height};
 use crate::chain::{BlockId, ChainError, ResolvedInput, RingMember};
 use crate::hash::Hash32;
 
@@ -76,6 +76,21 @@ pub struct RpcChainSource {
     /// that block is buried past [`REORG_WINDOW`]: a reorg gives a height a
     /// different block, and with it a different tree.
     tree_sizes: Cache<u64, u64>,
+    /// Curve-tree sizes too recent for `tree_sizes`, keyed by the block and
+    /// by the tip they were read under. A reorg changes the tip, so none
+    /// outlives the chain it was read from.
+    recent_tree_sizes: Cache<(u64, String), u64>,
+    /// [`RpcChainSource::tip_probe`]'s answers, keyed by the tip.
+    tip_probes: Cache<String, u64>,
+    /// Confirmed transactions too recent for `txs`, keyed by hash and by the
+    /// tip they were read under, which a reorg changes.
+    recent_txs: Cache<(Hash32, String), TxEntry>,
+    /// A block's transactions, keyed by its hash. The hash fixes the list and
+    /// the whole chain below it, so every field but the confirmation count,
+    /// which is recounted on the way out, holds at any depth.
+    block_txs: Cache<Hash32, Vec<TxEntry>>,
+    /// One fetch at a time of each answer the caches above hold.
+    flights: Flights<Flight>,
     /// Bounds how many RPC calls can be in flight against the daemon at once.
     ///
     /// The single choke point protecting the operator's node. Per-request
@@ -246,9 +261,17 @@ impl BlockTree {
 /// Concurrent RPC calls allowed against the daemon.
 ///
 /// monerod answers RPC on a bounded thread pool, so flooding it degrades the
-/// node itself -- including its peer-to-peer duties. Kept well under what a
-/// daemon will happily serve.
-pub const DEFAULT_MAX_INFLIGHT_RPC: usize = 24;
+/// node itself -- including its peer-to-peer duties. And it closes
+/// connections from one address past `--rpc-max-connections-per-private-ip`,
+/// 25 by default, so this stays clear of that with room for the connections
+/// still closing. A daemon reached over a public address allows 3
+/// (`--rpc-max-connections-per-public-ip`): raise that there, or this.
+pub const DEFAULT_MAX_INFLIGHT_RPC: usize = 16;
+
+/// The most block bodies one range fetches at once, so that a wide range
+/// shares the daemon with every other request rather than taking all of
+/// [`DEFAULT_MAX_INFLIGHT_RPC`] until it is done.
+const RANGE_BODIES_AT_ONCE: usize = 8;
 
 /// Roughly the bytes a cached block holds: its strings, which the daemon
 /// sizes, and a word for everything else.
@@ -279,6 +302,40 @@ fn tx_bytes(t: &TxEntry) -> usize {
         + std::mem::size_of::<TxEntry>()
 }
 
+/// A cached entry's confirmations, counted again from a chain of
+/// `chain_height` as monerod counts them: the chain's height less the
+/// block's. Never fewer than it had.
+fn recount(entry: &mut TxEntry, chain_height: u64) {
+    entry.confirmations = chain_height
+        .saturating_sub(entry.block_height)
+        .max(entry.confirmations);
+}
+
+/// Whether `txs` are the transactions of `header`'s block as the chain holds
+/// them, fit to keep under the block's hash. An orphan's are never asked: the
+/// daemon answers for its transactions as the main chain holds them.
+fn keepable(header: &monerod_rpc::types::BlockHeader, txs: &[TxEntry]) -> bool {
+    txs.iter()
+        .all(|e| !e.in_pool && e.block_height == header.height)
+}
+
+/// Roughly the bytes a block's cached transactions hold.
+#[allow(
+    clippy::ptr_arg,
+    reason = "a cache weighs its values as stored, a Vec here"
+)]
+fn block_txs_bytes(txs: &Vec<TxEntry>) -> usize {
+    txs.iter().map(tx_bytes).sum()
+}
+
+/// What [`RpcChainSource`] fetches one at a time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Flight {
+    Info,
+    Pool,
+    BlockTxs(Hash32),
+}
+
 /// Roughly the bytes a cached ring member holds. See [`block_bytes`].
 fn out_bytes(o: &OutKey) -> usize {
     o.key.len() + o.mask.len() + o.txid.len() + std::mem::size_of::<OutKey>()
@@ -294,18 +351,26 @@ impl RpcChainSource {
             // process footprint stays predictable.
             //
             // What the daemon sends is sized by the daemon, so the caches
-            // holding its strings are also held to a byte budget: about 200
+            // holding its strings are also held to a byte budget: about 230
             // MiB in all, inside the 512 MiB `deploy/oxblocks.service` allows.
             blocks_by_hash: Cache::expiring(512, Duration::from_secs(120))
                 .within_bytes(32 << 20, block_bytes),
-            blocks_by_height: Cache::permanent(2048).within_bytes(64 << 20, block_bytes),
-            txs: Cache::permanent(8192).within_bytes(96 << 20, tx_bytes),
+            blocks_by_height: Cache::permanent(2048).within_bytes(48 << 20, block_bytes),
+            txs: Cache::permanent(8192).within_bytes(64 << 20, tx_bytes),
             outs: Cache::permanent(65_536).within_bytes(16 << 20, out_bytes),
             // Long enough to collapse the several calls a single page makes,
             // short enough that the height on screen is never visibly stale.
             info: Cache::expiring(1, Duration::from_secs(5)),
             pool: Cache::expiring(1, Duration::from_secs(2)),
             tree_sizes: Cache::permanent(4096),
+            // The keys of a replaced tip are never asked for again; they
+            // expire rather than wait to be pushed out.
+            recent_tree_sizes: Cache::expiring(1024, Duration::from_secs(600)),
+            tip_probes: Cache::expiring(4, Duration::from_secs(600)),
+            block_txs: Cache::permanent(512).within_bytes(48 << 20, block_txs_bytes),
+            recent_txs: Cache::expiring(2048, Duration::from_secs(600))
+                .within_bytes(16 << 20, tx_bytes),
+            flights: Flights::default(),
             rpc_permits: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_RPC)),
             range_kib: Arc::new(Semaphore::new(RANGE_KIB as usize)),
             rpc_calls: Arc::new(AtomicU64::new(0)),
@@ -377,7 +442,7 @@ impl RpcChainSource {
     }
 
     /// Cache occupancy and hit counts, for `/health` and for tests.
-    pub fn cache_stats(&self) -> [(&'static str, crate::cache::Stats); 7] {
+    pub fn cache_stats(&self) -> [(&'static str, crate::cache::Stats); 11] {
         [
             ("blocks_by_hash", self.blocks_by_hash.stats()),
             ("blocks_by_height", self.blocks_by_height.stats()),
@@ -386,6 +451,10 @@ impl RpcChainSource {
             ("info", self.info.stats()),
             ("pool", self.pool.stats()),
             ("tree_sizes", self.tree_sizes.stats()),
+            ("recent_tree_sizes", self.recent_tree_sizes.stats()),
+            ("tip_probes", self.tip_probes.stats()),
+            ("recent_txs", self.recent_txs.stats()),
+            ("block_txs", self.block_txs.stats()),
         ]
     }
 
@@ -410,11 +479,34 @@ impl RpcChainSource {
         if entry.in_pool {
             return None;
         }
-        if let Some(hit) = self.tree_sizes.get(&reference) {
+        let probe = *entry.unified_ids.first()?;
+        // The tree a proof was built against holds at least the output spent.
+        self.tree_size(reference, probe, chain_height)
+            .await
+            .filter(|n| *n > 0)
+    }
+
+    /// How many outputs the curve tree held as of block `height`, asked with
+    /// `probe`: the unified id of an output created after `height`, which
+    /// cannot be in the tree as of it. See [`TreeSizeQuery`]. `None` whenever
+    /// the daemon cannot answer.
+    pub async fn tree_size(&self, height: u64, probe: u64, chain_height: u64) -> Option<u64> {
+        if let Some(hit) = self.tree_sizes.get(&height) {
             return Some(*hit);
         }
-        let probe = *entry.unified_ids.first()?;
-        let query = TreeSizeQuery::as_of_block(reference, probe)?;
+        let buried = safe_to_cache_by_height(depth(chain_height, height));
+        let tip = if buried {
+            None
+        } else {
+            self.info()
+                .await
+                .ok()
+                .map(|i| (height, i.top_block_hash.clone()))
+        };
+        if let Some(hit) = tip.as_ref().and_then(|k| self.recent_tree_sizes.get(k)) {
+            return Some(*hit);
+        }
+        let query = TreeSizeQuery::as_of_block(height, probe)?;
         let root = self
             .binary(
                 TreeSizeQuery::ENDPOINT,
@@ -423,13 +515,53 @@ impl RpcChainSource {
                 TreeSizeQuery::MAX_ANSWER_BYTES,
             )
             .await
-            .map_err(|e| tracing::warn!("tree size as of block {reference}: {e}"))
+            .map_err(|e| tracing::warn!("tree size as of block {height}: {e}"))
             .ok()?;
         let size = TreeSizeQuery::answer(&root)?;
-        if safe_to_cache_by_height(depth(chain_height, reference)) {
-            self.tree_sizes.insert(reference, size);
+        if buried {
+            self.tree_sizes.insert(height, size);
+        } else if let Some(key) = tip {
+            self.recent_tree_sizes.insert(key, size);
         }
         Some(size)
+    }
+
+    /// [`tree_size`](Self::tree_size) as of each of `heights`, asked together
+    /// with the one `probe`, which has to be newer than all of them. A height
+    /// the daemon cannot answer for is left out.
+    pub async fn tree_sizes(
+        &self,
+        heights: impl IntoIterator<Item = u64>,
+        probe: u64,
+        chain_height: u64,
+    ) -> HashMap<u64, u64> {
+        let heights: std::collections::BTreeSet<u64> = heights.into_iter().collect();
+        let sizes = futures_util::future::join_all(
+            heights
+                .iter()
+                .map(|&h| self.tree_size(h, probe, chain_height)),
+        )
+        .await;
+        heights
+            .into_iter()
+            .zip(sizes)
+            .filter_map(|(h, n)| Some((h, n?)))
+            .collect()
+    }
+
+    /// The unified id of the tip block's coinbase's first output: newer than
+    /// every block up to the tip, so a probe for the tree as of any of them.
+    pub async fn tip_probe(&self) -> Option<u64> {
+        let info = self.info().await.ok()?;
+        if let Some(hit) = self.tip_probes.get(&info.top_block_hash) {
+            return Some(*hit);
+        }
+        let block = self.block_at(info.height.checked_sub(1)?).await.ok()?;
+        let hash: Hash32 = block.miner_tx_hash.parse().ok()?;
+        let fetched = self.transactions(&[hash]).await.ok()?;
+        let probe = fetched.txs.first()?.unified_ids.first().copied()?;
+        self.tip_probes.insert(info.top_block_hash.clone(), probe);
+        Some(probe)
     }
 
     /// The paths through the curve tree of the outputs `unified_ids`, as of
@@ -469,6 +601,10 @@ impl RpcChainSource {
         if let Some(hit) = self.info.get(&()) {
             return Ok(hit);
         }
+        let _turn = self.flights.enter(&Flight::Info).await;
+        if let Some(hit) = self.info.get(&()) {
+            return Ok(hit);
+        }
         let fresh: GetInfo = self.rpc("get_info", None::<()>).await?;
         Ok(self.info.insert((), fresh))
     }
@@ -485,17 +621,29 @@ impl RpcChainSource {
     }
 
     pub async fn block(&self, id: BlockId) -> Result<Arc<GetBlock>, ChainError> {
-        match id {
-            BlockId::Hash(h) => {
-                if let Some(hit) = self.blocks_by_hash.get(&h) {
-                    return Ok(hit);
-                }
+        if let BlockId::Height(h) = id {
+            if let Some(hit) = self.blocks_by_height.get(&h) {
+                return Ok(hit);
             }
-            BlockId::Height(h) => {
-                if let Some(hit) = self.blocks_by_height.get(&h) {
-                    return Ok(hit);
-                }
+            // A recent height is not kept by height, but its block is by
+            // hash: the small header names the hash. A height the header call
+            // cannot answer is left to `get_block`, whose refusal says why.
+            if let Ok(range) = self.headers_range(h, h).await
+                && let Some(header) = range.headers.first()
+                && header.height == h
+            {
+                return self.body_for(header).await;
             }
+        }
+        self.fetch_block(id).await
+    }
+
+    /// [`Self::block`] from the hash cache or the daemon.
+    async fn fetch_block(&self, id: BlockId) -> Result<Arc<GetBlock>, ChainError> {
+        if let BlockId::Hash(h) = id
+            && let Some(hit) = self.blocks_by_hash.get(&h)
+        {
+            return Ok(hit);
         }
 
         let request = match id {
@@ -575,25 +723,12 @@ impl RpcChainSource {
             .hash
             .parse::<Hash32>()
             .map_or(BlockId::Height(header.height), BlockId::Hash);
-        self.block(id).await
+        self.fetch_block(id).await
     }
 
-    /// The block at `height`, without re-fetching a recent block's body on
-    /// every call.
-    ///
-    /// [`Self::block`] by height caches only blocks buried past the reorg
-    /// window, so a recent height costs a whole body each time. This asks for
-    /// the header instead, which is small, and takes the body by the hash it
-    /// names, which the hash cache holds after the first time.
+    /// The block at `height`: [`Self::block`] by height.
     pub async fn block_at(&self, height: u64) -> Result<Arc<GetBlock>, ChainError> {
-        if let Some(hit) = self.blocks_by_height.get(&height) {
-            return Ok(hit);
-        }
-        let range = self.headers_range(height, height).await?;
-        let Some(header) = range.headers.first() else {
-            return Err(ChainError::BlockNotFound(BlockId::Height(height)));
-        };
-        self.body_for(header).await
+        self.block(BlockId::Height(height)).await
     }
 
     /// The block carrying the root an FCMP++ proof naming `reference_block`
@@ -642,11 +777,27 @@ impl RpcChainSource {
         // and a reader paging back and forth revisits the same ones.
         let mut found: HashMap<Hash32, TxEntry> = HashMap::new();
         let mut want: Vec<String> = Vec::new();
+        let mut unburied: Vec<&Hash32> = Vec::new();
         for h in hashes {
             match self.txs.get(h) {
                 Some(hit) => {
                     found.insert(*h, (*hit).clone());
                 }
+                None => unburied.push(h),
+            }
+        }
+        // The tip, for what is kept under it; asked for only when needed.
+        let tip = if unburied.is_empty() {
+            None
+        } else {
+            self.info().await.ok().map(|i| i.top_block_hash.clone())
+        };
+        for h in unburied {
+            match tip
+                .as_ref()
+                .and_then(|t| self.recent_txs.get(&(*h, t.clone())))
+            {
+                Some(hit) => drop(found.insert(*h, (*hit).clone())),
                 None => want.push(h.to_hex()),
             }
         }
@@ -659,10 +810,7 @@ impl RpcChainSource {
             && let Ok(info) = self.info().await
         {
             for entry in found.values_mut() {
-                entry.confirmations = info
-                    .height
-                    .saturating_sub(entry.block_height)
-                    .max(entry.confirmations);
+                recount(entry, info.height);
             }
         }
 
@@ -707,6 +855,10 @@ impl RpcChainSource {
                         .is_some_and(|tip| safe_to_cache_by_height(depth(tip, entry.block_height)));
                 if buried {
                     self.txs.insert(h, entry.clone());
+                } else if !entry.in_pool
+                    && let Some(t) = &tip
+                {
+                    self.recent_txs.insert((h, t.clone()), entry.clone());
                 }
                 found.insert(h, entry);
             }
@@ -788,6 +940,38 @@ impl RpcChainSource {
         }
         let held = self.hold_kib(kib).await?;
 
+        // Blocks whose transactions are kept need neither body nor fetch for
+        // them. The rest are each taken in turn, in height order as every
+        // range takes them, so a range asked for twice at once is fetched
+        // once.
+        let mut kept: HashMap<u64, Vec<TxEntry>> = HashMap::new();
+        let mut turns = Vec::new();
+        for header in &headers {
+            let Some(key) = header
+                .hash
+                .parse::<Hash32>()
+                .ok()
+                .filter(|_| !header.orphan_status)
+            else {
+                continue;
+            };
+            if let Some(txs) = self.block_txs.get(&key) {
+                kept.insert(header.height, (*txs).clone());
+                continue;
+            }
+            turns.push(self.flights.enter(&Flight::BlockTxs(key)).await);
+            if let Some(txs) = self.block_txs.get(&key) {
+                kept.insert(header.height, (*txs).clone());
+            }
+        }
+        if !kept.is_empty()
+            && let Ok(info) = self.info().await
+        {
+            for e in kept.values_mut().flatten() {
+                recount(e, info.height);
+            }
+        }
+
         // A block's body is fetched when it holds transactions, whose hashes
         // only the body lists -- the range cannot be answered without it --
         // and when the caller wants a post-fork block's curve tree, which is
@@ -799,15 +983,23 @@ impl RpcChainSource {
         let wanted_bodies: Vec<(&monerod_rpc::types::BlockHeader, bool)> = headers
             .iter()
             .filter_map(|h| {
-                let needed = h.num_txes > 0;
+                let needed = h.num_txes > 0 && !kept.contains_key(&h.height);
                 let for_tree =
                     with_tree && h.major_version >= monerod_rpc::types::HF_VERSION_FCMP_PLUS_PLUS;
                 (needed || for_tree).then_some((h, needed))
             })
             .collect();
-        let bodies =
-            futures_util::future::join_all(wanted_bodies.iter().map(|(h, _)| self.body_for(h)))
-                .await;
+        let bodies: Vec<_> = {
+            use futures_util::StreamExt;
+            let fetches: Vec<_> = wanted_bodies
+                .iter()
+                .map(|(h, _)| self.body_for(h))
+                .collect();
+            futures_util::stream::iter(fetches)
+                .buffered(RANGE_BODIES_AT_ONCE)
+                .collect()
+                .await
+        };
 
         let mut extra: HashMap<u64, Arc<GetBlock>> = HashMap::with_capacity(wanted_bodies.len());
         // Trees left out are reported as none, which the API documents as
@@ -829,11 +1021,14 @@ impl RpcChainSource {
             );
         }
 
-        // Every hash in the range, in the order its block lists them.
+        // Every hash in the range not kept, in the order its block lists them.
         let wanted: Vec<Vec<Hash32>> = headers
             .iter()
             .map(|h| {
                 let mut hashes: Vec<Hash32> = Vec::new();
+                if kept.contains_key(&h.height) {
+                    return hashes;
+                }
                 hashes.extend(h.miner_tx_hash.parse::<Hash32>());
                 if let Some(body) = extra.get(&h.height) {
                     hashes.extend(
@@ -866,16 +1061,32 @@ impl RpcChainSource {
         let blocks = headers
             .into_iter()
             .zip(wanted)
-            .map(|(header, hashes)| BlockWithTxs {
-                tree: if with_tree {
-                    extra.get(&header.height).and_then(|b| BlockTree::of(b))
-                } else {
-                    None
-                },
-                header,
-                txs: hashes.iter().filter_map(|h| fetched.remove(h)).collect(),
+            .map(|(header, hashes)| {
+                let txs = match kept.remove(&header.height) {
+                    Some(txs) => txs,
+                    None => {
+                        let txs: Vec<TxEntry> =
+                            hashes.iter().filter_map(|h| fetched.remove(h)).collect();
+                        if let Ok(key) = header.hash.parse::<Hash32>()
+                            && keepable(&header, &txs)
+                        {
+                            self.block_txs.insert(key, txs.clone());
+                        }
+                        txs
+                    }
+                };
+                BlockWithTxs {
+                    tree: if with_tree {
+                        extra.get(&header.height).and_then(|b| BlockTree::of(b))
+                    } else {
+                        None
+                    },
+                    header,
+                    txs,
+                }
             })
             .collect();
+        drop(turns);
         Ok(BlockRange {
             blocks,
             _held: held,
@@ -910,6 +1121,37 @@ impl RpcChainSource {
         let held = self
             .hold_kib(block.block_header.block_size.div_ceil(1024))
             .await?;
+        let key = block
+            .block_header
+            .hash
+            .parse::<Hash32>()
+            .ok()
+            .filter(|_| !block.block_header.orphan_status);
+        let _turn = match key {
+            Some(k) => {
+                if let Some(txs) = self.kept_block_txs(&k).await {
+                    return Ok((
+                        FetchedTxs {
+                            txs,
+                            missed: Vec::new(),
+                        },
+                        held,
+                    ));
+                }
+                let turn = self.flights.enter(&Flight::BlockTxs(k)).await;
+                if let Some(txs) = self.kept_block_txs(&k).await {
+                    return Ok((
+                        FetchedTxs {
+                            txs,
+                            missed: Vec::new(),
+                        },
+                        held,
+                    ));
+                }
+                Some(turn)
+            }
+            None => None,
+        };
         let listed = std::iter::once(&block.miner_tx_hash).chain(&block.tx_hashes);
         let hashes: Vec<Hash32> = listed.clone().filter_map(|h| h.parse().ok()).collect();
         let fetched = self.transactions(&hashes).await?;
@@ -924,7 +1166,23 @@ impl RpcChainSource {
                 ),
             });
         }
+        if let Some(k) = key
+            && keepable(&block.block_header, &fetched.txs)
+        {
+            self.block_txs.insert(k, fetched.txs.clone());
+        }
         Ok((fetched, held))
+    }
+
+    /// The transactions kept for the block hashed `key`, recounted.
+    async fn kept_block_txs(&self, key: &Hash32) -> Option<Vec<TxEntry>> {
+        let mut txs = (*self.block_txs.get(key)?).clone();
+        if let Ok(info) = self.info().await {
+            for e in &mut txs {
+                recount(e, info.height);
+            }
+        }
+        Some(txs)
     }
 
     /// The tip block's header.
@@ -989,6 +1247,10 @@ impl RpcChainSource {
     /// [`ChainError::NeedsUnrestricted`] rather than as a generic failure --
     /// the page is unavailable by configuration, not broken.
     pub async fn mempool(&self) -> Result<Arc<GetTransactionPool>, ChainError> {
+        if let Some(hit) = self.pool.get(&()) {
+            return Ok(hit);
+        }
+        let _turn = self.flights.enter(&Flight::Pool).await;
         if let Some(hit) = self.pool.get(&()) {
             return Ok(hit);
         }
@@ -1871,6 +2133,155 @@ mod tests {
 
     use crate::fake_daemon::FakeDaemon;
 
+    /// A daemon answering the tree size as of block `n - 1` with `1000 + n`
+    /// for each count `n`, 0 for the tree as of 7, and failing for 300. It
+    /// cannot say what its tip is.
+    fn tree_daemon() -> FakeDaemon {
+        use monerod_rpc::epee::{Root, Value, encode_root};
+        FakeDaemon::start_raw(|what, body| {
+            if what == "get_info" {
+                return (503, b"busy".to_vec());
+            }
+            assert_eq!(what, TreeSizeQuery::ENDPOINT);
+            assert_eq!(
+                body["unified_ids"], 77,
+                "every height asked with the one probe"
+            );
+            let n = body["as_of_n_blocks"].as_u64().unwrap();
+            let (size, status) = match n {
+                8 => (0, "OK"),
+                301 => (0, "Failed"),
+                n => (1000 + n, "OK"),
+            };
+            let root = Root::new(vec![
+                ("n_leaf_tuples".to_owned(), Value::Unsigned(size)),
+                (
+                    "status".to_owned(),
+                    Value::Bytes(status.as_bytes().to_vec()),
+                ),
+            ]);
+            (200, encode_root(&root).unwrap())
+        })
+    }
+
+    /// Each height is asked about once, as a count one past it; one the
+    /// daemon fails is left out, and an empty tree is a size like any other.
+    #[tokio::test]
+    async fn tree_sizes_ask_once_per_height_and_leave_out_what_fails() {
+        let daemon = tree_daemon();
+        let src = daemon.source();
+        let sizes = src.tree_sizes([5, 3, 5, 300, 7], 77, 1000).await;
+        assert_eq!(sizes, HashMap::from([(3, 1004), (5, 1006), (7, 0)]));
+        let mut asked: Vec<u64> = daemon
+            .bodies(TreeSizeQuery::ENDPOINT)
+            .iter()
+            .map(|b| b["as_of_n_blocks"].as_u64().unwrap())
+            .collect();
+        asked.sort_unstable();
+        assert_eq!(asked, [4, 6, 8, 301]);
+
+        // Buried heights are kept. One at the tip, with no tip to key it by,
+        // is asked again.
+        let again = src.tree_sizes([3, 999], 77, 1000).await;
+        assert_eq!(again, HashMap::from([(3, 1004), (999, 2000)]));
+        assert_eq!(daemon.count(TreeSizeQuery::ENDPOINT), 5);
+        let _ = src.tree_sizes([999], 77, 1000).await;
+        assert_eq!(daemon.count(TreeSizeQuery::ENDPOINT), 6);
+    }
+
+    /// A daemon whose tip is whatever `tip` holds: its coinbase has unified id
+    /// `tip * 10`, and the tree as of block `n - 1` has `1000 * tip + n`
+    /// outputs, so an answer read under one tip differs from the next's.
+    fn tipping_daemon(tip: Arc<AtomicU64>) -> FakeDaemon {
+        use monerod_rpc::epee::{Root, Value, encode_root};
+        FakeDaemon::start_raw(move |what, body| {
+            let tip = tip.load(Ordering::SeqCst);
+            let chain = Chain { tip, fork: 0 };
+            let coinbase = format!("{:064x}", tip + 7_000);
+            let mut header = chain.header(tip, false);
+            header["miner_tx_hash"] = coinbase.clone().into();
+            let ok = |r: serde_json::Value| {
+                let v = serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": r});
+                (200, v.to_string().into_bytes())
+            };
+            match what {
+                TreeSizeQuery::ENDPOINT => {
+                    let n = body["as_of_n_blocks"].as_u64().unwrap();
+                    let root = Root::new(vec![
+                        ("n_leaf_tuples".to_owned(), Value::Unsigned(1000 * tip + n)),
+                        ("status".to_owned(), Value::Bytes(b"OK".to_vec())),
+                    ]);
+                    (200, encode_root(&root).unwrap())
+                }
+                "get_info" => ok(chain.info()),
+                "get_block_headers_range" => {
+                    ok(serde_json::json!({"headers": [header], "status": "OK"}))
+                }
+                "get_block" => ok(serde_json::json!({
+                    "block_header": header, "miner_tx_hash": coinbase,
+                    "blob": "", "json": "{}", "status": "OK",
+                })),
+                "get_transactions" => {
+                    let v = serde_json::json!({"txs": [{
+                        "tx_hash": coinbase, "as_hex": "", "as_json": "{}", "block_height": tip,
+                        "block_timestamp": 0, "confirmations": 1, "in_pool": false,
+                        "double_spend_seen": false, "output_indices": [0],
+                        "unified_ids": [tip * 10],
+                    }], "status": "OK"});
+                    (200, v.to_string().into_bytes())
+                }
+                _ => (404, Vec::new()),
+            }
+        })
+    }
+
+    /// A size too recent to keep for good is kept for as long as the tip it
+    /// was read under, and read again once the tip moves; so is the probe.
+    #[tokio::test]
+    async fn recent_tree_sizes_and_the_probe_last_as_long_as_their_tip() {
+        let tip = Arc::new(AtomicU64::new(500));
+        let daemon = tipping_daemon(Arc::clone(&tip));
+        let src = daemon.source();
+        let asked = || daemon.count(TreeSizeQuery::ENDPOINT);
+
+        assert_eq!(src.tip_probe().await, Some(5_000));
+        let sizes = src.tree_sizes([495, 499, 507], 5_000, 501).await;
+        assert_eq!(sizes[&499], 500_500);
+        assert_eq!(asked(), 3);
+        for _ in 0..3 {
+            assert_eq!(src.tip_probe().await, Some(5_000));
+            assert_eq!(src.tree_sizes([495, 499, 507], 5_000, 501).await, sizes);
+        }
+        assert_eq!(asked(), 3, "nothing asked again under the same tip");
+        assert_eq!(daemon.count("get_transactions"), 1);
+
+        tip.store(501, Ordering::SeqCst);
+        src.fresh_info().await.unwrap();
+        assert_eq!(src.tip_probe().await, Some(5_010));
+        let moved = src.tree_sizes([499], 5_010, 502).await;
+        assert_eq!(moved[&499], 501_500, "read again under the new tip");
+        assert_eq!(asked(), 4);
+    }
+
+    /// An empty tree is a block's real size, but no spend was proved against
+    /// one, so it is not an anonymity set.
+    #[tokio::test]
+    async fn an_empty_tree_is_no_anonymity_set() {
+        let daemon = tree_daemon();
+        let src = daemon.source();
+        let mut tx = fcmp_pp_tx();
+        tx.rctsig_prunable = Some(monerod_rpc::types::RctSigPrunable {
+            reference_block: Some(7),
+            n_tree_layers: Some(1),
+            ..Default::default()
+        });
+        let mut mined = entry(hash(2));
+        mined.unified_ids = vec![77];
+        assert_eq!(src.anonymity_set(&tx, &mined, 1000).await, None);
+        tx.rctsig_prunable.as_mut().unwrap().reference_block = Some(5);
+        assert_eq!(src.anonymity_set(&tx, &mined, 1000).await, Some(1006));
+    }
+
     /// A range whose daemon leaves out one of its blocks' transactions is
     /// refused, not served with the block short.
     #[tokio::test]
@@ -1916,6 +2327,241 @@ mod tests {
             assert!(src.mempool().await.unwrap().transactions.is_empty());
         }
         assert_eq!(daemon.count("get_transaction_pool"), 1);
+    }
+
+    /// Pages missing the pool together share one fetch of it.
+    #[tokio::test]
+    async fn the_pool_missed_at_once_is_fetched_once() {
+        let daemon = FakeDaemon::start(|_, _| {
+            std::thread::sleep(Duration::from_millis(50));
+            serde_json::json!({"transactions": [], "status": "OK"})
+        });
+        let src = daemon.source();
+        let all = futures_util::future::join_all((0..6).map(|_| src.mempool())).await;
+        assert!(all.iter().all(Result::is_ok));
+        assert_eq!(daemon.count("get_transaction_pool"), 1);
+    }
+
+    /// The tip missed at once is asked for once.
+    #[tokio::test]
+    async fn the_tip_missed_at_once_is_asked_for_once() {
+        let daemon = FakeDaemon::start(|_, _| {
+            std::thread::sleep(Duration::from_millis(50));
+            serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": Chain { tip: 9, fork: 0 }.info()})
+        });
+        let src = daemon.source();
+        let all = futures_util::future::join_all((0..6).map(|_| src.info())).await;
+        assert!(all.iter().all(Result::is_ok));
+        assert_eq!(daemon.count("get_info"), 1);
+    }
+
+    /// A chain of blocks 0 to the tip `tip` holds whose block `h` holds a
+    /// coinbase hashed `h` and one transaction hashed `1000 + h`, and whose
+    /// block hashes carry `salt`, so a different salt is a reorg of every
+    /// block.
+    fn txs_daemon(tip: Arc<AtomicU64>, salt: Arc<AtomicU64>) -> FakeDaemon {
+        FakeDaemon::start(move |what, body| {
+            let salt = salt.load(Ordering::SeqCst);
+            let tip = tip.load(Ordering::SeqCst);
+            let header = |h: u64| {
+                let mut header = Chain { tip, fork: 0 }.header(h, false);
+                header["hash"] = format!("{:064x}", h + 1 + salt * 1_000_000).into();
+                header["num_txes"] = 1.into();
+                header["miner_tx_hash"] = format!("{h:064x}").into();
+                header
+            };
+            let ok = |r: serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": r});
+            match what {
+                "get_block_headers_range" => {
+                    let p = &body["params"];
+                    let (a, b) = (
+                        p["start_height"].as_u64().unwrap(),
+                        p["end_height"].as_u64().unwrap(),
+                    );
+                    ok(
+                        serde_json::json!({"headers": (a..=b).map(header).collect::<Vec<_>>(), "status": "OK"}),
+                    )
+                }
+                "get_block" => {
+                    let p = &body["params"];
+                    let h = p["height"].as_u64().unwrap_or_else(|| {
+                        let wanted = p["hash"].as_str().unwrap().to_owned();
+                        (0..=tip)
+                            .find(|h| header(*h)["hash"] == wanted.as_str())
+                            .unwrap()
+                    });
+                    ok(serde_json::json!({
+                        "block_header": header(h), "miner_tx_hash": format!("{h:064x}"),
+                        "tx_hashes": [format!("{:064x}", 1000 + h)],
+                        "blob": "", "json": "{}", "status": "OK",
+                    }))
+                }
+                "get_transactions" => {
+                    let txs: Vec<serde_json::Value> = body["txs_hashes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|t| {
+                            let n = u64::from_str_radix(t.as_str().unwrap(), 16).unwrap();
+                            let height = n % 1000;
+                            serde_json::json!({
+                                "tx_hash": t, "as_hex": "", "as_json": "{}", "block_height": height,
+                                "block_timestamp": 0, "confirmations": tip + 1 - height,
+                                "in_pool": false, "double_spend_seen": false,
+                                "output_indices": [salt],
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({"txs": txs, "status": "OK"})
+                }
+                _ => ok(Chain { tip, fork: 0 }.info()),
+            }
+        })
+    }
+
+    /// A recent block's transactions are kept under its hash: a range asked
+    /// again needs neither its bodies nor its transactions, with the
+    /// confirmations still counted from the tip; and a reorg, which gives the
+    /// blocks new hashes, is fetched afresh.
+    #[tokio::test]
+    async fn a_recent_ranges_transactions_are_kept_under_their_blocks_hashes() {
+        let salt = Arc::new(AtomicU64::new(0));
+        let tip = Arc::new(AtomicU64::new(99));
+        let daemon = txs_daemon(Arc::clone(&tip), Arc::clone(&salt));
+        let src = daemon.source();
+        let bodies_served = |src: &RpcChainSource| src.cache_stats()[0].1.hits;
+        let first = src.blocks_in_range(95, 99, false).await.unwrap();
+        assert_eq!(first.blocks.len(), 5);
+        assert!(first.blocks.iter().all(|b| b.txs.len() == 2));
+        drop(first);
+        let (bodies, fetches) = (daemon.count("get_block"), daemon.count("get_transactions"));
+        assert_eq!((bodies, fetches), (5, 1));
+
+        tip.store(104, Ordering::SeqCst);
+        src.fresh_info().await.unwrap();
+        let served = bodies_served(&src);
+        let again = src.blocks_in_range(95, 99, false).await.unwrap();
+        assert_eq!(daemon.count("get_block"), bodies, "no body asked again");
+        assert_eq!(bodies_served(&src), served, "nor read from the body cache");
+        assert_eq!(
+            daemon.count("get_transactions"),
+            fetches,
+            "no transaction asked again"
+        );
+        let last = &again.blocks[4];
+        assert_eq!(last.txs[1].tx_hash, format!("{:064x}", 1099));
+        assert_eq!(last.txs[0].confirmations, 6, "recounted from the new tip");
+        drop(again);
+
+        // The block page's path is served from the same entries.
+        let block = src.block(BlockId::Height(97)).await.unwrap();
+        let (txs, _held) = src.block_transactions(&block).await.unwrap();
+        assert_eq!(txs.txs.len(), 2);
+        assert_eq!(daemon.count("get_transactions"), fetches);
+
+        salt.store(1, Ordering::SeqCst);
+        let reorged = src.blocks_in_range(95, 99, false).await.unwrap();
+        assert_eq!(daemon.count("get_transactions"), fetches + 1);
+        assert!(
+            reorged
+                .blocks
+                .iter()
+                .flat_map(|b| &b.txs)
+                .all(|t| t.output_indices == [1])
+        );
+    }
+
+    /// Only what the chain holds in that block is kept under its hash: not a
+    /// pool transaction, nor one the daemon places in another block.
+    #[test]
+    fn a_blocks_transactions_are_kept_only_as_that_block_holds_them() {
+        let header: monerod_rpc::types::BlockHeader =
+            serde_json::from_value(Chain { tip: 9, fork: 0 }.header(5, false)).unwrap();
+        let at = |height: u64, in_pool: bool| TxEntry {
+            block_height: height,
+            in_pool,
+            ..entry(hash(1))
+        };
+        assert!(keepable(&header, &[at(5, false), at(5, false)]));
+        assert!(!keepable(&header, &[at(5, false), at(6, false)]));
+        assert!(!keepable(&header, &[at(5, false), at(5, true)]));
+    }
+
+    /// A recent block asked for by height is found by its header's hash, so
+    /// its body is fetched once however often it is asked for.
+    #[tokio::test]
+    async fn a_recent_block_by_height_is_fetched_once() {
+        let daemon = txs_daemon(Arc::new(AtomicU64::new(99)), Arc::new(AtomicU64::new(0)));
+        let src = daemon.source();
+        for _ in 0..3 {
+            let block = src.block(BlockId::Height(98)).await.unwrap();
+            assert_eq!(block.block_header.height, 98);
+        }
+        assert_eq!(daemon.count("get_block"), 1);
+    }
+
+    /// A recent transaction looked up alone is kept under the tip, and
+    /// asked for again once the tip moves.
+    #[tokio::test]
+    async fn a_recent_transaction_is_kept_while_the_tip_stays() {
+        let tip = Arc::new(AtomicU64::new(99));
+        let daemon = txs_daemon(Arc::clone(&tip), Arc::new(AtomicU64::new(0)));
+        let src = daemon.source();
+        let wanted = [format!("{:064x}", 1098).parse::<Hash32>().unwrap()];
+        for _ in 0..3 {
+            assert_eq!(src.transactions(&wanted).await.unwrap().txs.len(), 1);
+        }
+        assert_eq!(daemon.count("get_transactions"), 1);
+        tip.store(100, Ordering::SeqCst);
+        src.fresh_info().await.unwrap();
+        let moved = src.transactions(&wanted).await.unwrap();
+        assert_eq!(daemon.count("get_transactions"), 2);
+        assert_eq!(moved.txs[0].confirmations, 3);
+    }
+
+    /// Two ranges asking for the same new blocks at once fetch them once.
+    #[tokio::test]
+    async fn a_range_asked_twice_at_once_is_fetched_once() {
+        let daemon = txs_daemon(Arc::new(AtomicU64::new(99)), Arc::new(AtomicU64::new(0)));
+        let src = daemon.source();
+        let (a, b) = tokio::join!(
+            src.blocks_in_range(90, 99, false),
+            src.blocks_in_range(90, 99, false)
+        );
+        assert_eq!(a.unwrap().blocks.len(), 10);
+        assert_eq!(b.unwrap().blocks.len(), 10);
+        assert_eq!(daemon.count("get_transactions"), 1);
+    }
+
+    /// A block page's transactions are kept the same way, and two pages
+    /// asking at once fetch them once.
+    #[tokio::test]
+    async fn a_blocks_transactions_asked_at_once_are_fetched_once() {
+        let daemon = txs_daemon(Arc::new(AtomicU64::new(99)), Arc::new(AtomicU64::new(0)));
+        let src = daemon.source();
+        let block = src.block(BlockId::Height(98)).await.unwrap();
+        let both =
+            futures_util::future::join_all((0..4).map(|_| src.block_transactions(&block))).await;
+        assert!(
+            both.iter()
+                .all(|r| r.as_ref().is_ok_and(|(f, _)| f.txs.len() == 2))
+        );
+        assert_eq!(daemon.count("get_transactions"), 1);
+
+        // An orphan's transactions are the main chain's to report, not its
+        // own, so they are never kept under its hash.
+        let mut orphan = (*src.block(BlockId::Height(97)).await.unwrap()).clone();
+        orphan.block_header.orphan_status = true;
+        for _ in 0..2 {
+            src.block_transactions(&orphan).await.unwrap();
+        }
+        let block_txs = src
+            .cache_stats()
+            .into_iter()
+            .find(|(n, _)| *n == "block_txs")
+            .unwrap()
+            .1;
+        assert_eq!(block_txs.len, 1, "block 98's alone");
     }
 
     /// A block's transactions are fetched under its size's share of the

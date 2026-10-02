@@ -42,7 +42,8 @@ impl FakeDaemon {
 
     /// As [`start`](Self::start), with `answer` giving the status and the
     /// raw body, for a binary call or a failing one. A binary request's body
-    /// reads as null.
+    /// reads as its unsigned fields among [`BINARY_FIELDS`], an array as its
+    /// one element when it has one; anything else in it reads as null.
     pub fn start_raw(
         answer: impl Fn(&str, &serde_json::Value) -> Reply + Send + Sync + 'static,
     ) -> Self {
@@ -97,8 +98,9 @@ impl FakeDaemon {
                     .unwrap_or("")
                     .trim_start_matches('/')
                     .to_owned();
+                let raw = &buf[start..start + length];
                 let body: serde_json::Value =
-                    serde_json::from_slice(&buf[start..start + length]).unwrap_or_default();
+                    serde_json::from_slice(raw).unwrap_or_else(|_| binary_body(raw));
                 let what = if path == "json_rpc" {
                     body["method"].as_str().unwrap_or("").to_owned()
                 } else {
@@ -140,6 +142,24 @@ impl FakeDaemon {
             .map(|(_, b)| b.clone())
             .collect()
     }
+}
+
+/// The binary request fields the fake reads.
+pub const BINARY_FIELDS: &[&str] = &["as_of_n_blocks", "unified_ids"];
+
+fn binary_body(raw: &[u8]) -> serde_json::Value {
+    use monerod_rpc::epee::{Value, read_root};
+    let Ok(root) = read_root(raw, BINARY_FIELDS) else {
+        return serde_json::Value::Null;
+    };
+    root.entries()
+        .iter()
+        .filter_map(|(k, v)| match v {
+            Value::Unsigned(n) => Some((k.clone(), serde_json::json!(n))),
+            _ => None,
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 impl Drop for FakeDaemon {

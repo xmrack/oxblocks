@@ -83,15 +83,19 @@ IPAddressAllow=localhost
 # explorer-core), which is roughly 160 MiB held as hex and JSON. One range
 # may hold half of that at most, and a wider one is refused; a range that
 # would take more than is left waits up to 5 seconds for others to finish,
-# and is then answered as busy. With the caches' 224 MiB that fits the
-# 512 MiB here. Two things are outside that budget: the mempool, fetched
-# whole, and a rendered response waiting for a slow client to read it, since
-# both limits are given back when the response is handed over. Rate limiting
+# and is then answered as busy. With the caches' 244 MiB that fits the
+# 512 MiB here. Three things are outside that budget: the mempool, fetched
+# whole; the last /api/transactions/recent answer, kept written out until a
+# block arrives or the pool is fetched again; and a rendered response waiting
+# for a slow client to read it, since both limits are given back when the
+# response is handed over. Rate limiting
 # and buffering at the reverse proxy are the other half of this.
 #
 # --max-inflight-rpc is the separate ceiling on calls reaching monerod. Lower it
 # if the daemon is shared with a wallet or another consumer; it bounds load on
-# the node, not memory here.
+# the node, not memory here. Keep it under monerod's
+# --rpc-max-connections-per-private-ip (25), or -per-public-ip (3) for a
+# daemon reached over a public address, past which monerod drops connections.
 MemoryMax=512M
 TasksMax=128
 LimitNOFILE=4096

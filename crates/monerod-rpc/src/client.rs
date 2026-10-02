@@ -29,6 +29,15 @@ use crate::url::BaseUrl;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The waits before each retry of a request no answer came back for.
+///
+/// monerod closes connections over its per-address limit as it accepts them,
+/// `--rpc-max-connections-per-private-ip` (25 by default) and the public one
+/// (3), so a burst at the limit sees some refused that a moment later would
+/// be served. Every call this client makes is a read, so asking again is
+/// safe.
+const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(250)];
+
 /// How much of a failing response body is kept for the error message.
 ///
 /// This is remote input on its way into logs, so it is bounded. monerod's own
@@ -225,16 +234,20 @@ impl Client {
             .join(path)
             .map_err(|e| RpcError::BadUrl(format!("{}{path}", self.base.as_str()), e))?;
 
-        let mut request = Request::builder()
-            .method(Method::POST)
-            .uri(uri)
-            .header(CONTENT_TYPE, HeaderValue::from_static(media_type))
-            .header(ACCEPT, HeaderValue::from_static(media_type))
-            .body(Full::new(Bytes::from(payload)))
-            .map_err(|e| RpcError::BadUrl(path.to_owned(), e.to_string()))?;
-        if let Some(ua) = &self.user_agent {
-            request.headers_mut().insert(USER_AGENT, ua.clone());
-        }
+        let payload = Bytes::from(payload);
+        let request = || {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri(uri.clone())
+                .header(CONTENT_TYPE, HeaderValue::from_static(media_type))
+                .header(ACCEPT, HeaderValue::from_static(media_type))
+                .body(Full::new(payload.clone()))
+                .map_err(|e| RpcError::BadUrl(path.to_owned(), e.to_string()))?;
+            if let Some(ua) = &self.user_agent {
+                request.headers_mut().insert(USER_AGENT, ua.clone());
+            }
+            Ok::<_, RpcError>(request)
+        };
 
         // One deadline across the whole exchange -- connect, send, read the
         // head, read the body -- rather than one per stage, which would let a
@@ -247,19 +260,33 @@ impl Client {
             message: format!("{stage} within {:?}", self.timeout),
         };
 
-        let sent = tokio::time::timeout_at(deadline, self.http.request(request))
-            .await
-            .map_err(|_| expired("no response"))?;
-
-        let response = sent.map_err(|e| RpcError::Transport {
-            context,
-            kind: if e.is_connect() {
-                TransportKind::Connect
-            } else {
-                TransportKind::Other
-            },
-            message: e.to_string(),
-        })?;
+        let mut waits = RETRY_WAITS.iter();
+        let response = loop {
+            let sent = tokio::time::timeout_at(deadline, self.http.request(request()?))
+                .await
+                .map_err(|_| expired("no response"))?;
+            match sent {
+                Ok(response) => break response,
+                Err(e) => {
+                    if let Some(wait) = waits.next() {
+                        tracing::debug!("{context}: retrying after {e}");
+                        tokio::time::timeout_at(deadline, tokio::time::sleep(*wait))
+                            .await
+                            .map_err(|_| expired("no response"))?;
+                        continue;
+                    }
+                    return Err(RpcError::Transport {
+                        context,
+                        kind: if e.is_connect() {
+                            TransportKind::Connect
+                        } else {
+                            TransportKind::Other
+                        },
+                        message: e.to_string(),
+                    });
+                }
+            }
+        };
 
         let http_status = response.status();
         if !http_status.is_success() {
@@ -663,6 +690,76 @@ mod tests {
     /// matters is where the *request* ends up, and a redirect that was followed
     /// would show up here as a transport error against the unreachable port in
     /// the `Location` header instead of as the 302 itself.
+    /// A server that closes its first `dropped` connections as it accepts
+    /// them, as monerod does over its per-address limit, then answers every
+    /// later one with `{"ok":true}`. Returns its port and the connections it
+    /// accepted, and stops after five seconds.
+    fn refusing(dropped: usize) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                if seen.fetch_add(1, Ordering::SeqCst) < dropped {
+                    drop(socket);
+                    continue;
+                }
+                socket.set_nonblocking(false).unwrap();
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf);
+                let body = r#"{"ok":true}"#;
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (port, accepted)
+    }
+
+    /// A connection closed before any answer is asked again, twice, and then
+    /// the failure is the caller's.
+    #[tokio::test]
+    async fn a_request_dropped_unanswered_is_asked_again() {
+        use std::sync::atomic::Ordering;
+        #[derive(serde::Deserialize)]
+        struct Ok {
+            ok: bool,
+        }
+        let (port, accepted) = refusing(2);
+        let client = Client::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let answer: Ok = client
+            .endpoint("get_height", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(answer.ok);
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+
+        let (port, accepted) = refusing(3);
+        let client = Client::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let outcome = client
+            .endpoint::<_, Ok>("get_height", &serde_json::json!({}))
+            .await;
+        assert!(
+            matches!(outcome, Err(RpcError::Transport { .. })),
+            "{:?}",
+            outcome.err()
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 3, "three tries in all");
+    }
+
     #[tokio::test]
     async fn a_redirect_is_reported_rather_than_followed() {
         // Port 1 is not listening, so a followed redirect would fail loudly.

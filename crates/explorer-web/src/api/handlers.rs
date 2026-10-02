@@ -21,6 +21,54 @@ pub struct AppState {
     pub limits: Limits,
     /// Checked paths through the curve tree. See [`crate::tree_paths::PathCache`].
     pub paths: crate::tree_paths::PathCache,
+    /// The last `/api/transactions/recent` answer. See [`RecentAnswer`].
+    pub recent: RecentAnswer,
+    /// What the pages' tables show of each transaction.
+    pub rows: crate::html::RowCache,
+}
+
+/// The last `/api/transactions/recent` answer, written out, with the tip and
+/// the pool it was built from.
+///
+/// Every caller asks for the same window, so the answer is the same for all
+/// of them until a block arrives or the pool is fetched again: the tip's hash
+/// names the window and the chain below it, and the pool is the very
+/// snapshot, compared by identity and held so that its address cannot be
+/// reused. Built by one caller at a time.
+#[derive(Default)]
+pub struct RecentAnswer {
+    kept: std::sync::Mutex<Option<KeptRecent>>,
+    turn: tokio::sync::Mutex<()>,
+}
+
+struct KeptRecent {
+    tip: String,
+    pool: Arc<monerod_rpc::types::GetTransactionPool>,
+    body: axum::body::Bytes,
+}
+
+impl RecentAnswer {
+    fn get(
+        &self,
+        tip: &str,
+        pool: &Arc<monerod_rpc::types::GetTransactionPool>,
+    ) -> Option<axum::body::Bytes> {
+        let kept = self.kept.lock().ok()?;
+        kept.as_ref()
+            .filter(|k| k.tip == tip && Arc::ptr_eq(&k.pool, pool))
+            .map(|k| k.body.clone())
+    }
+
+    fn keep(
+        &self,
+        tip: String,
+        pool: Arc<monerod_rpc::types::GetTransactionPool>,
+        body: axum::body::Bytes,
+    ) {
+        if let Ok(mut kept) = self.kept.lock() {
+            *kept = Some(KeptRecent { tip, pool, body });
+        }
+    }
 }
 
 pub type Shared = State<Arc<AppState>>;
@@ -168,59 +216,59 @@ pub async fn transaction(
 
 #[derive(Serialize)]
 pub struct PathsData {
-    tx_hash: String,
     as_of_block: u64,
-    n_leaf_tuples: u64,
     n_layers: usize,
+    n_leaf_tuples: u64,
+    outputs: Vec<OutputPathData>,
+    root: Option<String>,
     /// The block carrying the root of the tree as of `as_of_block`, and that
     /// root, where the block carries one.
     root_block: Option<u64>,
-    root: Option<String>,
     /// `matches` when every path's hashes hold and end at `root`, `fails`
     /// when one does not, `unchecked` when there is no root or no path.
     root_check: &'static str,
-    outputs: Vec<OutputPathData>,
+    tx_hash: String,
 }
 
 #[derive(Serialize)]
 pub struct OutputPathData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check: Option<&'static str>,
+    /// The leaves' group first, the root last.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<GroupData>,
     index: usize,
-    unified_id: u64,
     /// The last block the output is locked at; the tree holds it as of that
     /// block on.
     last_locked_block: u64,
     /// Absent for an output not in the tree as of `as_of_block`.
     #[serde(skip_serializing_if = "Option::is_none")]
     leaf_idx: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    check: Option<&'static str>,
-    /// The leaves' group first, the root last.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    groups: Vec<GroupData>,
+    unified_id: u64,
 }
 
 #[derive(Serialize)]
 pub struct GroupData {
-    layer: usize,
     curve: explorer_core::curve_tree::Curve,
+    layer: usize,
     layer_size: u64,
-    start: u64,
-    /// The output's ancestor's place in the group, or the output's own for
-    /// the leaves.
-    offset: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    leaves: Vec<LeafData>,
     /// Compressed points; absent for the leaves, which are in `leaves`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     members: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    leaves: Vec<LeafData>,
+    /// The output's ancestor's place in the group, or the output's own for
+    /// the leaves.
+    offset: u64,
+    start: u64,
 }
 
 #[derive(Serialize)]
 pub struct LeafData {
-    unified_id: u64,
+    commitment: String,
     kind: &'static str,
     output_key: String,
-    commitment: String,
+    unified_id: u64,
 }
 
 /// Paths through the curve tree of a transaction's outputs, as of `block` or
@@ -1062,6 +1110,19 @@ pub struct PrivateTxData {
     txs: Vec<TxDetail>,
 }
 
+/// What a private lookup of `matches` transactions holds of the range
+/// budget: [`PRIVATE_KIB_PER_MATCH`] each, and never more than the widest
+/// range of blocks.
+fn private_hold_kib(matches: usize) -> u64 {
+    (matches as u64)
+        .saturating_mul(PRIVATE_KIB_PER_MATCH)
+        .min(explorer_core::rpc_source::MAX_RANGE_KIB)
+}
+
+/// A fetched transaction's share of the range budget, in KiB: twice what an
+/// FCMP++ spend with two inputs takes, its hex and its decoded JSON.
+const PRIVATE_KIB_PER_MATCH: u64 = 64;
+
 pub async fn transaction_private(
     State(state): Shared,
     ApiPath(raw): ApiPath<String>,
@@ -1136,11 +1197,11 @@ pub async fn transaction_private(
         )));
     }
 
-    // The matches are fetched whole, and as many as the widest range of
-    // blocks could hold, so they wait for that share of the same budget.
+    // The matches are fetched whole, so they wait for their share of the
+    // budget ranges of blocks share.
     let _held = state
         .chain
-        .hold_kib(explorer_core::rpc_source::MAX_RANGE_KIB)
+        .hold_kib(private_hold_kib(matching.len()))
         .await
         .map_err(|e| on_chain_error(&e, "Cant get matching transactions"))?;
     let fetched = state
@@ -1315,17 +1376,34 @@ pub struct RecentData {
 /// flood this is the most expensive endpoint here; see
 /// `deploy/oxblocks.service`, which sizes `MemoryMax` against
 /// `--max-concurrent` for exactly this family of requests.
-pub async fn transactions_recent(State(state): Shared) -> Result<ApiOk<RecentData>, ApiError> {
-    let info = state
-        .chain
-        .info()
-        .await
-        .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
+pub async fn transactions_recent(
+    State(state): Shared,
+) -> Result<axum::response::Response, ApiError> {
+    let tip_and_pool = async || {
+        let info = state
+            .chain
+            .info()
+            .await
+            .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
+        Ok::<_, ApiError>((info, state.chain.mempool().await.ok()))
+    };
+    let kept = |info: &monerod_rpc::types::GetInfo, pool: &Option<Arc<_>>| {
+        pool.as_ref()
+            .and_then(|p| state.recent.get(&info.top_block_hash, p))
+            .map(super::envelope::ok_response)
+    };
+
+    let (info, pool) = tip_and_pool().await?;
+    if let Some(answer) = kept(&info, &pool) {
+        return Ok(answer);
+    }
+    let _turn = state.recent.turn.lock().await;
+    let (info, pool) = tip_and_pool().await?;
+    if let Some(answer) = kept(&info, &pool) {
+        return Ok(answer);
+    }
 
     let (from_height, to_height) = recent_window(info.height, state.limits.recent_blocks);
-
-    // The window is fetched before the pool, so that no copy of the pool is
-    // held while the window waits for its share of what ranges may hold.
     let window = state
         .chain
         .blocks_in_range(from_height, to_height, false)
@@ -1336,7 +1414,6 @@ pub async fn transactions_recent(State(state): Shared) -> Result<ApiOk<RecentDat
     // transaction, and a caller reaching for this endpoint is reaching for a
     // recent one. Counting them in `mempool_txs_no` while leaving them out of
     // `txs` would name a set and then withhold it.
-    let pool = state.chain.mempool().await.ok();
     let mut txs = Vec::new();
     let mut mempool_txs_no = 0;
     for entry in pool.iter().flat_map(|p| p.transactions.iter()) {
@@ -1345,19 +1422,25 @@ pub async fn transactions_recent(State(state): Shared) -> Result<ApiOk<RecentDat
         txs.push(TxDetail::build_pool(entry, &tx, &inputs, info.height));
         mempool_txs_no += 1;
     }
-    drop(pool);
 
     for block in &window {
         push_unexpanded(&mut txs, &block.txs, info.height);
     }
 
-    Ok(ApiOk(RecentData {
+    let body = super::envelope::ok_body(&RecentData {
         current_height: info.height,
         from_height,
         mempool_txs_no,
         to_height,
         txs,
-    }))
+    })?;
+    // A pool that could not be had is answered as empty, and not kept.
+    if let Some(pool) = pool {
+        state
+            .recent
+            .keep(info.top_block_hash.clone(), pool, body.clone());
+    }
+    Ok(super::envelope::ok_response(body))
 }
 
 #[cfg(test)]
@@ -1632,11 +1715,188 @@ mod tests {
         })
     }
 
+    /// A daemon whose chain is block 0 alone, a coinbase, with the tip hash
+    /// `tip` holds, and an empty pool.
+    fn recent_daemon(
+        tip: Arc<std::sync::atomic::AtomicU64>,
+    ) -> explorer_core::fake_daemon::FakeDaemon {
+        let coinbase = "aa".repeat(32);
+        explorer_core::fake_daemon::FakeDaemon::start(move |what, _| {
+            let tip = tip.load(std::sync::atomic::Ordering::SeqCst);
+            let header = serde_json::json!({
+                "major_version": 16, "minor_version": 16, "timestamp": 0, "prev_hash": "",
+                "nonce": 0, "orphan_status": false, "height": 0, "depth": 0,
+                "hash": format!("{tip:064x}"), "difficulty": 1, "difficulty_top64": 0,
+                "wide_difficulty": "0x1", "cumulative_difficulty": 1,
+                "cumulative_difficulty_top64": 0, "wide_cumulative_difficulty": "0x1",
+                "reward": 1, "block_size": 1, "num_txes": 0, "pow_hash": "",
+                "miner_tx_hash": coinbase,
+            });
+            let ok = |r: serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": r});
+            match what {
+                "get_info" => ok(serde_json::json!({
+                    "height": 1, "target_height": 0, "difficulty": 1, "difficulty_top64": 0,
+                    "target": 120, "tx_count": 1, "tx_pool_size": 0, "alt_blocks_count": 0,
+                    "outgoing_connections_count": 0, "incoming_connections_count": 0,
+                    "white_peerlist_size": 0, "grey_peerlist_size": 0, "testnet": false,
+                    "stagenet": false, "nettype": "regtest", "top_block_hash": format!("{tip:064x}"),
+                    "cumulative_difficulty": 1, "cumulative_difficulty_top64": 0,
+                    "block_size_limit": 0, "block_size_median": 0, "start_time": 0,
+                    "version": "test", "restricted": false, "status": "OK",
+                })),
+                "get_block_headers_range" => {
+                    ok(serde_json::json!({"headers": [header], "status": "OK"}))
+                }
+                "get_transactions" => serde_json::json!({"txs": [{
+                    "tx_hash": coinbase, "as_hex": "",
+                    "as_json": r#"{"version":2,"unlock_time":60,"vin":[{"gen":{"height":0}}],"vout":[],"extra":[],"rct_signatures":{"type":0}}"#,
+                    "block_height": 0, "block_timestamp": 0, "confirmations": 1, "in_pool": false,
+                    "double_spend_seen": false, "output_indices": [],
+                }], "status": "OK"}),
+                "get_transaction_pool" => serde_json::json!({"transactions": [], "status": "OK"}),
+                _ => serde_json::json!({"status": "Failed"}),
+            }
+        })
+    }
+
+    async fn body_of(response: axum::response::Response) -> axum::body::Bytes {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    /// Every caller gets the one answer, built once while the tip and the
+    /// pool stay the same, and built again once the tip moves.
+    #[tokio::test]
+    async fn the_recent_answer_is_built_once_per_tip_and_pool() {
+        let tip = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let daemon = recent_daemon(Arc::clone(&tip));
+        let state = state_on(&daemon);
+        let together = tokio::join!(
+            transactions_recent(state.clone()),
+            transactions_recent(state.clone()),
+            transactions_recent(state.clone()),
+            transactions_recent(state.clone()),
+        );
+        assert!(
+            together.0.is_ok() && together.1.is_ok() && together.2.is_ok() && together.3.is_ok()
+        );
+        assert_eq!(
+            daemon.count("get_block_headers_range"),
+            1,
+            "built once for all four"
+        );
+        let first = body_of(transactions_recent(state.clone()).await.unwrap()).await;
+        assert!(String::from_utf8_lossy(&first).contains(&"aa".repeat(32)));
+        let calls = state.chain.rpc_calls();
+        for _ in 0..3 {
+            let again = body_of(transactions_recent(state.clone()).await.unwrap()).await;
+            assert_eq!(again, first);
+        }
+        assert_eq!(
+            state.chain.rpc_calls(),
+            calls,
+            "no daemon call for the same answer"
+        );
+
+        tip.store(2, std::sync::atomic::Ordering::SeqCst);
+        state.chain.fresh_info().await.unwrap();
+        let moved = body_of(transactions_recent(state.clone()).await.unwrap()).await;
+        assert!(
+            state.chain.rpc_calls() > calls + 1,
+            "built again under the new tip"
+        );
+        assert_eq!(
+            moved, first,
+            "the same chain under a new tip hash reads the same"
+        );
+    }
+
+    /// A pool is the very snapshot the answer was built from, not one that
+    /// reads the same, and the tip is its hash.
+    #[test]
+    fn a_kept_recent_answer_is_for_its_own_tip_and_pool() {
+        let pool = || {
+            Arc::new(
+                serde_json::from_value::<monerod_rpc::types::GetTransactionPool>(
+                    serde_json::json!({"status": "OK"}),
+                )
+                .unwrap(),
+            )
+        };
+        let (a, b) = (pool(), pool());
+        let recent = RecentAnswer::default();
+        recent.keep(
+            "t".to_owned(),
+            Arc::clone(&a),
+            axum::body::Bytes::from_static(b"x"),
+        );
+        assert!(recent.get("t", &a).is_some());
+        assert!(recent.get("t", &b).is_none());
+        assert!(recent.get("u", &a).is_none());
+    }
+
+    /// A private lookup holds the range budget in proportion to what it
+    /// fetches, so a few lookups at once cannot stall every range.
+    #[test]
+    fn a_private_lookup_holds_what_its_matches_take() {
+        assert_eq!(private_hold_kib(64), 64 * PRIVATE_KIB_PER_MATCH);
+        assert!(private_hold_kib(64) * 5 < explorer_core::rpc_source::MAX_RANGE_KIB);
+        assert_eq!(
+            private_hold_kib(MAX_PRIVATE_TX_MATCHES as usize),
+            explorer_core::rpc_source::MAX_RANGE_KIB
+        );
+    }
+
+    /// The paths answer is written straight from its structs, so they have to
+    /// be in byte order, as `ok_body` checks.
+    #[test]
+    fn the_paths_answer_is_in_byte_order() {
+        let leaf = LeafData {
+            commitment: "c".to_owned(),
+            kind: "carrot",
+            output_key: "k".to_owned(),
+            unified_id: 7,
+        };
+        let group = |leaves: Vec<LeafData>, members: Vec<String>| GroupData {
+            curve: explorer_core::curve_tree::Curve::Selene,
+            layer: 0,
+            layer_size: 38,
+            leaves,
+            members,
+            offset: 1,
+            start: 0,
+        };
+        let data = PathsData {
+            as_of_block: 10,
+            n_layers: 2,
+            n_leaf_tuples: 38,
+            outputs: vec![OutputPathData {
+                check: Some("holds"),
+                groups: vec![
+                    group(vec![leaf], Vec::new()),
+                    group(Vec::new(), vec!["m".to_owned()]),
+                ],
+                index: 0,
+                last_locked_block: 9,
+                leaf_idx: Some(1),
+                unified_id: 7,
+            }],
+            root: Some("r".to_owned()),
+            root_block: Some(2),
+            root_check: "matches",
+            tx_hash: "t".to_owned(),
+        };
+        assert!(super::super::envelope::ok_body(&data).is_ok());
+    }
+
     fn state_on(daemon: &explorer_core::fake_daemon::FakeDaemon) -> Shared {
         State(Arc::new(AppState {
             chain: daemon.source(),
             limits: Limits::default(),
             paths: crate::tree_paths::PathCache::default(),
+            recent: Default::default(),
+            rows: Default::default(),
         }))
     }
 

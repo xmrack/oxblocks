@@ -1036,13 +1036,12 @@ impl TreeSizeQuery {
         ]
     }
 
-    /// The tree size from the daemon's answer. `None` when the answer does
-    /// not carry one, and for 0: a tree that an FCMP++ proof was built against
-    /// holds at least the output being spent, so 0 is the daemon's answer to
-    /// a question other than the one asked.
+    /// The tree size from the daemon's answer, `None` when it carries none.
+    /// 0 is a real answer: the tree is empty as of the first blocks after
+    /// FCMP++ activates.
     #[must_use]
     pub fn answer(root: &crate::epee::Root) -> Option<u64> {
-        root.unsigned("n_leaf_tuples").filter(|n| *n > 0)
+        root.unsigned("n_leaf_tuples")
     }
 }
 
@@ -2943,7 +2942,7 @@ mod tests {
             TreeSizeQuery::answer(&crate::epee::read_root(&bytes, TreeSizeQuery::WANTED).unwrap())
         };
         assert_eq!(answer(9_876), Some(9_876));
-        assert_eq!(answer(0), None, "0 answers a different question");
+        assert_eq!(answer(0), Some(0), "an empty tree");
     }
 
     #[test]

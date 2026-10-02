@@ -33,6 +33,7 @@ fake-daemon = ["monerod-rpc/test-support"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+monerod-rpc = { path = "../monerod-rpc", version = "0.1.0", features = ["test-support"] }
 
 [lints]
 workspace = true

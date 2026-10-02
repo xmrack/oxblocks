@@ -115,6 +115,11 @@ pub struct Config {
     /// here degrades the node itself. Requests that cannot get a slot queue in
     /// front of the daemon rather than stampeding it, and the inbound request
     /// timeout eventually sheds them. At least 1.
+    ///
+    /// Keep it under monerod's own per-address connection limit, past which
+    /// it drops connections: `--rpc-max-connections-per-private-ip`, 25 by
+    /// default, or `--rpc-max-connections-per-public-ip`, 3 by default, for
+    /// a daemon reached over a public address.
     #[arg(
         long,
         env = "OXBLOCKS_MAX_INFLIGHT_RPC",

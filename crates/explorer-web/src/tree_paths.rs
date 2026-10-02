@@ -39,7 +39,14 @@ const PATHS_KEPT_BYTES: usize = 16 * 1024 * 1024;
 /// the chain records, and only as of a block no reorganisation reaches: a
 /// later view of it then needs neither a daemon call nor the hashing. A path
 /// that fails is not kept, so it is asked for again next time.
-pub struct PathCache(Cache<(u64, u64), Checked>);
+///
+/// A path as of a block the reorg window still reaches is kept as well, for
+/// as long as the tip it was checked under: the tip's hash fixes the chain,
+/// and with it the tree as of every block below.
+pub struct PathCache {
+    buried: Cache<(u64, u64), Checked>,
+    recent: Cache<(u64, u64, String), Checked>,
+}
 
 struct Checked {
     n_leaf_tuples: u64,
@@ -48,34 +55,64 @@ struct Checked {
 
 impl Default for PathCache {
     fn default() -> Self {
-        Self(Cache::permanent(PATHS_KEPT).within_bytes(PATHS_KEPT_BYTES, checked_bytes))
+        Self {
+            buried: Cache::permanent(PATHS_KEPT).within_bytes(PATHS_KEPT_BYTES, checked_bytes),
+            // The keys of a replaced tip are never asked for again.
+            recent: Cache::expiring(PATHS_KEPT / 4, std::time::Duration::from_secs(600))
+                .within_bytes(PATHS_KEPT_BYTES / 4, checked_bytes),
+        }
     }
 }
 
 impl PathCache {
     #[must_use]
     pub fn stats(&self) -> explorer_core::cache::Stats {
-        self.0.stats()
+        self.buried.stats()
     }
 
-    /// `output`'s path as of `as_of_block`, if one was kept and it climbs
-    /// from `output` as its transaction records it now.
-    fn get(&self, as_of_block: u64, output: &Output) -> Option<Arc<Checked>> {
-        self.0
-            .get(&(as_of_block, output.unified_id))
-            .filter(|c| c.placed.leaf().is_some_and(|l| output.is(l)))
+    #[must_use]
+    pub fn recent_stats(&self) -> explorer_core::cache::Stats {
+        self.recent.stats()
     }
 
-    /// Keep `placed`, as of `as_of_block`, if it leads to `root`.
-    fn keep(&self, as_of_block: u64, n_leaf_tuples: u64, placed: &PlacedPath, root: Option<&str>) {
+    /// `output`'s path as of `as_of_block`, if one was kept, under `tip` for a
+    /// block not yet buried, and it climbs from `output` as its transaction
+    /// records it now.
+    fn get(&self, as_of_block: u64, tip: Option<&str>, output: &Output) -> Option<Arc<Checked>> {
+        match tip {
+            None => self.buried.get(&(as_of_block, output.unified_id)),
+            Some(t) => self
+                .recent
+                .get(&(as_of_block, output.unified_id, t.to_owned())),
+        }
+        .filter(|c| c.placed.leaf().is_some_and(|l| output.is(l)))
+    }
+
+    /// Keep `placed`, as of `as_of_block`, under `tip` for a block not yet
+    /// buried, if it leads to `root`.
+    fn keep(
+        &self,
+        as_of_block: u64,
+        tip: Option<&str>,
+        n_leaf_tuples: u64,
+        placed: &PlacedPath,
+        root: Option<&str>,
+    ) {
         if root.is_some_and(|r| leads_to(placed, r)) {
-            self.0.insert(
-                (as_of_block, placed.unified_id),
-                Checked {
-                    n_leaf_tuples,
-                    placed: placed.clone(),
-                },
-            );
+            let checked = Checked {
+                n_leaf_tuples,
+                placed: placed.clone(),
+            };
+            match tip {
+                None => drop(
+                    self.buried
+                        .insert((as_of_block, placed.unified_id), checked),
+                ),
+                Some(t) => drop(
+                    self.recent
+                        .insert((as_of_block, placed.unified_id, t.to_owned()), checked),
+                ),
+            }
         }
     }
 }
@@ -336,11 +373,13 @@ pub async fn gather(
         }
     };
 
-    // As of a block past the reorg window, a path checked before is kept.
+    // A path checked before is kept: for good as of a block past the reorg
+    // window, and under the tip's hash as of one it still reaches.
     let buried = safe_to_cache_by_height(tip.saturating_sub(as_of_block));
+    let kept_under = (!buried).then_some(info.top_block_hash.as_str());
     let known: Vec<Option<Arc<Checked>>> = wanted
         .iter()
-        .map(|o| buried.then(|| state.paths.get(as_of_block, o)).flatten())
+        .map(|o| state.paths.get(as_of_block, kept_under, o))
         .collect();
     let missing: Vec<Output> = wanted
         .iter()
@@ -367,11 +406,11 @@ pub async fn gather(
         None => Vec::new(),
         Some(answer) => check(missing, answer.paths, n_leaf_tuples).await?,
     };
-    if buried {
-        let root = root_block.as_ref().map(|(_, r)| r.as_str());
-        for p in fresh.iter().flatten() {
-            state.paths.keep(as_of_block, n_leaf_tuples, p, root);
-        }
+    let root = root_block.as_ref().map(|(_, r)| r.as_str());
+    for p in fresh.iter().flatten() {
+        state
+            .paths
+            .keep(as_of_block, kept_under, n_leaf_tuples, p, root);
     }
     let mut fresh = fresh.into_iter();
     let placed = known.into_iter().map(|k| match k {
@@ -520,29 +559,37 @@ pub(crate) mod tests {
         let cache = PathCache::default();
         assert!(placed.iter().all(|p| p.check == PathCheck::Holds));
 
-        cache.keep(814, n, &placed[0], Some(root));
-        let kept = cache.get(814, &outputs[0]).unwrap();
+        cache.keep(814, None, n, &placed[0], Some(root));
+        let kept = cache.get(814, None, &outputs[0]).unwrap();
         assert_eq!((kept.n_leaf_tuples, &kept.placed), (n, &placed[0]));
         // Kept as of that block only.
-        assert!(cache.get(815, &outputs[0]).is_none());
+        assert!(cache.get(815, None, &outputs[0]).is_none());
         // And given only for the output it climbs from.
         let other_key = Output {
             key: outputs[1].key,
             ..outputs[0]
         };
-        assert!(cache.get(814, &other_key).is_none());
+        assert!(cache.get(814, None, &other_key).is_none());
 
         // Not without a root to compare with, nor with another root.
-        cache.keep(814, n, &placed[1], None);
-        cache.keep(814, n, &placed[2], Some(&"00".repeat(32)));
+        cache.keep(814, None, n, &placed[1], None);
+        cache.keep(814, None, n, &placed[2], Some(&"00".repeat(32)));
         // Nor when its hashes do not hold.
         let mut broken = placed[3].clone();
         broken.check = PathCheck::Broken { layer: 0 };
-        cache.keep(814, n, &broken, Some(root));
+        cache.keep(814, None, n, &broken, Some(root));
         for o in &outputs[1..] {
-            assert!(cache.get(814, o).is_none());
+            assert!(cache.get(814, None, o).is_none());
         }
         assert_eq!(cache.stats().len, 1);
+
+        // Kept under a tip, a path is given under that tip only, and apart
+        // from those kept for good.
+        cache.keep(814, Some("t"), n, &placed[1], Some(root));
+        assert!(cache.get(814, Some("t"), &outputs[1]).is_some());
+        assert!(cache.get(814, Some("u"), &outputs[1]).is_none());
+        assert!(cache.get(814, None, &outputs[1]).is_none());
+        assert!(cache.get(814, Some("t"), &outputs[0]).is_none());
     }
 
     /// The page and the API take the same outputs for the same query.
@@ -637,7 +684,7 @@ pub(crate) mod tests {
                     "alt_blocks_count": 0, "outgoing_connections_count": 0,
                     "incoming_connections_count": 0, "white_peerlist_size": 0,
                     "grey_peerlist_size": 0, "testnet": false, "stagenet": false,
-                    "nettype": "regtest", "top_block_hash": "", "cumulative_difficulty": 1,
+                    "nettype": "regtest", "top_block_hash": format!("{height:064x}"), "cumulative_difficulty": 1,
                     "cumulative_difficulty_top64": 0, "block_size_limit": 0,
                     "block_size_median": 0, "start_time": 0, "version": "test",
                     "restricted": false, "status": "OK",
@@ -662,6 +709,8 @@ pub(crate) mod tests {
             chain: daemon.source(),
             limits: crate::config::Limits::default(),
             paths: PathCache::default(),
+            recent: Default::default(),
+            rows: Default::default(),
         }
     }
 
@@ -673,14 +722,39 @@ pub(crate) mod tests {
         paths.outputs.iter().map(|o| paths.standing(o)).collect()
     }
 
-    /// As of the tip, every path is fetched and checked, and none is kept:
-    /// the reorg window still reaches the tree as of that block.
+    /// As of the tip, every path is fetched and checked, and kept for as long
+    /// as that tip is: once a block arrives, the reorg window still reaches
+    /// the tree as of it, so it is fetched and checked again.
     #[tokio::test]
-    async fn the_paths_as_of_the_tip_are_checked_and_not_kept() {
+    async fn the_paths_as_of_the_tip_are_kept_while_the_tip_stays() {
+        let (entry, tx) = captured_tx();
+        let tip = tip_at(814);
+        let d = daemon(Arc::clone(&tip), 0..4);
+        let state = state_on(&d);
+        for _ in 0..3 {
+            assert!(gather(&state, &entry, &tx, Some(814), 0..4).await.is_ok());
+        }
+        assert_eq!(d.count(PathQuery::ENDPOINT), 1);
+        assert_eq!(state.paths.recent_stats().len, 4);
+        assert_eq!(state.paths.stats().len, 0, "not kept for good");
+
+        tip.store(815, std::sync::atomic::Ordering::SeqCst);
+        state.chain.fresh_info().await.unwrap();
+        assert!(gather(&state, &entry, &tx, Some(814), 0..4).await.is_ok());
+        assert_eq!(
+            d.count(PathQuery::ENDPOINT),
+            2,
+            "asked again under the new tip"
+        );
+    }
+
+    /// Every view as of the tip is checked; only the first under a tip asks.
+    #[tokio::test]
+    async fn the_paths_as_of_the_tip_are_checked() {
         let (entry, tx) = captured_tx();
         let d = daemon(tip_at(814), 0..4);
         let state = state_on(&d);
-        for asked in 1..=2 {
+        for _ in 1..=2 {
             let Ok(paths) = gather(&state, &entry, &tx, None, 0..4).await else {
                 panic!("paths")
             };
@@ -699,7 +773,7 @@ pub(crate) mod tests {
             assert_eq!(standings(&paths), [Standing::Reaches; 4]);
             assert_eq!(paths.root_check(), RootCheck::Matches);
             assert_eq!(state.paths.stats().len, 0);
-            assert_eq!(d.count(PathQuery::ENDPOINT), asked);
+            assert_eq!(d.count(PathQuery::ENDPOINT), 1);
         }
     }
 

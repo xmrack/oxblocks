@@ -15,6 +15,7 @@
 //!
 //! The error form carries `"data": null`, not `{}`.
 
+use axum::body::Bytes;
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
@@ -152,19 +153,49 @@ fn render(status: StatusCode, value: &serde_json::Value) -> Response {
     (status, api_headers(), body).into_response()
 }
 
+/// The success envelope around `data`, written out.
+///
+/// Straight from `data`, not through a `serde_json::Value`, which would hold
+/// the whole answer again as a tree only to sort its keys. The bytes are the
+/// same because every struct an answer is built from declares its fields in
+/// byte order (see `shapes`), and a `Value` inside one, as the raw endpoints
+/// carry, writes its keys sorted. Debug builds check that on every answer.
+pub fn ok_body<T: Serialize>(data: &T) -> Result<Bytes, ApiError> {
+    #[derive(Serialize)]
+    struct Envelope<'a, T> {
+        data: &'a T,
+        status: &'static str,
+    }
+    let body = serde_json::to_vec(&Envelope {
+        data,
+        status: "success",
+    })
+    .map_err(|e| ApiError::internal(format!("could not render: {e}")))?;
+    #[cfg(debug_assertions)]
+    {
+        let sorted = serde_json::from_slice::<serde_json::Value>(&body)
+            .and_then(|v| serde_json::to_vec(&v))
+            .map_err(|e| ApiError::internal(format!("could not reread: {e}")))?;
+        debug_assert!(
+            sorted == body,
+            "an answer's keys are not in byte order:\n{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    Ok(Bytes::from(body))
+}
+
+/// A success answer whose body is already written.
+pub fn ok_response(body: Bytes) -> Response {
+    (StatusCode::OK, api_headers(), body).into_response()
+}
+
 impl<T: Serialize> IntoResponse for ApiOk<T> {
     fn into_response(self) -> Response {
-        let data = match serde_json::to_value(&self.0) {
-            Ok(v) => v,
-            Err(e) => return ApiError::internal(format!("could not render: {e}")).into_response(),
-        };
-        let mut out = serde_json::Map::new();
-        out.insert("data".to_owned(), data);
-        out.insert(
-            "status".to_owned(),
-            serde_json::Value::String("success".to_owned()),
-        );
-        render(StatusCode::OK, &serde_json::Value::Object(out))
+        match ok_body(&self.0) {
+            Ok(body) => ok_response(body),
+            Err(e) => e.into_response(),
+        }
     }
 }
 
@@ -371,5 +402,38 @@ mod tests {
             assert!(at >= last, "{k} is out of alphabetical order");
             last = at;
         }
+    }
+
+    /// The check behind writing answers straight from their structs: a
+    /// struct out of byte order is caught rather than sent in another order
+    /// than the sorted answer it replaces.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "not in byte order")]
+    fn an_answer_out_of_byte_order_is_caught() {
+        #[derive(Serialize)]
+        struct Backwards {
+            b: u8,
+            a: u8,
+        }
+        let _ = ok_body(&Backwards { b: 1, a: 2 });
+    }
+
+    #[test]
+    fn a_sorted_answer_is_written_as_the_sorted_envelope() {
+        #[derive(Serialize)]
+        struct Sorted {
+            a: u8,
+            b: serde_json::Value,
+        }
+        let body = ok_body(&Sorted {
+            a: 1,
+            b: serde_json::json!({"z": 1, "y": [2]}),
+        })
+        .unwrap();
+        assert_eq!(
+            &body[..],
+            br#"{"data":{"a":1,"b":{"y":[2],"z":1}},"status":"success"}"#
+        );
     }
 }

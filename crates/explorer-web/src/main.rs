@@ -210,7 +210,11 @@ async fn health(
         .chain
         .cache_stats()
         .into_iter()
-        .chain([("tree_paths", state.paths.stats())])
+        .chain([
+            ("tree_paths", state.paths.stats()),
+            ("recent_tree_paths", state.paths.recent_stats()),
+            ("table_rows", state.rows.stats()),
+        ])
         .map(|(name, s)| {
             (
                 name.to_owned(),
@@ -300,6 +304,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_max_inflight_rpc(config.max_inflight_rpc),
         limits,
         paths: tree_paths::PathCache::default(),
+        recent: Default::default(),
+        rows: Default::default(),
     });
     match state.chain.info().await {
         Ok(info) => {
@@ -365,6 +371,8 @@ mod tests {
             ),
             limits,
             paths: crate::tree_paths::PathCache::default(),
+            recent: Default::default(),
+            rows: Default::default(),
         })
     }
 
@@ -394,6 +402,8 @@ mod tests {
             chain: explorer_core::RpcChainSource::new(monerod_rpc::Client::new(&url).unwrap()),
             limits: crate::config::Limits::default(),
             paths: crate::tree_paths::PathCache::default(),
+            recent: Default::default(),
+            rows: Default::default(),
         });
         let config = Config::parse_from([
             "oxblocks",

@@ -309,6 +309,49 @@ impl<K: Eq + Hash + Clone, V> Cache<K, V> {
     }
 }
 
+/// One fetch at a time per key, so that callers missing a cache together wait
+/// for the first one's answer rather than each asking the daemon.
+///
+/// A caller takes the key's turn with [`Flights::enter`], looks in the cache
+/// again once it has it, and fetches only if the answer is still missing. A
+/// key's lock lives only while someone holds or waits for it.
+pub struct Flights<K> {
+    locks: Mutex<HashMap<K, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl<K> Default for Flights<K> {
+    fn default() -> Self {
+        Self {
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: Hash + Eq + Clone> Flights<K> {
+    /// Wait for `key`'s turn. Several keys taken at once must be taken in one
+    /// order everywhere, or two callers can each hold what the other waits
+    /// for.
+    pub async fn enter(&self, key: &K) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = match self.locks.lock() {
+            Ok(mut locks) => {
+                locks.retain(|_, l| l.strong_count() > 0);
+                match locks.get(key).and_then(std::sync::Weak::upgrade) {
+                    Some(lock) => lock,
+                    None => {
+                        let lock = Arc::new(tokio::sync::Mutex::new(()));
+                        locks.insert(key.clone(), Arc::downgrade(&lock));
+                        lock
+                    }
+                }
+            }
+            // As for the cache: a poisoned map costs the coalescing, not the
+            // answer.
+            Err(_) => Arc::new(tokio::sync::Mutex::new(())),
+        };
+        lock.lock_owned().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -511,5 +554,32 @@ mod tests {
             h.join().expect("no thread panicked");
         }
         assert!(c.stats().len <= 64);
+    }
+
+    /// Callers of one key take turns; callers of another do not wait.
+    #[tokio::test]
+    async fn flights_of_one_key_take_turns() {
+        let flights: Arc<Flights<u8>> = Arc::default();
+        let first = flights.enter(&1).await;
+        let waiting = {
+            let flights = Arc::clone(&flights);
+            tokio::spawn(async move { drop(flights.enter(&1).await) })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished(), "the second caller of key 1 waits");
+        drop(flights.enter(&2).await);
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            flights
+                .locks
+                .lock()
+                .unwrap()
+                .values()
+                .all(|l| l.strong_count() == 0)
+        );
     }
 }
