@@ -4580,10 +4580,11 @@ mod tests {
             assert_eq!(page.range_proofs, 1);
 
             let html = page.render().expect("renders");
+            // The figures that come from the chain stand out from the prose.
             assert!(html.contains(
-                "As of block 120, the one this proof was built against, the tree held 62 outputs."
+                "As of block <strong>120</strong>, the one this proof was built against, the tree held <strong>62</strong> outputs."
             ));
-            assert!(html.contains("Block 112 already carries that tree's root:"));
+            assert!(html.contains("Block <strong>112</strong> already carries that tree's root:"));
             // Step 7 counts the inputs: each spent its own output.
             assert!(n > 1, "the captured transactions spend two outputs each");
             assert!(html.contains(&format!(

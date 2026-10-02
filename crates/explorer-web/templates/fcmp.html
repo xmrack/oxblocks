@@ -276,8 +276,8 @@ nothing about it.</p>
 <p class="sub">Every spendable output sits in one tree.</p>
 <p>Every output on the chain joins a single tree once it can be spent, and the
 whole tree is summed up by one short value at the top, its root.
-{% if let Some(n) = anonymity_set %}{% if let Some(r) = reference_block %}As of block {{ r }}, the one this proof was built against, the tree held {{ n }} outputs.{% endif %}{% else if in_pool %}The tree's size is known once this transaction is mined.{% endif %}
-{% if let Some((b, _)) = root_block %}Block {{ b }} already carries that tree's root: each block carries the root of the tree as it will stand eight blocks on, since every output spendable by then is already on the chain.{% endif %}</p>
+{% if let Some(n) = anonymity_set %}{% if let Some(r) = reference_block %}As of block <strong>{{ r }}</strong>, the one this proof was built against, the tree held <strong>{{ n }}</strong> outputs.{% endif %}{% else if in_pool %}The tree's size is known once this transaction is mined.{% endif %}
+{% if let Some((b, _)) = root_block %}Block <strong>{{ b }}</strong> already carries that tree's root: each block carries the root of the tree as it will stand eight blocks on, since every output spendable by then is already on the chain.{% endif %}</p>
 <div class="facts"><div class="facts-h">In this transaction</div><dl>
 {% if let Some(n) = anonymity_set %}<dt>Outputs in the tree</dt><dd>{{ n }}</dd>{% endif %}
 {% if let Some(n) = n_tree_layers %}<dt>Tree layers</dt><dd>{{ n }}</dd>{% endif %}
