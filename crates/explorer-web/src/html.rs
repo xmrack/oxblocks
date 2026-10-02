@@ -4843,19 +4843,49 @@ mod tests {
     }
 
     /// Every column note is for a column the table shows, and the notes are
-    /// one group, so that opening one closes the rest.
+    /// one group, so that opening one closes the rest. A chip holds only its
+    /// label: its text is a panel in the page's flow, shown by a rule of its
+    /// own, so that it moves the table down rather than covering it.
     #[test]
     fn every_column_note_is_for_a_column_shown() {
-        for page in [tx_page(), fcmp_tx_page()] {
+        let mut with_ids = fcmp_tx_page();
+        with_ids.has_unified_ids = true;
+        for page in [tx_page(), fcmp_tx_page(), with_ids] {
             let html = page.render().expect("renders");
-            let notes: Vec<&str> = html
-                .split(r#"<details class="note-chip" name="output-notes"><summary>"#)
+            // The rules that open a panel look for the chip within `.notes`.
+            let notes = html
+                .split_once(r#"<div class="notes">"#)
+                .and_then(|(_, rest)| rest.split_once("<table>"))
+                .map(|(notes, _)| notes)
+                .expect("the notes sit together before the table");
+            assert_eq!(
+                notes.matches(r#"class="note-panel""#).count(),
+                html.matches(r#"class="note-panel""#).count()
+            );
+            let chips: Vec<(&str, &str)> = notes
+                .split(r#"<details class="note-chip" name="output-notes" id="note-"#)
                 .skip(1)
-                .filter_map(|r| r.split(" <svg").next())
+                .filter_map(|r| r.split_once(r#""><summary>"#))
                 .collect();
-            assert!(notes.len() >= 2, "{html}");
-            assert_eq!(notes.len(), html.matches(r#"class="note-chip""#).count());
-            for n in notes {
+            assert!(chips.len() >= 2, "{html}");
+            assert_eq!(chips.len(), html.matches(r#"class="note-chip""#).count());
+            assert_eq!(chips.len(), html.matches(r#"class="note-panel""#).count());
+            let mut labels = Vec::new();
+            for (key, rest) in chips {
+                let (label, chip) = rest.split_once(" <svg").expect("an icon");
+                assert!(
+                    chip.split_once("</summary>")
+                        .is_some_and(|(_, after)| after.starts_with("</details>")),
+                    "{label}'s text is inside its chip"
+                );
+                assert!(html.contains(&format!(r#"<div class="note-panel" id="panel-{key}">"#)));
+                assert!(
+                    STYLESHEET.contains(&format!(".notes:has(#note-{key}[open]) #panel-{key}")),
+                    "nothing opens {label}'s panel"
+                );
+                labels.push(label);
+            }
+            for n in labels {
                 assert!(
                     html.contains(&format!("<th>{n}</th>"))
                         || html.contains(&format!(r#"<th class="num">{n}</th>"#)),
@@ -4873,7 +4903,7 @@ mod tests {
         assert!(html.contains("<th>Janus anchor</th>"));
         assert!(
             html.contains(
-                r#"<details class="note-chip" name="output-notes"><summary>Janus anchor "#
+                r#"<details class="note-chip" name="output-notes" id="note-anchor"><summary>Janus anchor "#
             )
         );
         assert_eq!(html.matches(&"7".repeat(32)).count(), 2);
@@ -5106,10 +5136,9 @@ mod tests {
             html.contains("A Bulletproofs+\n    range proof shows that the amount is not negative"),
             "the amount's note says what hides it"
         );
-        // Its heading links to its card.
-        assert!(
-            html.contains(r#"<details class="note-chip" name="output-notes"><summary>Amount "#)
-        );
+        assert!(html.contains(
+            r#"<details class="note-chip" name="output-notes" id="note-amount"><summary>Amount "#
+        ));
         let mut clear = tx_page();
         for o in &mut clear.outputs {
             o.amount.get_or_insert_with(|| "1.0".to_owned());

@@ -223,23 +223,31 @@
 
 <h2>{{ outputs.len() }} Output{% if outputs.len() != 1 %}s{% endif %}</h2>
 {% if has_unified_ids %}<p class="walk-row"><a class="walk" href="/tx/{{ hash }}/paths">Where {% if outputs.len() == 1 %}this output sits{% else %}these outputs sit{% endif %} in the curve tree &rarr;</a></p>{% endif %}
+<div class="notes">
 <div class="note-chips">
-  <details class="note-chip" name="output-notes"><summary>Stealth address <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+  <details class="note-chip" name="output-notes" id="note-stealth"><summary>Stealth address <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary></details>
+  {% if self.hidden_amounts() %}<details class="note-chip" name="output-notes" id="note-amount"><summary>Amount <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary></details>{% endif %}
+  {% if has_view_tags %}<details class="note-chip" name="output-notes" id="note-tag"><summary>View tag <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary></details>{% endif %}
+  {% if carrot %}<details class="note-chip" name="output-notes" id="note-anchor"><summary>Janus anchor <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary></details>{% endif %}
+  {% if has_unified_ids %}<details class="note-chip" name="output-notes" id="note-uid"><summary>Unified ID <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary></details>{% endif %}
+</div>
+  <div class="note-panel" id="panel-stealth">
     <p>Every output is paid to a fresh address used only once. The sender
     derives it from the recipient's address and a random secret, so the
     recipient's real address never reaches the chain.
     Two payments to the same person share nothing an observer can link. The
     recipient finds the outputs that are theirs by scanning the chain with
     their view key.</p>
-  </details>
-  {% if self.hidden_amounts() %}<details class="note-chip" name="output-notes"><summary>Amount <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+  </div>
+  {% if self.hidden_amounts() %}<div class="note-panel" id="panel-amount">
     <p>Hidden in a Pedersen commitment, which only the sender and the
     recipient can open. {% if rct_type >= 6 %}A Bulletproofs+{% else if rct_type >= 3 %}A Bulletproof{% else %}A Borromean{% endif %}
     range proof shows that the amount is not negative, without revealing it,
     so no one can create coins by sending less than nothing. The network
     still checks that the inputs and outputs balance.</p>
-  </details>{% endif %}
-  {% if has_view_tags %}<details class="note-chip" name="output-notes"><summary>View tag <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>    {% if carrot %}
+  </div>{% endif %}
+  {% if has_view_tags %}<div class="note-panel" id="panel-tag">
+    {% if carrot %}
     <p>Three bytes that make scanning cheaper. A wallet has to test every output
     on the chain to find the ones it can spend, and that test is expensive.
     The view tag is a cheap first check, drawn from the same shared secret as
@@ -255,22 +263,22 @@
     expensive check runs. It arrived in August 2022. It reveals nothing
     beyond which of the 256 buckets an output falls in.</p>
     {% endif %}
-  </details>{% endif %}
-  {% if carrot %}<details class="note-chip" name="output-notes"><summary>Janus anchor <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+  </div>{% endif %}
+  {% if carrot %}<div class="note-panel" id="panel-anchor">
     <p>Sixteen bytes, encrypted to the recipient. When they decrypt it, the
     anchor lets their wallet check that the output was built for the address
     it arrived at. Without that check a sender who knows two of someone's
     addresses could build an output against one and send it to the other,
     then wait to see whether the payment is acknowledged, and learn that the
     two addresses belong to the same person. Carrot added it. To anyone else it is random.</p>
-  </details>{% endif %}
-  {% if has_unified_ids %}<details class="note-chip" name="output-notes"><summary>Unified ID <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+  </div>{% endif %}
+  {% if has_unified_ids %}<div class="note-panel" id="panel-uid">
     <p>The output's place in the single sequence of all outputs on the
     chain, whatever their amount, that the FCMP++ tree is built from. A node
     finds the output's path through the tree by it, and the path is what a
     wallet needs to spend the output. It is public: anyone can read it here,
     and follow it to the path.</p>
-  </details>{% endif %}
+  </div>{% endif %}
 </div>
 <div class="scroll">
 <table>

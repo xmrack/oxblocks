@@ -127,9 +127,9 @@ th {
 }
 tbody tr:hover { background: var(--bg-sunken); }
 /* Notes on a table's columns: a row of chips above it, one note open at a
-   time (the chips share a `name`), shown under the row over the table. A
-   panel opening in the `<th>` itself would widen its column. */
-.note-chips { position: relative; display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0 0 0.9rem; }
+   time (the chips share a `name`). A panel opening in the `<th>` itself
+   would widen its column. */
+.note-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0 0 0.9rem; }
 .note-chip > summary {
   list-style: none;
   cursor: pointer;
@@ -150,23 +150,26 @@ tbody tr:hover { background: var(--bg-sunken); }
 .note-chip > summary:hover { border-color: var(--accent); color: var(--fg); }
 .note-chip[open] > summary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 .note-chip[open] > summary .icon { color: var(--accent-fg); }
-.note-chip > p {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: calc(100% + 0.45rem);
-  z-index: 5;
-  margin: 0;
+/* A chip's text is a panel under the row, in the page's flow, so opening it
+   moves the table down instead of covering it. */
+.note-panel {
+  display: none;
+  margin: 0 0 0.9rem;
   padding: 0.8rem 1rem;
   background: var(--bg-raised);
   border: 1px solid var(--line);
   border-left: 3px solid var(--accent);
   border-radius: var(--radius);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
   font-size: 0.86rem;
   color: var(--fg-muted);
   line-height: 1.5;
 }
+.note-panel p { margin: 0; }
+.notes:has(#note-stealth[open]) #panel-stealth,
+.notes:has(#note-amount[open]) #panel-amount,
+.notes:has(#note-tag[open]) #panel-tag,
+.notes:has(#note-anchor[open]) #panel-anchor,
+.notes:has(#note-uid[open]) #panel-uid { display: block; }
 
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
