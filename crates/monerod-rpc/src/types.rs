@@ -560,6 +560,20 @@ pub struct GetTxidsLooseResponse {
 // /get_height
 // ---------------------------------------------------------------------------
 
+/// `hard_fork_info` request: the version to report on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct HardForkInfoRequest {
+    pub version: u8,
+}
+
+/// `hard_fork_info`. Only the field this explorer reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardForkInfo {
+    /// The height the version asked about begins at, by the network's fork
+    /// table, whether or not the chain has reached it.
+    pub earliest_height: u64,
+}
+
 /// `/get_height`. No `credits`/`top_hash`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GetHeight {

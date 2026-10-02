@@ -80,6 +80,8 @@ pub struct RpcChainSource {
     /// by the tip they were read under. A reorg changes the tip, so none
     /// outlives the chain it was read from.
     recent_tree_sizes: Cache<(u64, String), u64>,
+    /// [`RpcChainSource::v2_height`]'s answer, which the network fixes.
+    v2_height: Cache<(), u64>,
     /// [`RpcChainSource::tip_probe`]'s answers, keyed by the tip.
     tip_probes: Cache<String, u64>,
     /// Confirmed transactions too recent for `txs`, keyed by hash and by the
@@ -367,6 +369,7 @@ impl RpcChainSource {
             // expire rather than wait to be pushed out.
             recent_tree_sizes: Cache::expiring(1024, Duration::from_secs(600)),
             tip_probes: Cache::expiring(4, Duration::from_secs(600)),
+            v2_height: Cache::permanent(1),
             block_txs: Cache::permanent(512).within_bytes(48 << 20, block_txs_bytes),
             recent_txs: Cache::expiring(2048, Duration::from_secs(600))
                 .within_bytes(16 << 20, tx_bytes),
@@ -607,6 +610,21 @@ impl RpcChainSource {
         }
         let fresh: GetInfo = self.rpc("get_info", None::<()>).await?;
         Ok(self.info.insert((), fresh))
+    }
+
+    /// The height hard fork 2 began at. Blocks were a minute apart before it
+    /// and two after. `None` where the daemon would not say.
+    pub async fn v2_height(&self) -> Option<u64> {
+        use monerod_rpc::types::{HardForkInfo, HardForkInfoRequest};
+
+        if let Some(hit) = self.v2_height.get(&()) {
+            return Some(*hit);
+        }
+        let info: HardForkInfo = self
+            .rpc("hard_fork_info", Some(HardForkInfoRequest { version: 2 }))
+            .await
+            .ok()?;
+        Some(*self.v2_height.insert((), info.earliest_height))
     }
 
     /// The chain's info, asked of the daemon now rather than read from the

@@ -79,9 +79,10 @@
     which is which. That set is the anonymity set for the input.
     Consensus has fixed the size for everyone since October 2018, because a
     transaction that chose its own would stand out. It was 11, and has been
-    16 since August 2022. Before that the sender chose it, above a minimum
-    that rose over time, and until November 2019 one input's ring could be
-    larger than another's. The earliest
+    16 since August 2022, except when spending an old public amount too rare
+    to find decoys for. Before that the sender chose it, above a minimum
+    that rose over time, and before RingCT one input's ring could be larger
+    than another's. The earliest
     transactions often used a ring of one, which has no decoys and shows the
     output spent. A coinbase creates coins instead of spending them, so it
     has no ring.</p></details>
@@ -129,7 +130,7 @@
 {% if coinbase %}
 <p class="empty">A coinbase transaction has no inputs because it creates new coins rather than spending existing ones.</p>
 {% else %}
-  {% if fcmp_pp %}<p class="walk-row"><a class="walk" href="/tx/{{ hash }}/fcmp">How this spend stays private &rarr;</a></p>{% endif %}
+  <p class="walk-row"><a class="walk" href="/tx/{{ hash }}/{% if fcmp_pp %}fcmp{% else %}ring{% endif %}">How this spend stays private &rarr;</a></p>
   {% if let Some(picture) = tree %}
   <figure class="curve-tree">
     <figcaption>Curve tree

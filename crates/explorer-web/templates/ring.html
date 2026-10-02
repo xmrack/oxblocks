@@ -1,0 +1,413 @@
+{% extends "base.html" %}
+{% block title %}{{ scheme }} of {{ hash }} &mdash; oxblocks{% endblock %}
+{% import "walk.html" as walk %}
+{% block content %}
+<p class="crumb"><a href="/tx/{{ hash }}">Transaction</a> <span class="hash">{{ hash }}</span></p>
+<h1>How this spend stays private</h1>
+<p class="lede">{% if decoys %}This transaction spends {{ inputs.len() }} output{% if inputs.len() != 1 %}s{% endif %} without saying which.
+Each input hides the output it spends among a ring of others, and {{ signed_by }} shows that one of them is being spent.{% else %}Every ring in this transaction holds a single output, so it does not hide which output{% if inputs.len() != 1 %}s{% endif %} it spends.{% endif %}
+{{ era }} {% if decoys %}Here is what each part does.{% else %}Here is what it still proves.{% endif %}</p>
+{% if !held %}
+<p class="empty tight">This node no longer holds this transaction's {% if cn %}signatures{% else %}signatures and range proofs{% endif %}, so their bytes are not shown here. What each part does is the same.</p>
+{% endif %}
+
+{# Step 1 comes last: with no anchor in the URL it is the one shown, and a
+   later step that is targeted hides it with `~`, which needs it after them. #}
+<div class="walkthrough">
+
+{% if commit > 0 %}
+<section class="step" id="s{{ commit }}">
+{% call walk::open(steps, commit) %}{% endcall %}
+<p class="sub">Each input restates its amount under a new mask.</p>
+<p>An output's amount is locked in its commitment, a point that hides the
+amount behind a secret mask. Each input publishes a fresh commitment to the
+amount it spends, its pseudo-output, under a new mask. For the output really
+spent, its commitment less the pseudo-output hides no amount at all, only the
+difference of the two masks, which the sender knows. The next step's signature
+proves that of one member of the ring{% if decoys %} without saying which, so the
+pseudo-output carries the real amount without pointing at the output it came
+from{% endif %}.</p>
+{% call walk::bar(map, map_labels, commit) %}{% endcall %}
+<div class="facts"><div class="facts-h">In this transaction</div><dl>
+{% for i in inputs %}{% if let Some(p) = i.pseudo_out %}<dt>Input {{ loop.index }} &middot; C&#x303;</dt><dd><span class="hash">{{ p }}</span> <span class="tag">pseudo-output</span></dd>{% endif %}
+{% endfor %}<dt>Size</dt><dd>32 bytes per input</dd>
+</dl></div>
+<details class="maths"><summary>Show me the math</summary>
+<p class="eq"><var>C</var> = <var>k</var>&middot;<var>G</var> + <var>a</var>&middot;<var>H</var><br>
+<var>C&#x303;</var> = <var>k&#x303;</var>&middot;<var>G</var> + <var>a</var>&middot;<var>H</var><br>
+<var>C</var> &minus; <var>C&#x303;</var> = (<var>k</var> &minus; <var>k&#x303;</var>)&middot;<var>G</var></p>
+<p><var>a</var> is the amount, <var>k</var> the output's mask and
+<var>k&#x303;</var> a fresh one. <var>H</var> is a second generator with no
+known relation to <var>G</var>, so no one can open a commitment to two
+amounts. The output's owner can work out <var>k</var>, so it knows
+<var>z</var> = <var>k</var> &minus; <var>k&#x303;</var>, and proving that
+<var>C<sub>i</sub></var> &minus; <var>C&#x303;</var> = <var>z</var>&middot;<var>G</var>
+for some member <var>i</var> proves that the pseudo-output holds that member's
+amount. The sender picks the last input's mask so that the pseudo-outputs'
+masks add up to the outputs', which step {{ balance }}'s balance needs.</p>
+</details>
+</div>
+<svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><circle class="solid" cx="45" cy="60" r="22"/><text class="on-solid" x="45" y="65" text-anchor="middle">C</text><path class="line" d="M75 60H120"/><path class="head" d="M120 54l10 6-10 6z"/><text class="small" x="102" y="48" text-anchor="middle">new mask</text><circle class="ghost" cx="160" cy="60" r="22"/><text class="on-ghost" x="160" y="65" text-anchor="middle">C&#x303;</text></svg>
+</div>
+{% call walk::close(steps, commit) %}{% endcall %}
+</section>
+{% endif %}
+
+<section class="step" id="s{{ sign }}">
+{% call walk::open(steps, sign) %}{% endcall %}
+{% if cn %}
+<p class="sub">One ring signature for each input.</p>
+<p>Each input carries a ring signature over its whole ring. It shows that
+whoever built the input knows the secret key of one of the ring's outputs{% if decoys %},
+without saying which{% endif %}. It also carries a key image, made from that secret key
+and that output alone, so spending one output twice shows up as the same key
+image twice, which the chain refuses. The signature signs the transaction's
+prefix, so it cannot be moved onto another one.</p>
+{% else if full %}
+<p class="sub">One signature covers every input, and the amounts.</p>
+<p>A single MLSAG signs the whole transaction. Its rows are each input's ring
+and, last, the inputs' commitments less the outputs' and the fee. It shows
+that in one column{% if decoys %}, without saying which,{% endif %} whoever built it knows each input's
+secret key, and that the last row there hides no amount: the amounts balance.
+Each key row carries a key image, made from that secret key and that output
+alone, so spending one output twice shows up as the same key image twice. The
+signature signs the transaction, so it cannot be moved onto another one.</p>
+{% else if clsag %}
+<p class="sub">A ring signature for each input.</p>
+<p>Each input carries a CLSAG. It shows that whoever built the input knows the
+secret key of one of the ring's outputs, and that this output's commitment less
+the pseudo-output hides no amount{% if decoys %}, without saying which output{% endif %}. It proves the
+same as the MLSAG before it, but folds the two keys into one, so it needs one
+scalar for each ring member rather than two. Its key image is made from that
+secret key and that output alone, so spending one output twice shows up as the
+same key image twice. The signature signs the transaction, so it cannot be
+moved onto another one.</p>
+{% else %}
+<p class="sub">A ring signature for each input.</p>
+<p>Each input carries an MLSAG over two rows: the ring's keys, and each
+member's commitment less the pseudo-output. It shows that in one column{% if decoys %},
+without saying which,{% endif %} whoever built it knows the secret key and that the
+commitment there less the pseudo-output hides no amount. Its key image is made
+from that secret key and that output alone, so spending one output twice shows
+up as the same key image twice. The signature signs the transaction, so it
+cannot be moved onto another one.</p>
+{% endif %}
+{% call walk::bar(map, map_labels, sign) %}{% endcall %}
+<div class="facts"><div class="facts-h">In this transaction</div><dl>
+{% for i in inputs %}<dt>Input {{ loop.index }} &middot; key image</dt><dd class="hash mark">{{ i.key_image }}</dd>
+{% if let Some(d) = i.d %}<dt>Input {{ loop.index }} &middot; D/8</dt><dd class="hash">{{ d }}</dd>
+{% endif %}{% if let Some(b) = i.sig_bytes %}<dt>Input {{ loop.index }} &middot; signature</dt><dd>{{ b }} bytes</dd>
+{% endif %}{% endfor %}
+{% if let Some((bytes, rows, cols)) = full_sig %}<dt>Signature</dt><dd>{{ bytes }} bytes, {{ cols }} columns of {{ rows }}</dd>{% endif %}
+{% if let Some(b) = as_mlsag %}<dt>As an MLSAG</dt><dd>{{ b }} bytes per input</dd>{% endif %}
+<dt>Signs</dt><dd>{% if cn %}the transaction's prefix{% else %}the prefix, the fee, the output commitments{% if base_pseudo %}, the pseudo-outputs{% endif %}, the encrypted amounts and the range proofs{% endif %}</dd>
+</dl></div>
+<details class="maths"><summary>Show me the math</summary>
+{% if cn %}
+<p>The ring is <var>P<sub>1</sub></var>, &hellip;, <var>P<sub>n</sub></var>,
+and the sender knows <var>x</var> with <var>P<sub>s</sub></var> = <var>x</var>&middot;<var>G</var>
+for one <var>s</var>. Its key image is</p>
+<p class="eq"><var>I</var> = <var>x</var>&middot;<var>H<sub>p</sub></var>(<var>P<sub>s</sub></var>)</p>
+<p>where <var>H<sub>p</sub></var> hashes a point onto the curve. The signature
+is two scalars, <var>c<sub>i</sub></var> and <var>r<sub>i</sub></var>, for each
+member: 64 bytes a member. The verifier computes</p>
+<p class="eq"><var>L<sub>i</sub></var> = <var>r<sub>i</sub></var>&middot;<var>G</var> + <var>c<sub>i</sub></var>&middot;<var>P<sub>i</sub></var><br>
+<var>R<sub>i</sub></var> = <var>r<sub>i</sub></var>&middot;<var>H<sub>p</sub></var>(<var>P<sub>i</sub></var>) + <var>c<sub>i</sub></var>&middot;<var>I</var></p>
+<p>and checks that</p>
+<p class="eq">&Sigma;<sub><var>i</var></sub> <var>c<sub>i</sub></var> = <var>H<sub>s</sub></var>(<var>m</var>, <var>L<sub>1</sub></var>, <var>R<sub>1</sub></var>, &hellip;, <var>L<sub>n</sub></var>, <var>R<sub>n</sub></var>)</p>
+<p>with <var>m</var> the hash of the transaction's prefix and
+<var>H<sub>s</sub></var> a hash to a scalar. The sender makes its own
+<var>L<sub>s</sub></var> = <var>q</var>&middot;<var>G</var> and
+<var>R<sub>s</sub></var> = <var>q</var>&middot;<var>H<sub>p</sub></var>(<var>P<sub>s</sub></var>)
+from a random <var>q</var>, picks every other member's pair at random, and
+computes the hash. It then sets its own <var>c<sub>s</sub></var> so that the
+sum comes out, and <var>r<sub>s</sub></var> = <var>q</var> &minus; <var>c<sub>s</sub></var><var>x</var>.
+Only that last step needs <var>x</var>, and every pair looks alike, so nothing
+says which was the sender's. <var>R<sub>s</sub></var> comes out right only if
+<var>I</var> was made with the same <var>x</var>, which ties the key image to
+the output.</p>
+{% else if full %}
+<p>With <var>k</var> inputs, each column <var>i</var> of the signature holds
+<var>k</var> + 1 keys: the <var>i</var>-th member of every input's ring,
+<var>P<sub>1,i</sub></var>, &hellip;, <var>P<sub>k,i</sub></var>, and</p>
+<p class="eq"><var>Z<sub>i</sub></var> = &Sigma;<sub><var>j</var></sub> <var>C<sub>j,i</sub></var> &minus; &Sigma;<sub><var>o</var></sub> <var>C<sub>o</sub></var> &minus; <var>f</var>&middot;<var>H</var></p>
+<p>the column's input commitments less every output's commitment and the fee
+<var>f</var>. In the real column the amounts cancel, so <var>Z</var> = <var>z</var>&middot;<var>G</var>,
+with <var>z</var> the inputs' masks less the outputs', which the sender knows.
+Each key row has a key image, <var>I<sub>j</sub></var> = <var>x<sub>j</sub></var>&middot;<var>H<sub>p</sub></var>(<var>P<sub>j</sub></var>),
+where <var>H<sub>p</sub></var> hashes a point onto the curve. Starting from a
+challenge <var>c<sub>1</sub></var>, the verifier goes round the columns:</p>
+<p class="eq"><var>L<sub>j,i</sub></var> = <var>s<sub>j,i</sub></var>&middot;<var>G</var> + <var>c<sub>i</sub></var>&middot;<var>P<sub>j,i</sub></var>,
+&ensp; <var>R<sub>j,i</sub></var> = <var>s<sub>j,i</sub></var>&middot;<var>H<sub>p</sub></var>(<var>P<sub>j,i</sub></var>) + <var>c<sub>i</sub></var>&middot;<var>I<sub>j</sub></var><br>
+<var>L&prime;<sub>i</sub></var> = <var>s&prime;<sub>i</sub></var>&middot;<var>G</var> + <var>c<sub>i</sub></var>&middot;<var>Z<sub>i</sub></var><br>
+<var>c<sub>i+1</sub></var> = <var>H<sub>s</sub></var>(<var>m</var>, <var>P<sub>1,i</sub></var>, <var>L<sub>1,i</sub></var>, <var>R<sub>1,i</sub></var>, &hellip;, <var>P<sub>k,i</sub></var>, <var>L<sub>k,i</sub></var>, <var>R<sub>k,i</sub></var>, <var>Z<sub>i</sub></var>, <var>L&prime;<sub>i</sub></var>)</p>
+<p>and must come back to <var>c<sub>1</sub></var> after the last. Each
+challenge is a hash of the one before, so the loop closes only where the
+sender knows every secret of a column: it starts there from random points,
+goes round, and solves for that column's scalars last. So every input's real
+member sits at the same place in its ring, which is why wallets used this form
+only for a single input. The signature is <var>c<sub>1</sub></var> and
+<var>k</var> + 1 scalars per column, ((<var>k</var> + 1)<var>n</var> + 1)
+&times; 32 bytes. <var>m</var> hashes the transaction's prefix, the rest of its
+RingCT data, which holds the fee, the output commitments and the encrypted
+amounts, and its range proofs.</p>
+{% else if clsag %}
+<p>Each member <var>i</var> of the ring brings a key <var>P<sub>i</sub></var>
+and a commitment <var>C<sub>i</sub></var>. For the real one,
+<var>P</var> = <var>x</var>&middot;<var>G</var> and
+<var>C</var> &minus; <var>C&#x303;</var> = <var>z</var>&middot;<var>G</var>.
+There are two key images:</p>
+<p class="eq"><var>I</var> = <var>x</var>&middot;<var>H<sub>p</sub></var>(<var>P</var>), &ensp; <var>D</var> = <var>z</var>&middot;<var>H<sub>p</sub></var>(<var>P</var>)</p>
+<p>where <var>H<sub>p</sub></var> hashes a point onto the curve. Two hashes of
+the whole ring, both images and the pseudo-output weigh the two keys into
+one:</p>
+<p class="eq"><var>&mu;<sub>P</sub></var> = <var>H<sub>s</sub></var>(&ldquo;CLSAG_agg_0&rdquo;, <var>P<sub>1</sub></var>&hellip;<var>P<sub>n</sub></var>, <var>C<sub>1</sub></var>&hellip;<var>C<sub>n</sub></var>, <var>I</var>, <var>D</var>/8, <var>C&#x303;</var>), and <var>&mu;<sub>C</sub></var> the same with &ldquo;CLSAG_agg_1&rdquo;<br>
+<var>W<sub>i</sub></var> = <var>&mu;<sub>P</sub></var>&middot;<var>P<sub>i</sub></var> + <var>&mu;<sub>C</sub></var>&middot;(<var>C<sub>i</sub></var> &minus; <var>C&#x303;</var>),
+&ensp; <var>W&#x303;</var> = <var>&mu;<sub>P</sub></var>&middot;<var>I</var> + <var>&mu;<sub>C</sub></var>&middot;<var>D</var></p>
+<p>The real member's <var>W</var> is <var>w</var>&middot;<var>G</var>, with
+<var>w</var> = <var>&mu;<sub>P</sub></var><var>x</var> + <var>&mu;<sub>C</sub></var><var>z</var>,
+and <var>W&#x303;</var> = <var>w</var>&middot;<var>H<sub>p</sub></var>(<var>P</var>).
+Starting from a challenge <var>c<sub>1</sub></var>, the verifier goes round the
+ring over the combined keys:</p>
+<p class="eq"><var>L<sub>i</sub></var> = <var>s<sub>i</sub></var>&middot;<var>G</var> + <var>c<sub>i</sub></var>&middot;<var>W<sub>i</sub></var><br>
+<var>R<sub>i</sub></var> = <var>s<sub>i</sub></var>&middot;<var>H<sub>p</sub></var>(<var>P<sub>i</sub></var>) + <var>c<sub>i</sub></var>&middot;<var>W&#x303;</var><br>
+<var>c<sub>i+1</sub></var> = <var>H<sub>s</sub></var>(&ldquo;CLSAG_round&rdquo;, <var>P<sub>1</sub></var>&hellip;<var>P<sub>n</sub></var>, <var>C<sub>1</sub></var>&hellip;<var>C<sub>n</sub></var>, <var>C&#x303;</var>, <var>m</var>, <var>L<sub>i</sub></var>, <var>R<sub>i</sub></var>)</p>
+<p>and must come back to <var>c<sub>1</sub></var> after the last. The loop
+closes only where the sender knows <var>w</var>. The weights are hashes of the
+images themselves, so a false <var>I</var> cannot be made up for in
+<var>D</var>: the proof holds only if both were made with the real member's
+<var>x</var> and <var>z</var>. The signature is <var>s<sub>1</sub></var>,
+&hellip;, <var>s<sub>n</sub></var>, <var>c<sub>1</sub></var> and <var>D</var>:
+(<var>n</var> + 2) &times; 32 bytes, against (2<var>n</var> + 1) &times; 32
+for an MLSAG. <var>D</var> is stored divided by 8, and the verifier multiplies
+it back, so it cannot carry a part outside the prime-order group. <var>m</var>
+hashes the transaction's prefix, the rest of its RingCT data, which holds the
+fee, the output commitments and the encrypted amounts, and its range
+proofs.</p>
+{% else %}
+<p>Each member <var>i</var> of the ring is a column of two keys:
+<var>P<sub>i</sub></var>, and <var>Z<sub>i</sub></var> = <var>C<sub>i</sub></var> &minus; <var>C&#x303;</var>.
+For the real member, <var>P</var> = <var>x</var>&middot;<var>G</var> and
+<var>Z</var> = <var>z</var>&middot;<var>G</var>, and the key image is
+<var>I</var> = <var>x</var>&middot;<var>H<sub>p</sub></var>(<var>P</var>),
+where <var>H<sub>p</sub></var> hashes a point onto the curve. Starting from a
+challenge <var>c<sub>1</sub></var>, the verifier goes round the ring:</p>
+<p class="eq"><var>L<sub>i</sub></var> = <var>s<sub>i</sub></var>&middot;<var>G</var> + <var>c<sub>i</sub></var>&middot;<var>P<sub>i</sub></var><br>
+<var>R<sub>i</sub></var> = <var>s<sub>i</sub></var>&middot;<var>H<sub>p</sub></var>(<var>P<sub>i</sub></var>) + <var>c<sub>i</sub></var>&middot;<var>I</var><br>
+<var>L&prime;<sub>i</sub></var> = <var>s&prime;<sub>i</sub></var>&middot;<var>G</var> + <var>c<sub>i</sub></var>&middot;<var>Z<sub>i</sub></var><br>
+<var>c<sub>i+1</sub></var> = <var>H<sub>s</sub></var>(<var>m</var>, <var>P<sub>i</sub></var>, <var>L<sub>i</sub></var>, <var>R<sub>i</sub></var>, <var>Z<sub>i</sub></var>, <var>L&prime;<sub>i</sub></var>)</p>
+<p>and must come back to <var>c<sub>1</sub></var> after the last. Each
+challenge is a hash of the one before, so the loop closes only where the
+sender knows both <var>x</var> and <var>z</var>: it starts at its own member
+from random points, goes round, and solves for its own <var>s</var> and
+<var>s&prime;</var> last. The signature is <var>c<sub>1</sub></var> and two
+scalars per member, (2<var>n</var> + 1) &times; 32 bytes. <var>m</var> hashes
+the transaction's prefix, the rest of its RingCT data, which holds the fee, the
+output commitments{% if base_pseudo %}, the pseudo-outputs{% endif %} and the
+encrypted amounts, and its range proofs.</p>
+{% endif %}
+</details>
+</div>
+<svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><rect class="card" x="30" y="30" width="80" height="60" rx="6"/><path class="pen" d="M44 70q12-22 22-4t22-8"/><path class="line" d="M118 60H140"/><path class="head" d="M140 54l10 6-10 6z"/><rect class="solid" x="156" y="50" width="22" height="20" rx="3"/><text class="small" x="167" y="88" text-anchor="middle">key image</text></svg>
+</div>
+{% call walk::close(steps, sign) %}{% endcall %}
+</section>
+
+<section class="step" id="s{{ balance }}">
+{% call walk::open(steps, balance) %}{% endcall %}
+{% if cn %}
+<p class="sub">Every amount is in the clear.</p>
+<p>Before RingCT every amount was public. The inputs' amounts, which are those
+of the outputs they spend, must add up to more than the outputs', and what is
+left over is the fee. Wallets split amounts into round denominations, so that
+each output could find decoys of the same amount.</p>
+{% else %}
+<p class="sub">The amounts are hidden, and still add up.</p>
+<p>{% if full %}The signature's last row already showed that the input
+commitments add up to the outputs' plus the fee.{% else %}The pseudo-outputs
+must add up to the outputs' commitments plus the fee.{% endif %} A range proof
+shows that no output amount is negative. Neither reveals any amount but the
+fee{% if pre_ringct %} and those of the pre-RingCT outputs spent{% endif %}.
+Each output also carries its amount encrypted for its recipient.</p>
+{% endif %}
+{% call walk::bar(map, map_labels, balance) %}{% endcall %}
+<div class="facts"><div class="facts-h">In this transaction</div><dl>
+{% if let Some((ins, outs)) = plain %}
+<dt>Inputs</dt><dd>{{ ins }} XMR, in the clear</dd>
+<dt>Outputs</dt><dd>{{ outs }} XMR, in the clear</dd>
+<dt>Fee</dt><dd>{{ fee }} XMR</dd>
+{% else %}
+<dt>Inputs</dt><dd>{% if full %}balanced inside the signature{% else %}{{ inputs.len() }} pseudo-output{% if inputs.len() != 1 %}s{% endif %}{% endif %}</dd>
+<dt>Outputs</dt><dd>{{ outputs }} hidden amount{% if outputs != 1 %}s{% endif %}</dd>
+<dt>Fee</dt><dd>{{ fee }} XMR{% if !pre_ringct %}, the only amount in the clear{% endif %}</dd>
+{% if let Some(r) = range %}<dt>Range proof</dt><dd>{% if let Some(c) = r.count %}{{ c }} {% endif %}{{ r.name }}{% if r.name == "Borromean" %} range proof{% if r.count != Some(1) %}s{% endif %}, one for each output{% else if r.name == "Bulletproofs+" %} proof{% if r.count != Some(1) %}s{% endif %} over the outputs{% else %}{% if r.count != Some(1) %}s{% endif %} over the outputs{% endif %}{% if let Some(b) = r.bytes %}, {{ b }} bytes{% endif %}</dd>{% endif %}
+<dt>Encrypted amounts</dt><dd>{% if compact_amounts %}8 bytes for each output{% else %}a 32-byte amount and a 32-byte mask for each output{% endif %}</dd>
+{% endif %}
+</dl></div>
+<details class="maths"><summary>Show me the math</summary>
+{% if cn %}
+<p class="eq">&Sigma;<sub><var>i</var></sub> <var>a<sub>i</sub></var> = &Sigma;<sub><var>j</var></sub> <var>a<sub>j</sub></var> + <var>f</var></p>
+<p>Each amount is a whole number of atomic units, 10<sup>12</sup> to the XMR,
+in 64 bits. The verifier adds the inputs' and the outputs' up directly,
+checking that neither sum overflows, and the fee <var>f</var> is what the
+outputs leave over, which must be more than nothing. Nothing is hidden, so nothing needs a range proof.</p>
+{% else %}
+{% if full %}<p class="eq"><var>Z</var> = &Sigma;<sub><var>j</var></sub> <var>C<sub>j</sub></var> &minus; &Sigma;<sub><var>o</var></sub> <var>C<sub>o</sub></var> &minus; <var>f</var>&middot;<var>H</var> = <var>z</var>&middot;<var>G</var></p>
+<p>Each commitment is <var>k</var>&middot;<var>G</var> + <var>a</var>&middot;<var>H</var>
+for a mask <var>k</var> and an amount <var>a</var>. In the real column of the
+signature, <var>Z</var> holds no <var>H</var> at all only if the amounts of
+the inputs equal those of the outputs plus the fee <var>f</var>, and the
+signature proved that <var>Z</var> is a multiple of <var>G</var>.</p>
+{% else %}<p class="eq">&Sigma;<sub><var>i</var></sub> <var>C&#x303;<sub>i</sub></var> = &Sigma;<sub><var>j</var></sub> <var>C<sub>j</sub></var> + <var>f</var>&middot;<var>H</var></p>
+<p>Each commitment is <var>k</var>&middot;<var>G</var> + <var>a</var>&middot;<var>H</var>
+for a mask <var>k</var> and an amount <var>a</var>. The left side sums the
+pseudo-outputs, the right the output commitments and the fee <var>f</var>. The
+sender chose the masks so that they cancel, which leaves the amounts to
+balance.</p>{% endif %}
+<p>The range proof shows each output amount lies in [0, 2<sup>64</sup>).
+Without it, a negative amount, which wraps around to a huge number, could
+balance an output worth more than the inputs.
+{% if let Some(r) = range %}{% if r.name == "Borromean" %}A Borromean range
+proof writes the amount in 64 bits and commits to each bit apart,
+<var>C</var> = <var>C<sub>0</sub></var> + &hellip; + <var>C<sub>63</sub></var>,
+with <var>C<sub>j</sub></var> committing to 0 or 2<sup><var>j</var></sup>. A
+ring signature of two members for each bit then shows that
+<var>C<sub>j</sub></var> or <var>C<sub>j</sub></var> &minus; 2<sup><var>j</var></sup>&middot;<var>H</var>
+is a multiple of <var>G</var>. That is 64 commitments and their signatures:
+6,176 bytes an output.{% else if r.name == "Bulletproof" %}A Bulletproof proves
+the ranges of up to 16 outputs at once, and grows with the logarithm of their
+number rather than with it: for <var>m</var> outputs, rounded up to a power of
+two, it is 2&thinsp;log<sub>2</sub>(64<var>m</var>) + 9 points and scalars of
+32 bytes.{% else %}Bulletproofs+ prove the ranges of up to 16 outputs at once,
+like the Bulletproofs before them, in three fewer points and scalars: for
+<var>m</var> outputs, rounded up to a power of two,
+2&thinsp;log<sub>2</sub>(64<var>m</var>) + 6 of 32 bytes.{% endif %}{% endif %}
+The inputs need no range proof of their own: each is the amount of an output
+already on the chain{% if !full %}, as the signature showed of its
+pseudo-output{% endif %}.</p>
+<p>{% if compact_amounts %}Each output's encrypted amount is its 8-byte amount
+masked with a hash of the secret the sender shares with the recipient, and its
+mask <var>k</var> is another such hash, so it is not sent.{% else %}Each
+output's encrypted amount is its amount and its mask <var>k</var>, each added
+to a hash of the secret the sender shares with the recipient.{% endif %} The
+recipient recomputes the commitment from them to check it.</p>
+{% endif %}
+</details>
+</div>
+<svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><path class="line" d="M40 50H160M100 50V100M76 100H124"/><rect class="node" x="28" y="56" width="36" height="20" rx="3"/><text class="small" x="46" y="92" text-anchor="middle">in</text><rect class="node" x="130" y="56" width="26" height="20" rx="3"/><rect class="solid" x="158" y="56" width="10" height="20" rx="2"/><text class="small" x="149" y="92" text-anchor="middle">out + fee</text></svg>
+</div>
+{% call walk::close(steps, balance) %}{% endcall %}
+</section>
+
+<section class="step" id="s{{ tell }}">
+{% call walk::open(steps, tell) %}{% endcall %}
+<p class="sub">Everything checks out{% if decoys %}, and one thing stays hidden{% endif %}.</p>
+<p>{% if inputs.len() == 1 %}That {% if !decoys %}the one output{% else if let Some(n) = ring_size %}one of the {{ n }} outputs{% else %}an output{% endif %} in its ring
+was spent, by someone entitled to spend it, and only once{% if !cn %}, and that the amounts balance{% endif %}.{% if decoys %} Not which one{% if !cn %}, and not how much{% endif %}.{% endif %}{% else %}That each of its {{ inputs.len() }} inputs spent {% if decoys %}one of the outputs{% else %}the one output{% endif %} in its ring,
+by someone entitled to spend it, and only once{% if !cn %}, and that the amounts balance{% endif %}.{% if decoys %} Not which ones{% if !cn %}, and not how much{% endif %}.{% endif %}{% endif %}
+{% if cn %}The amounts, though, are all in the clear.{% endif %}
+{% if let Some(e) = exposed %}{{ e }}{% endif %}</p>
+{% if decoys %}<p>A ring hides the spend only among its own members, which the
+sender's wallet picked. Whatever rules a member out, such as seeing it spent
+alone elsewhere, narrows the ring. FCMP++ replaces the ring with every
+spendable output on the chain.</p>{% endif %}
+<div class="facts"><div class="facts-h">In this transaction</div><dl>
+{% if let Some(n) = ring_size %}<dt>{% if inputs.len() == 1 %}Could be spending{% else %}Each input could be spending{% endif %}</dt><dd>{% if *n == 1 %}only the one output in its ring{% else %}any of the {{ n }} outputs in its ring{% endif %}</dd>
+{% else %}{% for i in inputs %}<dt>Input {{ loop.index }} could be spending</dt><dd>{% if i.size == 1 %}only the one output in its ring{% else %}any of the {{ i.size }} outputs in its ring{% endif %}</dd>
+{% endfor %}{% endif %}
+<dt>Spent before?</dt><dd>No. The {% if in_pool %}pool{% else %}chain{% endif %} accepted its key images as new.</dd>
+<dt>Amounts</dt><dd>{% if cn %}In the clear, and they balance.{% else if pre_ringct %}They balance, and only the fee and the pre-RingCT amounts are shown.{% else %}They balance, and only the fee is shown.{% endif %}</dd>
+</dl></div>
+<details class="maths"><summary>Show me the math</summary>
+<p>A verifier checks, for this transaction:</p>
+<ol>
+<li>that every ring member is an output on the chain{% if cn %} of the input's amount{% endif %}, and unlocked;</li>
+<li>{% if full %}the signature{% else %}each input's signature{% endif %}, against {% if cn %}the hash of the prefix{% else %}<var>m</var>{% endif %};</li>
+<li>that each key image is a point of the prime-order group other than the
+identity, and has not been seen before;</li>
+<li>{% if cn %}that the inputs add up to more than the outputs, with no
+overflow, the rest being the fee.{% else %}that the amounts balance, and the range proofs.{% endif %}</li>
+</ol>
+<p>{% if cn %}Each signature ties its key image to a member of its
+ring.{% else if full %}The signature ties each key image and the balance to
+one column, the same member of every ring.{% else %}Each signature ties its
+key image and its pseudo-output to the same member of its ring, so the output
+whose key image is new is the one whose amount balances.{% endif %} None of
+these checks depends on which member was spent, so passing them says nothing
+about it.</p>
+</details>
+</div>
+<svg class="pic" viewBox="0 0 200 120" aria-hidden="true">{% for d in tell_pic %}<circle class="{{ d.class }}" cx="{{ d.x }}" cy="{{ d.y }}" r="{{ d.r }}"/>{% endfor %}</svg>
+</div>
+{% call walk::close(steps, tell) %}{% endcall %}
+</section>
+
+<section class="step first" id="s1">
+{% call walk::open(steps, 1) %}{% endcall %}
+<p class="sub">Every input hides among other outputs.</p>
+<p>An input does not name the output it spends.
+{% if decoys %}It names a ring: {% if let Some(n) = ring_size %}{{ n }} outputs{% else %}a few outputs{% endif %}
+already on the chain, its own among them and the rest decoys, which the
+sender's wallet picked.{% else %}It names a ring of outputs already on the
+chain: its own, and normally decoys the sender's wallet picked to hide it. Here
+each ring holds only its own output.{% endif %}
+{% if cn %}Amounts were public then, so every member of a ring holds the same
+amount as the output being spent.{% else %}Amounts are hidden, so any RingCT
+output can stand in as a decoy.{% if pre_ringct %} An input spending an output
+from before RingCT is the exception: its ring holds outputs of that output's
+own, public, amount.{% endif %}{% endif %}
+Since October 2018 consensus has required rings of 11 members, and of 16
+since August 2022, except when spending an old public amount too rare to find
+decoys for. Before that the sender chose the size above a rising minimum, and
+the earliest rings often held a single output, with no decoys at all.</p>
+<div class="facts"><div class="facts-h">In this transaction</div><dl>
+{% let f = ring_facts %}<dt>Rings</dt><dd>{{ f.rings }}</dd>
+{% if let Some((b, age)) = f.oldest %}<dt>Oldest member</dt><dd>block <a href="/block/{{ b }}">{{ b }}</a>, {{ age }} before the spend</dd>{% endif %}
+{% if let Some((b, age)) = f.youngest %}<dt>Youngest member</dt><dd>block <a href="/block/{{ b }}">{{ b }}</a>, {{ age }} before the spend</dd>{% endif %}
+</dl></div>
+<figure class="ring-timeline">
+{% for t in timelines %}<svg class="timeline tl-{{ t.g.class }}" viewBox="0 0 {{ t.g.width }} {{ t.height }}" role="group" aria-label="Each input's ring members, by how long before the spend they were made">
+{% for k in t.ticks %}<line class="grid" x1="{{ k.x }}" x2="{{ k.x }}" y1="{{ t.top }}" y2="{{ t.axis_y }}"/>{% endfor %}
+<line class="spend" x1="{{ t.g.spend }}" x2="{{ t.g.spend }}" y1="16" y2="{{ t.bottom }}"/>
+<text class="spend-l" x="{{ t.g.spend }}" y="11" text-anchor="end">{{ t.spend }}</text>
+{% for r in t.rows %}<g class="row">
+<text class="name" x="0" y="{% if r.note.is_some() %}{{ r.y - 2 }}{% else %}{{ r.y + 4 }}{% endif %}">{{ r.label }}</text>{% if let Some((n, squeeze)) = r.note %}<text class="note" x="0" y="{{ r.y + 11 }}"{% if let Some(w) = squeeze %} textLength="{{ w }}" lengthAdjust="spacingAndGlyphs"{% endif %}>{{ n }}</text>{% endif %}
+<line class="lane" x1="{{ t.g.left }}" x2="{{ t.g.spend }}" y1="{{ r.y }}" y2="{{ r.y }}"/>
+{% if r.unresolved %}<text class="note" x="{{ t.g.left + 6 }}" y="{{ r.y - 6 }}">{% if r.solid %}a ring of one output, with no decoys, which this node could not look up{% else %}this node could not look up this ring{% endif %}</text>{% else %}<rect class="band" x="{{ r.band_x }}" y="{{ r.y - 10 }}" width="{{ t.g.spend - r.band_x }}" height="20" rx="4"/>
+{% for d in r.dots %}<a href="/block/{{ d.block }}"><circle class="mem{% if r.solid %} only{% endif %}" cx="{{ d.x }}" cy="{{ r.y }}" r="6"><title>{{ d.title }}</title></circle></a>{% endfor %}{% if let Some((x, anchor)) = r.alone %}<text class="alone" x="{{ x }}" y="{{ r.y + 4 }}" text-anchor="{{ anchor }}">no decoys</text>{% endif %}{% endif %}
+</g>{% endfor %}
+<line class="axis" x1="{{ t.g.left }}" x2="{{ t.g.spend }}" y1="{{ t.axis_y }}" y2="{{ t.axis_y }}"/>
+{% for k in t.ticks %}<text class="tick" x="{{ k.x }}" y="{{ t.axis_y + 16 }}" text-anchor="middle">{{ k.label }}</text>{% endfor %}
+<text class="tick" x="{{ t.g.young }}" y="{{ t.axis_y + 16 }}" text-anchor="middle">{{ t.youngest }}</text>
+</svg>
+{% endfor %}<figcaption>Each input's ring, by how long before the spend each member was made, on a
+logarithmic scale. {% if ring_facts.under_age %}The axis ends at the youngest
+member: this ring is from before November 2019, when consensus began refusing
+members younger than ten blocks.{% else %}The axis ends ten blocks before the
+spend, the youngest a ring member can be: consensus has refused younger ones
+since November 2019, and wallets kept to that before.{% endif %} Since 2018
+wallets have drawn decoys mostly from recent outputs, where real spends usually
+are, so the real one sits among them. Each dot links to its block.</figcaption></figure>
+<details class="maths"><summary>Show me the math</summary>
+<p>Each ring member is an output's one-time key
+<var>P<sub>i</sub></var>{% if !cn %} and its amount commitment
+<var>C<sub>i</sub></var>{% endif %}. An input lists its ring as key offsets:
+the first is an output's index, and each after it is the gap from the one
+before, which keeps the list short and in order.{% for i in inputs %}{% if loop.first %}
+Input 1's offsets, {{ i.offsets }}, add up to {% if let Some(a) = i.amount %}the outputs of {{ a }} XMR numbered{% else %}outputs{% endif %} {{ i.indices }}.{% endif %}{% endfor %}</p>
+<p>{% if cn %}Outputs are numbered one amount at a time, so each amount has its
+own count, and a ring's members are looked up by its amount and their
+numbers.{% else %}RingCT outputs share one count.{% if pre_ringct %} An output
+from before RingCT is numbered among the outputs of its own amount, and its
+commitment is taken as <var>C</var> = <var>G</var> + <var>a</var>&middot;<var>H</var>,
+a commitment to its public amount <var>a</var> under a mask of 1.{% endif %}{% endif %}
+A verifier looks the members up in its own copy of the chain, so a ring can
+only name outputs that exist.</p>
+</details>
+</div>
+</div>
+{% call walk::close(steps, 1) %}{% endcall %}
+</section>
+
+</div>
+{% endblock %}

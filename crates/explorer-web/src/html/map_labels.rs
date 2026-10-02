@@ -89,18 +89,17 @@ pub struct Outside {
     pub text: String,
 }
 
-/// One kind of part: its parts' bytes each, and each part's left, width and
-/// centre, in thousandths of the bar.
+/// One kind of part: each part's left and width, in thousandths of the bar,
+/// and its bytes.
 struct Kind {
     class: &'static str,
     step: usize,
-    bytes: usize,
-    parts: Vec<(f64, f64)>,
+    parts: Vec<(f64, f64, usize)>,
 }
 
 impl Kind {
     fn centres(&self) -> impl Iterator<Item = f64> + '_ {
-        self.parts.iter().map(|&(x, w)| x + w / 2.0)
+        self.parts.iter().map(|&(x, w, _)| x + w / 2.0)
     }
 
     fn name(&self) -> (&'static str, &'static str) {
@@ -108,13 +107,16 @@ impl Kind {
             "tuple" => ("Disguised output", "Disguise"),
             "sal" => ("Signature", "Signature"),
             "member" => ("Membership proof", "Membership"),
+            "pseudo" => ("Pseudo-output", "Pseudo"),
+            "ring" => ("Ring signature", "Signature"),
+            "range" => ("Range proof", "Range"),
             _ => ("Root anchor", "Anchor"),
         }
     }
 
-    /// What a part could say inside itself, longest first.
-    fn inside_texts(&self) -> [String; 3] {
-        let ((long, short), b) = (self.name(), grouped(self.bytes as u64));
+    /// What a part of `bytes` could say inside itself, longest first.
+    fn inside_texts(&self, bytes: usize) -> [String; 3] {
+        let ((long, short), b) = (self.name(), grouped(bytes as u64));
         [
             format!("{long} · {b} bytes"),
             format!("{short} · {b} B"),
@@ -122,14 +124,22 @@ impl Kind {
         ]
     }
 
-    /// What the kind's label beside the bar could say, longest first.
+    /// What the kind's label beside the bar could say, longest first: each
+    /// part's size, or their total where they differ.
     fn outside_texts(&self) -> [String; 3] {
-        let ((long, short), b) = (self.name(), grouped(self.bytes as u64));
+        let (long, short) = self.name();
         let n = self.parts.len();
-        let times = if n > 1 {
-            format!(" × {n}")
+        let first = self.parts.first().map_or(0, |p| p.2);
+        let (b, times) = if self.parts.iter().all(|p| p.2 == first) {
+            let times = if n > 1 {
+                format!(" × {n}")
+            } else {
+                String::new()
+            };
+            (grouped(first as u64), times)
         } else {
-            String::new()
+            let total = self.parts.iter().map(|p| p.2).sum::<usize>();
+            (grouped(total as u64), format!(" in {n}"))
         };
         [
             format!("{long} {b} B{times}"),
@@ -138,11 +148,11 @@ impl Kind {
         ]
     }
 
-    /// Below the bar for the disguises and the anchor, above it for the
-    /// rest, so the disguises and signatures, which alternate, never share
-    /// a side.
+    /// Below the bar for the disguises, pseudo-outputs, range proofs and the
+    /// anchor, above it for the rest, so the parts that alternate never
+    /// share a side.
     fn prefers_above(&self) -> bool {
-        matches!(self.class, "sal" | "member")
+        matches!(self.class, "sal" | "member" | "ring")
     }
 }
 
@@ -215,17 +225,21 @@ fn lay_out(kinds: &[Kind], variant: &Variant, top: f64) -> LabelSet {
     let mut placed: Vec<Placed> = Vec::new();
 
     for kind in kinds {
-        let fits = kind.inside_texts().into_iter().find(|t| {
+        let fits = (0..3).find_map(|t| {
             kind.parts
                 .iter()
-                .all(|&(_, w)| px(w) >= text_width(t, INSIDE_PX) + 2.0 * INSIDE_PAD)
+                .map(|&(x, w, bytes)| {
+                    let text = kind.inside_texts(bytes).into_iter().nth(t)?;
+                    (px(w) >= text_width(&text, INSIDE_PX) + 2.0 * INSIDE_PAD).then(|| Inside {
+                        step: kind.step,
+                        x: pct(x),
+                        text,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
         });
-        if let Some(text) = fits {
-            inside.extend(kind.parts.iter().map(|&(x, _)| Inside {
-                step: kind.step,
-                x: pct(x),
-                text: text.clone(),
-            }));
+        if let Some(fits) = fits {
+            inside.extend(fits);
             continue;
         }
 
@@ -284,13 +298,12 @@ fn lay_out(kinds: &[Kind], variant: &Variant, top: f64) -> LabelSet {
 pub fn map_labels(map: &[ProofSegment]) -> Option<MapLabels> {
     let mut kinds: Vec<Kind> = Vec::new();
     for g in map {
-        let part = (f64::from(g.x), f64::from(g.width));
+        let part = (f64::from(g.x), f64::from(g.width), g.bytes);
         match kinds.iter_mut().find(|k| k.class == g.class) {
             Some(k) => k.parts.push(part),
             None => kinds.push(Kind {
                 class: g.class,
                 step: g.step,
-                bytes: g.bytes,
                 parts: vec![part],
             }),
         }
@@ -429,6 +442,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Parts of one kind but different sizes, as rings of different sizes
+    /// sign: each labelled with its own size inside, and their total beside
+    /// the bar.
+    #[test]
+    fn parts_of_one_kind_keep_their_own_sizes() {
+        let bar = |sizes: &[usize], range: usize| {
+            crate::html::lay_bar(
+                sizes
+                    .iter()
+                    .map(|&b| (b, "ring", 2, String::new()))
+                    .chain([(range, "range", 3, String::new())])
+                    .collect(),
+            )
+        };
+        let labels = map_labels(&bar(&[3_000, 5_000], 400)).unwrap();
+        let inside: Vec<_> = labels.sets[0]
+            .inside
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(inside, ["Signature · 3,000 B", "Signature · 5,000 B"]);
+
+        let small = bar(&[64, 128, 64], 40_000);
+        let labels = map_labels(&small).unwrap();
+        let ring: Vec<_> = labels.sets[0]
+            .outside
+            .iter()
+            .filter(|l| l.step == 2)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(ring, ["Ring signature 256 B in 3"]);
+        let equal = map_labels(&bar(&[64, 64], 40_000)).unwrap();
+        assert!(
+            equal.sets[0]
+                .outside
+                .iter()
+                .any(|l| l.text == "Ring signature 64 B × 2")
+        );
     }
 
     /// The real page's one input: the membership proof labelled inside, the

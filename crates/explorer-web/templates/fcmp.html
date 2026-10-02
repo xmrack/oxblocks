@@ -1,17 +1,6 @@
 {% extends "base.html" %}
 {% block title %}FCMP++ proof of {{ hash }} &mdash; oxblocks{% endblock %}
-{% macro open(steps, n) %}
-<nav class="rail" aria-label="Steps">{% for s in steps %}<a class="pip{% if s.n == n %} on{% else if s.n < n %} done{% endif %}" href="#s{{ s.n }}" title="{{ s.title }}"{% if s.n == n %} aria-current="step"{% endif %}>{{ s.n }}</a>{% if !loop.last %}<span class="link"></span>{% endif %}{% endfor %}</nav>
-<div class="step-card"><div class="copy"><div class="kicker">Step {{ n }} of {{ steps.len() }}</div>{% for s in steps %}{% if s.n == n %}<h2>{{ s.title }}</h2>{% endif %}{% endfor %}
-{% endmacro %}
-{% macro close(steps, n) %}
-<div class="step-nav">{% for s in steps %}{% if s.n + 1 == n %}<a class="btn ghost" href="#s{{ s.n }}">&larr; Back</a>{% endif %}{% if s.n == n + 1 %}<a class="btn next" href="#s{{ s.n }}">Next: {{ s.title }} &rarr;</a>{% endif %}{% endfor %}{% if n == steps.len() %}<a class="btn next" href="#s1">Start again</a>{% endif %}</div>
-{% endmacro %}
-{% macro bar(map, labels, n) %}
-{% if let Some(l) = labels %}<svg class="proof-map" width="100%" height="{{ l.height }}" role="img" aria-label="The proof drawn to scale, with this step's part lit">{% for g in map %}<a href="#s{{ g.step }}"><rect class="seg {{ g.class }}{% if g.step == n %} on{% endif %}" x="{{ g.x_pct() }}" y="{{ l.top }}" width="{{ g.width_pct() }}" height="{{ crate::html::map_labels::BAR_H }}" rx="4"><title>{{ g.label }}</title></rect></a>{% endfor %}
-{% for set in l.sets %}<g class="pm-{{ set.class }}">{% for t in set.inside %}<text class="pm-in{% if t.step == n %} on{% endif %}" x="{{ t.x }}" dx="8" y="{{ l.inside_y }}">{{ t.text }}</text>{% endfor %}{% for o in set.outside %}<g class="pm-out{% if o.step == n %} on{% endif %}">{% for x in o.ticks %}<line x1="{{ x }}" x2="{{ x }}" y1="{{ o.tick_y.0 }}" y2="{{ o.tick_y.1 }}"/>{% endfor %}{% if let Some((a, b)) = o.bracket %}<line x1="{{ a }}" x2="{{ b }}" y1="{{ o.tick_y.1 }}" y2="{{ o.tick_y.1 }}"/>{% endif %}<text x="{{ o.x }}" dx="{{ o.dx }}" y="{{ o.y }}" text-anchor="{{ o.anchor }}">{{ o.text }}</text></g>{% endfor %}</g>
-{% endfor %}</svg>{% endif %}
-{% endmacro %}
+{% import "walk.html" as walk %}
 {% block content %}
 <p class="crumb"><a href="/tx/{{ hash }}">Transaction</a> <span class="hash">{{ hash }}</span></p>
 <h1>How this spend stays private</h1>
@@ -26,7 +15,7 @@
 <div class="walkthrough">
 
 <section class="step" id="s2">
-{% call open(steps, 2) %}{% endcall %}
+{% call walk::open(steps, 2) %}{% endcall %}
 <p class="sub">An input never points at the output it spends.</p>
 <p>Instead of naming its output, each input publishes a disguised copy of it.
 An output is three points: its key, the point its key image is made from, and
@@ -35,7 +24,7 @@ leaf anyone can see, and a fourth point, R, commits to one of those masks for
 the checks that follow. The masks only come off inside the membership proof,
 where nobody can watch. The disguised amount doubles as the input's
 pseudo-output.</p>
-{% call bar(map, map_labels, 2) %}{% endcall %}
+{% call walk::bar(map, map_labels, 2) %}{% endcall %}
 <div class="facts"><div class="facts-h">In this transaction</div><dl>
 {% for i in inputs %}
 {% if let Some(d) = i.disguise %}
@@ -63,18 +52,18 @@ bytes.</p>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><circle class="solid" cx="45" cy="60" r="22"/><text class="on-solid" x="45" y="65" text-anchor="middle">O</text><path class="line" d="M75 60H120"/><path class="head" d="M120 54l10 6-10 6z"/><text class="small" x="102" y="48" text-anchor="middle">+ mask</text><circle class="ghost" cx="160" cy="60" r="22"/><text class="on-ghost" x="160" y="65" text-anchor="middle">&Otilde;</text></svg>
 </div>
-{% call close(steps, 2) %}{% endcall %}
+{% call walk::close(steps, 2) %}{% endcall %}
 </section>
 
 <section class="step" id="s3">
-{% call open(steps, 3) %}{% endcall %}
+{% call walk::open(steps, 3) %}{% endcall %}
 <p class="sub">A short signature for each input.</p>
 <p>Each input carries a small proof that whoever built it knows the secret keys
 behind the disguised output, and that its key image was made with those same
 keys. A key image depends only on the output, not on how it was disguised, so
 spending one output twice shows up as the same key image twice. The proof also
 signs the transaction, so it cannot be moved onto another one.</p>
-{% call bar(map, map_labels, 3) %}{% endcall %}
+{% call walk::bar(map, map_labels, 3) %}{% endcall %}
 <div class="facts"><div class="facts-h">In this transaction</div><dl>
 {% for i in inputs %}<dt>Input {{ loop.index }} &middot; key image</dt><dd class="hash mark">{{ i.key_image }}</dd>{% endfor %}
 <dt>Size</dt><dd>{{ sal_len }} bytes per input</dd>
@@ -106,11 +95,11 @@ mask off <var>&Itilde;</var> in <var>L</var>.</p>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><rect class="card" x="30" y="30" width="80" height="60" rx="6"/><path class="pen" d="M44 70q12-22 22-4t22-8"/><path class="line" d="M118 60H140"/><path class="head" d="M140 54l10 6-10 6z"/><rect class="solid" x="156" y="50" width="22" height="20" rx="3"/><text class="small" x="167" y="88" text-anchor="middle">key image</text></svg>
 </div>
-{% call close(steps, 3) %}{% endcall %}
+{% call walk::close(steps, 3) %}{% endcall %}
 </section>
 
 <section class="step" id="s4">
-{% call open(steps, 4) %}{% endcall %}
+{% call walk::open(steps, 4) %}{% endcall %}
 <p class="sub">One proof covers every input.</p>
 <p>The largest part. It shows that each disguised output, with its masks taken
 off, is a leaf of the tree, and climbs from that leaf to the root, without
@@ -119,7 +108,7 @@ the proof, so the climb cannot be matched against the tree. The layers
 alternate between two curves, Selene and Helios, paired so that a point on
 either can be fed to the other as numbers. So the climb is split between two
 proofs, one on each curve, each taking every other layer.</p>
-{% call bar(map, map_labels, 4) %}{% endcall %}
+{% call walk::bar(map, map_labels, 4) %}{% endcall %}
 <div class="facts"><div class="facts-h">In this transaction</div><dl>
 {% if let Some((bytes, share)) = membership %}<dt>Size</dt><dd>{{ bytes }} bytes, {{ share }}% of the proof</dd>{% endif %}
 <dt>Covers</dt><dd>{% if inputs.len() == 1 %}the one input{% else %}all {{ inputs.len() }} inputs at once{% endif %}</dd>
@@ -166,11 +155,11 @@ alone.</p>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><path class="edge" d="M100 18L55 58M100 18L145 58M55 58L20 100M55 58L36 100M55 58L52 100M55 58L68 100M55 58L84 100M145 58L116 100M145 58L132 100M145 58L148 100M145 58L164 100M145 58L180 100"/><circle class="solid" cx="100" cy="18" r="5"/><circle class="node" cx="55" cy="58" r="5"/><circle class="node" cx="145" cy="58" r="5"/><circle class="node" cx="20" cy="100" r="3.5"/><circle class="node" cx="36" cy="100" r="3.5"/><circle class="node" cx="52" cy="100" r="3.5"/><circle class="node" cx="68" cy="100" r="3.5"/><circle class="node" cx="84" cy="100" r="3.5"/><circle class="node" cx="116" cy="100" r="3.5"/><circle class="node" cx="132" cy="100" r="3.5"/><circle class="node" cx="148" cy="100" r="3.5"/><circle class="node" cx="164" cy="100" r="3.5"/><circle class="node" cx="180" cy="100" r="3.5"/><text class="q" x="178" y="84">?</text></svg>
 </div>
-{% call close(steps, 4) %}{% endcall %}
+{% call walk::close(steps, 4) %}{% endcall %}
 </section>
 
 <section class="step" id="s5">
-{% call open(steps, 5) %}{% endcall %}
+{% call walk::open(steps, 5) %}{% endcall %}
 <p class="sub">The last {{ root_pok_len }} bytes.</p>
 <p>The root is public, but the membership proof's copy of it carries a random
 mask, like everything the proof commits to. Its last {{ root_pok_len }} bytes
@@ -178,7 +167,7 @@ show that this copy is the real root plus that mask and nothing else. The
 verifier supplies the real
 root{% if let Some((b, _)) = root_block %}, the one block {{ b }} carries{% endif %},
 so a proof built on an invented tree fails.</p>
-{% call bar(map, map_labels, 5) %}{% endcall %}
+{% call walk::bar(map, map_labels, 5) %}{% endcall %}
 <div class="facts"><div class="facts-h">In this transaction</div><dl>
 <dt>Size</dt><dd>{{ root_pok_len }} bytes</dd>
 {% if let Some((b, root)) = root_block %}<dt>Root</dt><dd><span class="hash">{{ root }}</span>, in block <a href="/block/{{ b }}">{{ b }}</a></dd>{% endif %}
@@ -203,11 +192,11 @@ points, and no multiple of <var>H</var> alone could make it.</p>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><circle class="solid" cx="50" cy="60" r="9"/><path class="chain" d="M64 60H120"/><rect class="card" x="124" y="36" width="56" height="48" rx="5"/><text class="small" x="152" y="64" text-anchor="middle">block</text></svg>
 </div>
-{% call close(steps, 5) %}{% endcall %}
+{% call walk::close(steps, 5) %}{% endcall %}
 </section>
 
 <section class="step" id="s6">
-{% call open(steps, 6) %}{% endcall %}
+{% call walk::open(steps, 6) %}{% endcall %}
 <p class="sub">Unchanged from RingCT.</p>
 <p>The disguised input amounts must add up to the outputs plus the fee, and a
 range proof shows that no output amount is negative. Neither reveals any amount
@@ -234,11 +223,11 @@ the chain.</p>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><path class="line" d="M40 50H160M100 50V100M76 100H124"/><rect class="node" x="28" y="56" width="36" height="20" rx="3"/><text class="small" x="46" y="92" text-anchor="middle">in</text><rect class="node" x="130" y="56" width="26" height="20" rx="3"/><rect class="solid" x="158" y="56" width="10" height="20" rx="2"/><text class="small" x="149" y="92" text-anchor="middle">out + fee</text></svg>
 </div>
-{% call close(steps, 6) %}{% endcall %}
+{% call walk::close(steps, 6) %}{% endcall %}
 </section>
 
 <section class="step" id="s7">
-{% call open(steps, 7) %}{% endcall %}
+{% call walk::open(steps, 7) %}{% endcall %}
 <p class="sub">Everything checks out, and one thing stays hidden.</p>
 <p>{% if inputs.len() == 1 %}That {% if let Some(n) = anonymity_set %}one of {{ n }} outputs{% else %}an output in the tree{% endif %}
 was spent, by someone entitled to spend it, and only once. Not which one.{% else %}That each of its {{ inputs.len() }} inputs spent a different one of {% if let Some(n) = anonymity_set %}{{ n }} outputs{% else %}the outputs in the tree{% endif %},
@@ -268,11 +257,11 @@ nothing about it.</p>
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true">{% for y in 0..5 %}{% for x in 0..11 %}<circle class="node" cx="{{ 22 + x * 16 }}" cy="{{ 24 + y * 18 }}" r="5"/>{% endfor %}{% endfor %}</svg>
 </div>
-{% call close(steps, 7) %}{% endcall %}
+{% call walk::close(steps, 7) %}{% endcall %}
 </section>
 
 <section class="step first" id="s1">
-{% call open(steps, 1) %}{% endcall %}
+{% call walk::open(steps, 1) %}{% endcall %}
 <p class="sub">Every spendable output sits in one tree.</p>
 <p>Every output on the chain joins a single tree once it can be spent, and the
 whole tree is summed up by one short value at the top, its root.
@@ -311,7 +300,7 @@ layer{% if layer_sums.len() != 1 %}s{% endif %}.</p>{% endif %}
 </div>
 <svg class="pic" viewBox="0 0 200 120" aria-hidden="true"><path class="web" d="M96 38H104L120 56H80ZM80 64H120L170 82H30Z"/><rect class="solid" x="96" y="30" width="8" height="8" rx="2"/><rect class="node" x="80" y="56" width="40" height="8" rx="2"/><rect class="node" x="30" y="82" width="140" height="8" rx="2"/></svg>
 </div>
-{% call close(steps, 1) %}{% endcall %}
+{% call walk::close(steps, 1) %}{% endcall %}
 </section>
 
 </div>

@@ -25,8 +25,10 @@ use crate::config::Theme;
 mod leaf_grid;
 mod map_labels;
 mod paths;
+mod ring_walk;
 mod tree_field;
 pub use paths::tree_paths;
+pub use ring_walk::ring_proof;
 
 /// The chain summary strip shown on every page.
 pub struct ChainStatus {
@@ -276,10 +278,6 @@ fn is_p2pool(coinbase: bool, outputs: usize, merge_mined: bool) -> bool {
     coinbase && outputs > 1 && merge_mined
 }
 
-/// Blocks per hour and per day at Monero's two-minute target.
-const BLOCKS_PER_HOUR: u64 = 30;
-const BLOCKS_PER_DAY: u64 = 720;
-
 /// The strip's coordinate space, in the pixels it occupies at full size. The
 /// stylesheet lets it shrink with a narrow window but never enlarges it, so
 /// the axis labels stay the size they were drawn at.
@@ -291,16 +289,65 @@ const STEM_WIDTH: u32 = 2;
 /// Baseline for the axis labels: below the band, with room for descenders.
 const TICK_BASELINE: u32 = STRIP_HEIGHT - 5;
 
-/// Axis labels, spaced widely enough on a log scale that two never collide.
+/// Axis labels, in minutes, spaced widely enough on a log scale that two
+/// never collide.
 const AGE_TICKS: [(u64, &str); 7] = [
-    (BLOCKS_PER_HOUR, "1h"),
-    (6 * BLOCKS_PER_HOUR, "6h"),
-    (BLOCKS_PER_DAY, "1d"),
-    (7 * BLOCKS_PER_DAY, "1w"),
-    (30 * BLOCKS_PER_DAY, "1mo"),
-    (365 * BLOCKS_PER_DAY, "1y"),
-    (1825 * BLOCKS_PER_DAY, "5y"),
+    (60, "1h"),
+    (6 * 60, "6h"),
+    (1440, "1d"),
+    (7 * 1440, "1w"),
+    (30 * 1440, "1mo"),
+    (365 * 1440, "1y"),
+    (1825 * 1440, "5y"),
 ];
+
+/// Turns ages in blocks before a block into times. Blocks were a minute
+/// apart until hard fork 2 and two minutes after.
+#[derive(Debug, Clone, Copy)]
+struct Clock {
+    /// The block ages are counted back from.
+    at: u64,
+    /// The height hard fork 2 began at. `None` where the daemon would not
+    /// say, and then ages are given in blocks.
+    v2: Option<u64>,
+}
+
+impl Clock {
+    /// How many of the blocks back from `at` were two minutes apart.
+    fn two_minute_blocks(self, v2: u64) -> u64 {
+        self.at.saturating_sub(v2.saturating_sub(1))
+    }
+
+    /// Minutes from the block `age` blocks back to `at`.
+    fn minutes(self, age: u64) -> Option<u64> {
+        let two = self.two_minute_blocks(self.v2?).min(age);
+        Some(age.saturating_add(two))
+    }
+
+    /// How many blocks back from `at` lie `minutes` before it.
+    fn blocks(self, minutes: u64) -> Option<u64> {
+        let two = self.two_minute_blocks(self.v2?);
+        Some(match minutes.checked_sub(two.saturating_mul(2)) {
+            Some(more) => two.saturating_add(more),
+            None => minutes / 2,
+        })
+    }
+
+    /// An age the way a reader would say it, or in blocks where the times
+    /// are not known.
+    fn age(self, blocks: u64) -> String {
+        self.minutes(blocks).map_or_else(
+            || {
+                format!(
+                    "{} block{}",
+                    grouped(blocks),
+                    if blocks == 1 { "" } else { "s" }
+                )
+            },
+            minutes_label,
+        )
+    }
+}
 
 /// The axis every strip on a transaction shares: the oldest age any of its
 /// inputs reaches. Drawn to its own scale, each input would put the same
@@ -322,8 +369,8 @@ fn axis_span(heights: impl Iterator<Item = u64>, spent_at: u64) -> u64 {
 ///
 /// `oldest` is the axis, in blocks, and is the oldest age reached by any of
 /// the transaction's inputs rather than by this one alone.
-fn age_strip(ring: &[RingView], spent_at: u64, oldest: u64) -> AgeStrip {
-    let ages = ring.iter().map(|m| spent_at.saturating_sub(m.height));
+fn age_strip(ring: &[RingView], clock: Clock, oldest: u64) -> AgeStrip {
+    let ages = ring.iter().map(|m| clock.at.saturating_sub(m.height));
 
     AgeStrip {
         marks: ages
@@ -332,7 +379,7 @@ fn age_strip(ring: &[RingView], spent_at: u64, oldest: u64) -> AgeStrip {
                 AgeMark {
                     halo: centred(x, HALO_WIDTH),
                     stem: centred(x, STEM_WIDTH),
-                    label: age_label(age),
+                    label: clock.age(age),
                 }
             })
             .collect(),
@@ -340,8 +387,9 @@ fn age_strip(ring: &[RingView], spent_at: u64, oldest: u64) -> AgeStrip {
         // invites the reader to look for members that are not there.
         ticks: AGE_TICKS
             .iter()
-            .filter(|&&(age, _)| age <= oldest)
-            .map(|&(age, label)| AgeTick {
+            .filter_map(|&(minutes, label)| Some((clock.blocks(minutes)?, label)))
+            .filter(|&(age, _)| age <= oldest)
+            .map(|(age, label)| AgeTick {
                 x: strip_x(age, oldest),
                 label: label.to_owned(),
             })
@@ -386,9 +434,8 @@ fn strip_x(age: u64, oldest: u64) -> u32 {
     x
 }
 
-/// An age written the way a reader would say it.
-fn age_label(blocks: u64) -> String {
-    let minutes = blocks.saturating_mul(2);
+/// A time written the way a reader would say it.
+fn minutes_label(minutes: u64) -> String {
     match minutes {
         0..60 => format!("{minutes} min"),
         60..1440 => format!("{} h", minutes / 60),
@@ -1694,6 +1741,10 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
         entry.block_height
     };
 
+    let clock = Clock {
+        at: spent_at,
+        v2: state.chain.v2_height().await,
+    };
     let oldest = axis_span(
         rings.iter().flat_map(|r| &r.ring).map(|m| m.block_height),
         spent_at,
@@ -1718,7 +1769,7 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
                 amount: visible_amount(r.amount),
                 size,
                 unavailable: r.ring_unavailable,
-                ages: age_strip(&ring, spent_at, oldest),
+                ages: age_strip(&ring, clock, oldest),
                 ring,
             }
         })
@@ -1991,7 +2042,12 @@ fn proof_map(inputs: usize, membership_len: usize) -> Vec<ProofSegment> {
         5,
         format!("The root anchor, {FCMP_PP_ROOT_POK_LEN} bytes"),
     ));
+    lay_bar(parts)
+}
 
+/// Lays parts, each its bytes, class, step and label, along the bar in
+/// order.
+fn lay_bar(parts: Vec<(usize, &'static str, usize, String)>) -> Vec<ProofSegment> {
     #[allow(
         clippy::cast_precision_loss,
         reason = "a chart coordinate, not chain arithmetic"
@@ -2855,6 +2911,15 @@ mod tests {
             .collect()
     }
 
+    /// Blocks per hour and per day at the two-minute target.
+    const BLOCKS_PER_HOUR: u64 = 30;
+    const BLOCKS_PER_DAY: u64 = 720;
+
+    /// Ages back from `at`, every block two minutes apart.
+    fn clock(at: u64) -> Clock {
+        Clock { at, v2: Some(1) }
+    }
+
     fn ring_at(heights: &[u64]) -> Vec<RingView> {
         heights
             .iter()
@@ -2871,7 +2936,11 @@ mod tests {
     fn the_oldest_member_anchors_the_left_edge_and_the_newest_the_spend() {
         let spent_at = 3_000_000;
         let axis = 40 * BLOCKS_PER_DAY;
-        let strip = age_strip(&ring_at(&[spent_at, spent_at - axis]), spent_at, axis);
+        let strip = age_strip(
+            &ring_at(&[spent_at, spent_at - axis]),
+            clock(spent_at),
+            axis,
+        );
 
         assert_eq!(
             strip.marks.first().map(|m| m.stem),
@@ -2894,7 +2963,7 @@ mod tests {
             .iter()
             .map(|age| spent_at - age)
             .collect();
-        let strip = age_strip(&ring_at(&heights), spent_at, 30 * BLOCKS_PER_DAY);
+        let strip = age_strip(&ring_at(&heights), clock(spent_at), 30 * BLOCKS_PER_DAY);
 
         let mut checked = 0;
         for pair in strip.marks.windows(2) {
@@ -2923,7 +2992,7 @@ mod tests {
                 spent_at - 6 * BLOCKS_PER_HOUR,
                 spent_at - 365 * BLOCKS_PER_DAY,
             ]),
-            spent_at,
+            clock(spent_at),
             365 * BLOCKS_PER_DAY,
         );
 
@@ -2946,7 +3015,7 @@ mod tests {
         let spent_at = 3_000_000;
         let strip = age_strip(
             &ring_at(&[spent_at - BLOCKS_PER_DAY, spent_at - 365 * BLOCKS_PER_DAY]),
-            spent_at,
+            clock(spent_at),
             365 * BLOCKS_PER_DAY,
         );
 
@@ -2960,7 +3029,7 @@ mod tests {
         let spent_at = 3_000_000;
         let strip = age_strip(
             &ring_at(&[spent_at, spent_at - 2 * BLOCKS_PER_DAY]),
-            spent_at,
+            clock(spent_at),
             2 * BLOCKS_PER_DAY,
         );
 
@@ -2998,8 +3067,8 @@ mod tests {
         let spent_at = 3_000_000;
         let ring = ring_at(&[spent_at, spent_at - BLOCKS_PER_DAY]);
 
-        let alone = age_strip(&ring, spent_at, BLOCKS_PER_DAY);
-        let beside_an_older_input = age_strip(&ring, spent_at, 365 * BLOCKS_PER_DAY);
+        let alone = age_strip(&ring, clock(spent_at), BLOCKS_PER_DAY);
+        let beside_an_older_input = age_strip(&ring, clock(spent_at), 365 * BLOCKS_PER_DAY);
 
         assert_eq!(alone.marks.last().map(|m| m.stem), Some(0));
         assert!(
@@ -3010,12 +3079,81 @@ mod tests {
 
     #[test]
     fn an_age_is_labelled_in_the_unit_a_reader_would_use() {
-        assert_eq!(age_label(0), "0 min");
-        assert_eq!(age_label(5), "10 min");
-        assert_eq!(age_label(BLOCKS_PER_HOUR), "1 h");
-        assert_eq!(age_label(BLOCKS_PER_DAY), "1 d");
-        assert_eq!(age_label(29 * BLOCKS_PER_DAY), "29 d");
-        assert_eq!(age_label(45 * BLOCKS_PER_DAY), "1 mo");
+        let c = clock(3_000_000);
+        assert_eq!(c.age(0), "0 min");
+        assert_eq!(c.age(5), "10 min");
+        assert_eq!(c.age(BLOCKS_PER_HOUR), "1 h");
+        assert_eq!(c.age(BLOCKS_PER_DAY), "1 d");
+        assert_eq!(c.age(29 * BLOCKS_PER_DAY), "29 d");
+        assert_eq!(c.age(45 * BLOCKS_PER_DAY), "1 mo");
+    }
+
+    /// Before hard fork 2 an hour was sixty blocks, and the strip's labels
+    /// and marks say so.
+    #[test]
+    fn a_strip_from_before_hard_fork_2_counts_a_minute_a_block() {
+        let early = Clock {
+            at: 2_000,
+            v2: Some(3_000),
+        };
+        let strip = age_strip(&ring_at(&[1_940, 2_000 - 1_440]), early, 1_440);
+        assert_eq!(strip.marks.first().map(|m| m.label.as_str()), Some("1 h"));
+        let hour = strip
+            .ticks
+            .iter()
+            .find(|t| t.label == "1h")
+            .expect("an hour tick");
+        assert_eq!(hour.x, strip_x(60, 1_440));
+        let day = strip
+            .ticks
+            .iter()
+            .find(|t| t.label == "1d")
+            .expect("a day tick");
+        assert_eq!(day.x, strip_x(1_440, 1_440));
+    }
+
+    /// Blocks were a minute apart before hard fork 2, so an age reaching
+    /// back past it is shorter than two minutes a block makes it.
+    #[test]
+    fn blocks_before_hard_fork_2_count_a_minute_each() {
+        let v2 = 1_000;
+        let after = Clock {
+            at: 1_100,
+            v2: Some(v2),
+        };
+        assert_eq!(after.minutes(100), Some(200), "all after the fork");
+        assert_eq!(
+            after.minutes(101),
+            Some(202),
+            "the fork block itself is two minutes on"
+        );
+        assert_eq!(after.minutes(102), Some(203), "and the gap before it one");
+        assert_eq!(after.minutes(300), Some(2 * 101 + 199));
+        let before = Clock {
+            at: 500,
+            v2: Some(v2),
+        };
+        assert_eq!(before.minutes(60), Some(60));
+        assert_eq!(before.age(60), "1 h");
+        // The block at or just younger than each time.
+        for minutes in [0, 60, 201, 202, 203, 401, 10_000] {
+            let blocks = after.blocks(minutes).unwrap();
+            assert!(after.minutes(blocks).unwrap() <= minutes, "{minutes} min");
+            assert!(
+                after.minutes(blocks + 1).unwrap() > minutes,
+                "{minutes} min"
+            );
+        }
+        assert_eq!(after.blocks(202), Some(101));
+        assert_eq!(after.blocks(401), Some(300));
+        assert_eq!(before.blocks(60), Some(60));
+        let unknown = Clock {
+            at: 1_100,
+            v2: None,
+        };
+        assert_eq!((unknown.minutes(5), unknown.blocks(60)), (None, None));
+        assert_eq!(unknown.age(5), "5 blocks");
+        assert_eq!(unknown.age(1), "1 block");
     }
 
     /// A ring member mined after the spending block would underflow an
@@ -3023,7 +3161,7 @@ mod tests {
     /// must not render a wrong chart if it does.
     #[test]
     fn a_ring_member_newer_than_the_spend_does_not_wrap() {
-        let strip = age_strip(&ring_at(&[3_000_100]), 3_000_000, 0);
+        let strip = age_strip(&ring_at(&[3_000_100]), clock(3_000_000), 0);
 
         assert_eq!(
             strip.marks.first().map(|m| m.stem),
@@ -4101,7 +4239,7 @@ mod tests {
                         public_key: "2".repeat(64),
                         tx_hash: "3".repeat(64),
                     }],
-                    ages: age_strip(&[], 0, 0),
+                    ages: age_strip(&[], clock(0), 0),
                 },
                 InputView {
                     key_image: "4".repeat(64),
@@ -4109,7 +4247,7 @@ mod tests {
                     size: 16,
                     unavailable: false,
                     ring: Vec::new(),
-                    ages: age_strip(&[], 0, 0),
+                    ages: age_strip(&[], clock(0), 0),
                 },
             ],
             outputs: vec![
@@ -4516,7 +4654,11 @@ mod tests {
 
         let mut ring = tx_page();
         ring.hash = "abc".to_owned();
-        assert!(!ring.render().expect("renders").contains("/fcmp"));
+        let html = ring.render().expect("renders");
+        assert!(!html.contains("/fcmp"));
+        assert_eq!(html.matches(&link.replace("/fcmp", "/ring")).count(), 1);
+        ring.coinbase = true;
+        assert!(!ring.render().expect("renders").contains(r#"class="walk""#));
     }
 
     fn fcmp_fixture(file: &str) -> Vec<(TxEntry, TxJson)> {
