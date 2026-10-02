@@ -185,6 +185,13 @@ struct TxPage {
     extra_undecoded: bool,
 }
 
+impl TxPage {
+    /// Whether any output's amount is hidden, for the column's note.
+    fn hidden_amounts(&self) -> bool {
+        self.outputs.iter().any(|o| o.amount.is_none())
+    }
+}
+
 struct InputView {
     key_image: String,
     amount: Option<String>,
@@ -3087,8 +3094,9 @@ mod tests {
         );
         assert_eq!(
             html.matches(r#"<svg class="icon""#).count(),
-            html.matches("<details class=\"hint\">").count(),
-            "every hint should carry the icon"
+            html.matches("<details class=\"hint\">").count()
+                + html.matches(r#"<details class="note-chip""#).count(),
+            "every hint and column note should carry the icon"
         );
         assert!(!html.to_lowercase().contains("<script"));
         assert!(!html.contains("onclick"));
@@ -4742,12 +4750,40 @@ mod tests {
         assert!(!html.contains("Ring members are still resolved"));
     }
 
+    /// Every column note is for a column the table shows, and the notes are
+    /// one group, so that opening one closes the rest.
+    #[test]
+    fn every_column_note_is_for_a_column_shown() {
+        for page in [tx_page(), fcmp_tx_page()] {
+            let html = page.render().expect("renders");
+            let notes: Vec<&str> = html
+                .split(r#"<details class="note-chip" name="output-notes"><summary>"#)
+                .skip(1)
+                .filter_map(|r| r.split(" <svg").next())
+                .collect();
+            assert!(notes.len() >= 2, "{html}");
+            assert_eq!(notes.len(), html.matches(r#"class="note-chip""#).count());
+            for n in notes {
+                assert!(
+                    html.contains(&format!("<th>{n}</th>"))
+                        || html.contains(&format!(r#"<th class="num">{n}</th>"#)),
+                    "{n} has no column"
+                );
+            }
+        }
+    }
+
     /// Carrot outputs carry a three-byte view tag and an encrypted anchor, and
-    /// the hint describes the three-byte tag, not the one-byte one.
+    /// the note describes the three-byte tag, not the one-byte one.
     #[test]
     fn carrot_outputs_show_their_anchor_and_describe_their_view_tag() {
         let html = fcmp_tx_page().render().expect("renders");
         assert!(html.contains("<th>Janus anchor</th>"));
+        assert!(
+            html.contains(
+                r#"<details class="note-chip" name="output-notes"><summary>Janus anchor "#
+            )
+        );
         assert_eq!(html.matches(&"7".repeat(32)).count(), 2);
         assert!(html.contains("<code>a1b2c3</code>"));
         assert!(html.contains("Three bytes that make scanning cheaper"));
@@ -4945,8 +4981,21 @@ mod tests {
             "exactly one of the two outputs is a hidden RingCT amount"
         );
         assert!(
-            html.contains(r#"title="Hidden in a Pedersen commitment. A Bulletproofs+ range proof"#),
-            "hovering says what hides the amount"
+            html.contains("A Bulletproofs+\n    range proof shows that the amount is not negative"),
+            "the amount's note says what hides it"
+        );
+        // Its heading links to its card.
+        assert!(
+            html.contains(r#"<details class="note-chip" name="output-notes"><summary>Amount "#)
+        );
+        let mut clear = tx_page();
+        for o in &mut clear.outputs {
+            o.amount.get_or_insert_with(|| "1.0".to_owned());
+        }
+        let html = clear.render().expect("renders");
+        assert!(
+            !html.contains("<summary>Amount "),
+            "no note where nothing is hidden"
         );
         assert!(
             html.contains("3.0"),

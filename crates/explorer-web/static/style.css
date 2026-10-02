@@ -126,11 +126,47 @@ th {
   top: 0;
 }
 tbody tr:hover { background: var(--bg-sunken); }
-/* Hints for the columns of the table below, one per line above it. They do
-   not sit in the `<th>` itself, because a panel opened there widens its
-   column and pushes the rest of the table off the screen. */
-.legend { margin: 0 0 0.55rem; font-size: 0.82rem; color: var(--fg-faint); }
-.legend > div { padding: 0.08rem 0; }
+/* Notes on a table's columns: a row of chips above it, one note open at a
+   time (the chips share a `name`), shown under the row over the table. A
+   panel opening in the `<th>` itself would widen its column. */
+.note-chips { position: relative; display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0 0 0.9rem; }
+.note-chip > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.28rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-raised);
+  font-size: 0.82rem;
+  color: var(--fg-muted);
+}
+.note-chip > summary::-webkit-details-marker { display: none; }
+.note-chip > summary .icon { fill: none; stroke: currentColor; stroke-width: 1.4; color: var(--fg-faint); }
+.note-chip > summary .icon .dot { fill: currentColor; stroke: none; }
+.note-chip > summary .icon .stem { stroke-linecap: round; }
+.note-chip > summary:hover { border-color: var(--accent); color: var(--fg); }
+.note-chip[open] > summary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.note-chip[open] > summary .icon { color: var(--accent-fg); }
+.note-chip > p {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 0.45rem);
+  z-index: 5;
+  margin: 0;
+  padding: 0.8rem 1rem;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
+  font-size: 0.86rem;
+  color: var(--fg-muted);
+  line-height: 1.5;
+}
 
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
