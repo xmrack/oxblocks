@@ -195,7 +195,13 @@ pub async fn ring_proof(State(state): Shared, Path(raw): Path<String>) -> Page {
             &format!("Transaction {hash} {why}."),
         );
     };
-    let (rings, v2) = tokio::join!(state.chain.resolve_rings(&tx), state.chain.v2_height());
+    // A pool transaction's ages count from the tip, so without the chain's
+    // status its rings are shown as not looked up rather than as ages from 0.
+    let (rings, v2) = if entry.in_pool && chain.is_none() {
+        (Vec::new(), None)
+    } else {
+        tokio::join!(state.chain.resolve_rings(&tx), state.chain.v2_height())
+    };
     render(
         StatusCode::OK,
         &ring_page(chain, &entry, &tx, scheme, &rings, v2),
@@ -211,6 +217,12 @@ fn ring_page(
     v2: Option<u64>,
 ) -> RingPage {
     let f = TxFacts::from_entry(entry, tx);
+    let unknown_tip: &[ResolvedInput] = &[];
+    let rings = if entry.in_pool && chain.is_none() {
+        unknown_tip
+    } else {
+        rings
+    };
     // Ages are measured against the block that spent them, or the tip for a
     // transaction still in the pool, as on the transaction's page.
     let clock = Clock {
@@ -1484,6 +1496,27 @@ mod tests {
         assert!(!p.ring_facts.under_age);
         let html = p.render().unwrap();
         assert!(html.contains("the youngest a ring member can be"));
+    }
+
+    /// A pool transaction's ages count from the tip, so without the chain's
+    /// status its rings read as not looked up, not as ages from block 0.
+    #[test]
+    fn a_pool_spend_without_the_tip_has_no_ages() {
+        let mut f = rct5();
+        let spent = f.0.block_height;
+        f.0.in_pool = true;
+        let heights: Vec<u64> = (0..11).map(|i| spent - 10 - i * 300).collect();
+        let p = ring_page(
+            None,
+            &f.0,
+            &f.1,
+            Scheme::Clsag,
+            &[resolved(&heights)],
+            Some(1),
+        );
+        assert!(p.inputs.iter().all(|i| i.unresolved && i.blocks.is_empty()));
+        assert!(!p.ring_facts.under_age);
+        assert_eq!(p.ring_facts.oldest, None);
     }
 
     /// Where the daemon will not say where hard fork 2 began, ages are in

@@ -145,6 +145,15 @@ struct LeafRow {
     on: bool,
 }
 
+/// Why outputs from the `from`th, counted from 0, are not there to show.
+fn no_such_outputs(from: usize, total: usize) -> String {
+    format!(
+        "This transaction has {total} output{}, so none from output {}.",
+        plural(total),
+        from.saturating_add(1)
+    )
+}
+
 pub async fn tree_paths(
     State(state): Shared,
     Path(raw): Path<String>,
@@ -211,11 +220,7 @@ pub async fn tree_paths(
                 chain,
                 StatusCode::NOT_FOUND,
                 "No such outputs",
-                &format!(
-                    "This transaction has {total} output{}, so none from output {}.",
-                    plural(total),
-                    from + 1
-                ),
+                &no_such_outputs(from, total),
             );
         }
         Err(PathsError::Chain(e)) => {
@@ -606,6 +611,16 @@ mod tests {
     use super::*;
     use crate::tree_paths::{OutputPath, RootCheck};
     use monerod_rpc::types::PathQuery;
+
+    /// A `from` as large as the query allows is told of, not overflowed.
+    #[test]
+    fn outputs_from_past_the_last_are_counted_from_one() {
+        assert_eq!(
+            no_such_outputs(60, 2),
+            "This transaction has 2 outputs, so none from output 61."
+        );
+        assert!(no_such_outputs(usize::MAX, 1).ends_with(&format!("output {}.", usize::MAX)));
+    }
 
     const IDS: [u64; 4] = [802, 803, 804, 805];
     const ROOT_806: &str = "e71da88f93a4ded7a2de6217859985fb5349d597e38232572e8d02d8a21e51ce";

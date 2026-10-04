@@ -332,6 +332,10 @@ code.lit {
 .toc .verb { color: var(--fg-faint); font-size: 0.78rem; font-weight: 600; width: 2.4rem; }
 .toc code { color: var(--accent); word-break: break-all; }
 .toc .what { margin-left: auto; color: var(--fg-muted); }
+@media (max-width: 640px) {
+  .toc a { display: grid; grid-template-columns: 2.4rem minmax(0, 1fr); }
+  .toc .what { grid-column: 2; margin-left: 0; font-size: 0.84rem; }
+}
 
 /* ---------- notices ---------- */
 

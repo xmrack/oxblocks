@@ -296,8 +296,9 @@ oxblocks also takes its reading of monerod's binary answers from monero-oxide
 (`monero-epee`), and the FCMP++ proof's layout (`Fcmp::ipa_rows`,
 `Fcmp::proof_size`).
 
-An output joins the tree when it unlocks, ten blocks after it is mined by
-default, so a transaction's outputs have no path before then. The page says
+An output joins the tree in the block nine after the one that mined it by
+default, the last before it can be spent, so a transaction's outputs have no
+path before then. The page says
 which block they join as of. `tools/capture-path-fixtures.py` records the
 paths and roots in `fixtures/fcmp/paths/`, which the tests hash up to the
 roots monerod recorded.

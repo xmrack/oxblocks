@@ -1139,6 +1139,8 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "monero-epee",
+ "ring",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",

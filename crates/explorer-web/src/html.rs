@@ -208,7 +208,8 @@ struct InputView {
     size: usize,
     unavailable: bool,
     ring: Vec<RingView>,
-    ages: AgeStrip,
+    /// `None` where the height they are counted from is unknown.
+    ages: Option<AgeStrip>,
 }
 
 struct RingView {
@@ -1150,6 +1151,8 @@ struct ApiPage {
     max_transactions_limit: u64,
     max_mempool_limit: u64,
     max_block_range: u64,
+    /// The most chain data one range of blocks may hold, in MiB.
+    max_range_mib: u64,
     min_postfix_len: usize,
     max_postfix_len: usize,
     min_anonymity_set: u64,
@@ -1711,6 +1714,17 @@ async fn tree_facts(
     )
 }
 
+/// The height ring ages are measured against: the block that spent them, or
+/// the tip for a transaction still in the pool, unknown without the chain's
+/// status.
+fn spent_height(entry: &TxEntry, chain: Option<&ChainStatus>) -> Option<u64> {
+    if entry.in_pool {
+        chain.map(|c| c.height)
+    } else {
+        Some(entry.block_height)
+    }
+}
+
 pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page {
     let mut chain = status_of(&state).await;
     let (entry, tx) = match fetch_tx(&state, &mut chain, &raw).await {
@@ -1733,22 +1747,14 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
         entry.block_timestamp
     };
 
-    // Ring ages are measured against the block that spent them, or the tip
-    // for a transaction still in the pool.
-    let spent_at = if entry.in_pool {
-        chain.as_ref().map_or(0, |c| c.height)
-    } else {
-        entry.block_height
-    };
-
-    let clock = Clock {
-        at: spent_at,
-        v2: state.chain.v2_height().await,
-    };
-    let oldest = axis_span(
-        rings.iter().flat_map(|r| &r.ring).map(|m| m.block_height),
-        spent_at,
-    );
+    let v2 = state.chain.v2_height().await;
+    let clock = spent_height(entry, chain.as_ref()).map(|at| Clock { at, v2 });
+    let oldest = clock.map_or(0, |c| {
+        axis_span(
+            rings.iter().flat_map(|r| &r.ring).map(|m| m.block_height),
+            c.at,
+        )
+    });
 
     let lens = ring_lens(&tx);
     let inputs: Vec<InputView> = rings
@@ -1769,7 +1775,7 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
                 amount: visible_amount(r.amount),
                 size,
                 unavailable: r.ring_unavailable,
-                ages: age_strip(&ring, clock, oldest),
+                ages: clock.map(|c| age_strip(&ring, c, oldest)),
                 ring,
             }
         })
@@ -2045,21 +2051,34 @@ fn proof_map(inputs: usize, membership_len: usize) -> Vec<ProofSegment> {
     lay_bar(parts)
 }
 
+/// The most of the bar that widening parts to [`MAP_MIN_SEGMENT`] may take
+/// from the rest before parts of a kind are drawn as one.
+const MAP_MAX_WIDENED: f64 = 20.0;
+
 /// Lays parts, each its bytes, class, step and label, along the bar in
-/// order.
+/// order, or one part of each class, in the order the classes first come,
+/// where drawing every part visibly would take the bar off scale.
 fn lay_bar(parts: Vec<(usize, &'static str, usize, String)>) -> Vec<ProofSegment> {
     #[allow(
         clippy::cast_precision_loss,
         reason = "a chart coordinate, not chain arithmetic"
     )]
-    let total = parts.iter().map(|p| p.0).sum::<usize>().max(1) as f64;
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "a chart coordinate, not chain arithmetic"
-    )]
-    let drawn: Vec<f64> = parts
-        .iter()
-        .map(|p| (p.0 as f64 / total * f64::from(MAP_WIDTH)).max(MAP_MIN_SEGMENT))
+    let widths = |parts: &[(usize, &'static str, usize, String)]| -> Vec<f64> {
+        let total = parts.iter().map(|p| p.0).sum::<usize>().max(1) as f64;
+        parts
+            .iter()
+            .map(|p| p.0 as f64 / total * f64::from(MAP_WIDTH))
+            .collect()
+    };
+    let widened = |w: &[f64]| -> f64 { w.iter().map(|w| (MAP_MIN_SEGMENT - w).max(0.0)).sum() };
+    let parts = if widened(&widths(&parts)) > MAP_MAX_WIDENED {
+        by_class(parts)
+    } else {
+        parts
+    };
+    let drawn: Vec<f64> = widths(&parts)
+        .into_iter()
+        .map(|w| w.max(MAP_MIN_SEGMENT))
         .collect();
     let scale = f64::from(MAP_WIDTH) / drawn.iter().sum::<f64>();
 
@@ -2087,6 +2106,38 @@ fn lay_bar(parts: Vec<(usize, &'static str, usize, String)>) -> Vec<ProofSegment
                 bytes,
                 label,
             }
+        })
+        .collect()
+}
+
+/// `parts` with each class's drawn as one, where the class first comes.
+fn by_class(
+    parts: Vec<(usize, &'static str, usize, String)>,
+) -> Vec<(usize, &'static str, usize, String)> {
+    let mut merged: Vec<(usize, &'static str, usize, String, usize)> = Vec::new();
+    for (bytes, class, step, label) in parts {
+        match merged.iter_mut().find(|m| m.1 == class) {
+            Some(m) => {
+                m.0 = m.0.saturating_add(bytes);
+                m.4 += 1;
+            }
+            None => merged.push((bytes, class, step, label, 1)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(bytes, class, step, label, n)| {
+            let what = match class {
+                _ if n == 1 => return (bytes, class, step, label),
+                "tuple" => "disguised outputs",
+                "sal" => "signatures",
+                "pseudo" => "pseudo-outputs",
+                "ring" => "ring signatures",
+                "range" => "range proofs",
+                _ => "parts",
+            };
+            let label = format!("{n} {what}, {} bytes", grouped(bytes as u64));
+            (bytes, class, step, label)
         })
         .collect()
 }
@@ -2484,6 +2535,7 @@ pub async fn api_docs(State(state): Shared) -> Page {
             max_transactions_limit: crate::api::handlers::MAX_TRANSACTIONS_LIMIT,
             max_mempool_limit: crate::api::handlers::MAX_MEMPOOL_LIMIT,
             max_block_range: state.limits.block_range,
+            max_range_mib: explorer_core::rpc_source::MAX_RANGE_KIB / 1024,
             min_postfix_len: state.limits.postfix_min,
             max_postfix_len: state.limits.postfix_max,
             min_anonymity_set: crate::api::handlers::MIN_ANONYMITY_SET,
@@ -2625,6 +2677,7 @@ mod tests {
             max_transactions_limit: h::MAX_TRANSACTIONS_LIMIT,
             max_mempool_limit: h::MAX_MEMPOOL_LIMIT,
             max_block_range: limits.block_range,
+            max_range_mib: explorer_core::rpc_source::MAX_RANGE_KIB / 1024,
             min_postfix_len: limits.postfix_min,
             max_postfix_len: limits.postfix_max,
             min_anonymity_set: h::MIN_ANONYMITY_SET,
@@ -3237,6 +3290,103 @@ mod tests {
             "an ordinary transaction with many outputs is not a payout"
         );
         assert!(!is_p2pool(false, 2, false));
+    }
+
+    /// A pool spend's ages count from the tip, which is unknown without the
+    /// chain's status; a mined one's from its own block.
+    #[test]
+    fn ring_ages_are_counted_from_a_known_height_only() {
+        let entry = |in_pool: bool| -> TxEntry {
+            serde_json::from_value(serde_json::json!({
+                "tx_hash": format!("{:064x}", 7), "as_hex": "", "as_json": "{}",
+                "block_height": 5, "block_timestamp": 0, "confirmations": 1,
+                "in_pool": in_pool, "double_spend_seen": false, "output_indices": [],
+            }))
+            .unwrap()
+        };
+        let chain = status();
+        assert_eq!(spent_height(&entry(false), None), Some(5));
+        assert_eq!(spent_height(&entry(true), chain.as_ref()), Some(3_185_431));
+        assert_eq!(spent_height(&entry(true), None), None);
+
+        let mut page = tx_page();
+        let ring = (0..16)
+            .map(|i| RingView {
+                height: 100 + i,
+                public_key: "2".repeat(64),
+                tx_hash: "3".repeat(64),
+            })
+            .collect();
+        page.inputs[1].ring = ring;
+        page.inputs[1].ages = None;
+        let html = page.render().unwrap();
+        assert!(html.contains("the members' ages are unknown"), "{html}");
+        page.inputs[1].ages = Some(age_strip(&page.inputs[1].ring, clock(200), 100));
+        let html = page.render().unwrap();
+        assert!(!html.contains("the members' ages are unknown"));
+        assert!(html.contains("class=\"ring-ages\""));
+    }
+
+    /// A pool spend's page, with the chain's status out of reach, shows its
+    /// ring without ages rather than ages counted from block 0; with the
+    /// status, it shows them.
+    #[tokio::test]
+    async fn a_pool_spends_ring_ages_wait_for_the_tip() {
+        let mut fetched: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/mainnet/get_transactions_rct5_clsag.json"
+        ))
+        .unwrap();
+        let entry = fetched["txs"].as_array_mut().unwrap().last_mut().unwrap();
+        entry["in_pool"] = true.into();
+        let hash = entry["tx_hash"].as_str().unwrap().to_owned();
+        let daemon = |status: bool| {
+            let fetched = fetched.clone();
+            explorer_core::fake_daemon::FakeDaemon::start(move |what, body| match what {
+                "get_transactions" => fetched.clone(),
+                "get_outs" => {
+                    let n = body["outputs"].as_array().map_or(0, Vec::len);
+                    let out = serde_json::json!({
+                        "key": "1".repeat(64), "mask": "2".repeat(64), "unlocked": true,
+                        "height": 3_185_000, "txid": "3".repeat(64),
+                    });
+                    serde_json::json!({"outs": vec![out; n], "status": "OK"})
+                }
+                "get_info" if status => serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": {
+                    "height": 3_185_431, "target_height": 0, "difficulty": 1, "difficulty_top64": 0,
+                    "target": 120, "tx_count": 1, "tx_pool_size": 1, "alt_blocks_count": 0,
+                    "outgoing_connections_count": 0, "incoming_connections_count": 0,
+                    "white_peerlist_size": 0, "grey_peerlist_size": 0, "testnet": false,
+                    "stagenet": false, "nettype": "mainnet", "top_block_hash": "",
+                    "cumulative_difficulty": 1, "cumulative_difficulty_top64": 0,
+                    "block_size_limit": 0, "block_size_median": 0, "start_time": 0,
+                    "version": "test", "restricted": false, "status": "OK",
+                }}),
+                _ => serde_json::json!({"jsonrpc": "2.0", "id": "0",
+                    "error": {"code": -9, "message": "busy"}}),
+            })
+        };
+        let page = |daemon: explorer_core::fake_daemon::FakeDaemon| {
+            let hash = hash.clone();
+            async move {
+                let state = std::sync::Arc::new(AppState {
+                    chain: daemon.source(),
+                    limits: crate::config::Limits::default(),
+                    paths: crate::tree_paths::PathCache::default(),
+                    recent: Default::default(),
+                    rows: Default::default(),
+                });
+                transaction(State(state), Path(hash)).await.1
+            }
+        };
+        let without = page(daemon(false)).await;
+        assert!(
+            without.contains("the members' ages are unknown"),
+            "{without}"
+        );
+        assert!(!without.contains("class=\"ring-ages\""));
+        let with = page(daemon(true)).await;
+        assert!(with.contains("class=\"ring-ages\""), "{with}");
+        assert!(with.contains("<title>431 blocks old</title>"), "{with}");
     }
 
     /// The hints are plain markup: no script, no external reference, and they
@@ -4239,7 +4389,7 @@ mod tests {
                         public_key: "2".repeat(64),
                         tx_hash: "3".repeat(64),
                     }],
-                    ages: age_strip(&[], clock(0), 0),
+                    ages: Some(age_strip(&[], clock(0), 0)),
                 },
                 InputView {
                     key_image: "4".repeat(64),
@@ -4247,7 +4397,7 @@ mod tests {
                     size: 16,
                     unavailable: false,
                     ring: Vec::new(),
-                    ages: age_strip(&[], clock(0), 0),
+                    ages: Some(age_strip(&[], clock(0), 0)),
                 },
             ],
             outputs: vec![
@@ -4826,12 +4976,24 @@ mod tests {
         assert_eq!(map[0].label, "Input 1's disguised output, 96 bytes");
         assert_eq!(map[3].label, "Input 2's signature, 384 bytes");
 
-        // Every part of a 128-input proof still gets a visible sliver.
+        // A 128-input proof draws each kind once, to scale, rather than 258
+        // slivers widened off it.
         let wide = proof_map(128, 200_000);
-        assert_eq!(wide.len(), 258);
-        assert!(wide.iter().all(|g| g.width >= 1), "no part vanishes");
+        let kinds: Vec<_> = wide.iter().map(|g| g.class).collect();
+        assert_eq!(kinds, ["tuple", "sal", "member", "anchor"]);
+        assert_eq!(wide[0].label, "128 disguised outputs, 12,288 bytes");
+        assert_eq!(wide[1].label, "128 signatures, 49,152 bytes");
+        assert_eq!(wide[2].label, "The membership proof, 199,936 bytes");
+        let total = 128.0 * 480.0 + 200_000.0;
+        for (g, bytes) in wide.iter().zip([12_288.0, 49_152.0, 199_936.0]) {
+            let share = f64::from(g.width + 2) / f64::from(MAP_WIDTH);
+            assert!((share - bytes / total).abs() < 0.015, "{}", g.label);
+        }
         let end = wide.last().expect("an anchor");
         assert_eq!(end.x + end.width + 1, MAP_WIDTH);
+
+        // Short of that, every part is drawn on its own.
+        assert_eq!(proof_map(4, 5_568).len(), 10);
     }
 
     /// The proof's shape, the tree, the root's curve and the bar all come

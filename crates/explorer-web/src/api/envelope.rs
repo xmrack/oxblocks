@@ -74,6 +74,24 @@ impl ApiError {
         Self::new(Outcome::Error, StatusCode::SERVICE_UNAVAILABLE, message)
     }
 
+    /// Answers 503: the explorer is holding as much as it may and the
+    /// request waited too long for its turn. Asking again later can succeed.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::new(Outcome::Error, StatusCode::SERVICE_UNAVAILABLE, message)
+    }
+
+    /// An answer of `status` that no handler wrote, such as a timeout: `fail`
+    /// for a 4xx and `error` otherwise.
+    pub fn of_status(status: StatusCode) -> Self {
+        let outcome = if status.is_client_error() {
+            Outcome::Fail
+        } else {
+            Outcome::Error
+        };
+        let message = status.canonical_reason().unwrap_or("error").to_owned();
+        Self::new(outcome, status, message)
+    }
+
     /// Answers 500: our own bug.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(Outcome::Error, StatusCode::INTERNAL_SERVER_ERROR, message)
@@ -121,6 +139,14 @@ impl ApiError {
 
 #[derive(Debug, Clone)]
 pub struct ApiOk<T>(pub T);
+
+/// Whether `response` is one this API wrote, rather than one a layer around
+/// it did.
+pub fn is_enveloped(response: &Response) -> bool {
+    response
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+}
 
 /// Headers on every JSON response.
 fn api_headers() -> [(HeaderName, HeaderValue); 3] {

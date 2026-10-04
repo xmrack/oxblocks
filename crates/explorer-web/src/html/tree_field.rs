@@ -784,7 +784,7 @@ fn labels(l: &Layout, f: &Frame, about: &About<'_>) -> Vec<RowLabel> {
             } else {
                 let size = l.size(lv);
                 let nodes = format!("{} node{}", grouped(size), plural(size));
-                let groups = format!("groups of {}", children(lv));
+                let groups = format!("{} under each", children(lv));
                 if wide {
                     texts.push(("sub", format!("{nodes} · {groups}"), None));
                 } else if lv < l.low {
@@ -946,7 +946,7 @@ fn aria(l: &Layout, as_of: Option<u64>, root_block: Option<u64>) -> String {
     for lv in 1..l.top {
         let size = l.size(lv);
         s.push_str(&format!(
-            "; layer {lv}, {}, {} node{} in groups of {}",
+            "; layer {lv}, {}, {} node{} with {} under each",
             Curve::of_layer(lv).name(),
             grouped(size),
             plural(size),
@@ -1007,8 +1007,8 @@ mod tests {
         assert_eq!(subpaths(path(&wide.nodes, "tf-dot")), 39);
         assert_eq!(subpaths(path(&wide.nodes, "tf-ringnode")), 3);
 
-        assert_eq!(lines(label(&wide, "Layer 1")), ["39 nodes · groups of 38"]);
-        assert_eq!(lines(label(&wide, "Layer 2")), ["3 nodes · groups of 18"]);
+        assert_eq!(lines(label(&wide, "Layer 1")), ["39 nodes · 38 under each"]);
+        assert_eq!(lines(label(&wide, "Layer 2")), ["3 nodes · 18 under each"]);
         let root = label(&wide, "Root");
         assert_eq!(root.aside.as_deref(), Some("Selene"));
         assert_eq!(
@@ -1032,7 +1032,7 @@ mod tests {
         assert_eq!(notes, [("38 each", None), ("last ", Some("30"))]);
         assert!(
             wide.aria
-                .contains("layer 1, Selene, 39 nodes in groups of 38")
+                .contains("layer 1, Selene, 39 nodes with 38 under each")
         );
 
         // The narrow picture draws the wide one's strokes again, and says
@@ -1040,7 +1040,7 @@ mod tests {
         assert!(narrow.art.is_empty() && narrow.reuse.is_some());
         assert_eq!(
             lines(label(&narrow, "Layer 1")),
-            ["Selene", "39 nodes", "groups of 38"]
+            ["Selene", "39 nodes", "38 under each"]
         );
     }
 
@@ -1088,7 +1088,7 @@ mod tests {
         );
         assert_eq!(
             lines(label(&wide, "Layer 1")),
-            ["4,899,428 nodes · groups of 38"]
+            ["4,899,428 nodes · 38 under each"]
         );
         let m = &wide.measures[0];
         assert_eq!(

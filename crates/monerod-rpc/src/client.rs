@@ -98,9 +98,19 @@ pub struct ClientBuilder {
     timeout: Duration,
     max_response_bytes: u64,
     user_agent: Option<String>,
+    pinned: Option<[u8; 32]>,
 }
 
 impl ClientBuilder {
+    /// Trust the daemon's certificate whose SHA-256 is `sha256`, and no
+    /// other, in place of the public CAs: monerod serves one it signed
+    /// itself.
+    #[cfg(feature = "tls")]
+    pub const fn pinned_certificate(mut self, sha256: [u8; 32]) -> Self {
+        self.pinned = Some(sha256);
+        self
+    }
+
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -123,10 +133,7 @@ impl ClientBuilder {
 
         let user_agent = self
             .user_agent
-            .map(|ua| {
-                HeaderValue::from_str(&ua)
-                    .map_err(|e| RpcError::BadUrl(ua.clone(), format!("bad user agent: {e}")))
-            })
+            .map(|ua| HeaderValue::from_str(&ua).map_err(|e| RpcError::BadUserAgent(e.to_string())))
             .transpose()?;
 
         // Nothing here follows redirects: hyper's client does not, and there
@@ -135,7 +142,7 @@ impl ClientBuilder {
         // misconfiguration, a compromised daemon -- therefore cannot point it
         // at a host the operator never named.
         Ok(Client {
-            http: HyperClient::builder(TokioExecutor::new()).build(connector()),
+            http: HyperClient::builder(TokioExecutor::new()).build(connector(self.pinned)?),
             base,
             timeout: self.timeout,
             max_response_bytes: self.max_response_bytes,
@@ -151,6 +158,7 @@ impl Client {
             timeout: DEFAULT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             user_agent: None,
+            pinned: None,
         }
     }
 
@@ -371,10 +379,7 @@ impl Client {
             )
             .await?;
         let reply: Reply<'_> =
-            serde_json::from_slice(&bytes).map_err(|source| RpcError::Decode {
-                context: method,
-                source,
-            })?;
+            serde_json::from_slice(&bytes).map_err(|e| RpcError::decode(method, &e))?;
 
         if let Some(error) = reply.error {
             let fault: Fault = serde_json::from_str(error.get()).unwrap_or_default();
@@ -397,10 +402,7 @@ impl Client {
         // still a failure.
         Self::check_status(result.get().as_bytes(), method)?;
 
-        serde_json::from_str(result.get()).map_err(|source| RpcError::Decode {
-            context: method,
-            source,
-        })
+        serde_json::from_str(result.get()).map_err(|e| RpcError::decode(method, &e))
     }
 
     /// Call one of the bare (non-JSON-RPC) endpoints, e.g. `/get_transactions`.
@@ -413,10 +415,7 @@ impl Client {
     {
         let bytes = self.post(endpoint, endpoint, body).await?;
         Self::check_status(&bytes, endpoint)?;
-        serde_json::from_slice(&bytes).map_err(|source| RpcError::Decode {
-            context: endpoint,
-            source,
-        })
+        serde_json::from_slice(&bytes).map_err(|e| RpcError::decode(endpoint, &e))
     }
 
     /// Call a binary endpoint, e.g. `/get_path_by_unified_id.bin`, and return
@@ -517,19 +516,90 @@ impl Client {
 /// deployment is a loopback daemon over plain HTTP, and requiring TLS there
 /// would break it. The scheme in the configured URL decides.
 #[cfg(feature = "tls")]
-fn connector() -> Connector {
+fn connector(pinned: Option<[u8; 32]>) -> Result<Connector, RpcError> {
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
     http.enforce_http(false);
-    hyper_rustls::HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .wrap_connector(http)
+    let builder = hyper_rustls::HttpsConnectorBuilder::new();
+    let builder = match pinned {
+        Some(sha256) => builder.with_tls_config(pinned_config(sha256)?),
+        None => builder.with_webpki_roots(),
+    };
+    Ok(builder.https_or_http().enable_http1().wrap_connector(http))
 }
 
 #[cfg(not(feature = "tls"))]
-fn connector() -> Connector {
-    hyper_util::client::legacy::connect::HttpConnector::new()
+#[allow(clippy::unnecessary_wraps, reason = "the same signature as with TLS")]
+fn connector(_pinned: Option<[u8; 32]>) -> Result<Connector, RpcError> {
+    Ok(hyper_util::client::legacy::connect::HttpConnector::new())
+}
+
+/// A TLS client trusting the one certificate whose SHA-256 is `sha256`.
+#[cfg(feature = "tls")]
+fn pinned_config(sha256: [u8; 32]) -> Result<rustls::ClientConfig, RpcError> {
+    use std::sync::Arc;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(Pinned {
+        sha256,
+        algorithms: provider.signature_verification_algorithms,
+    });
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| RpcError::Tls(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
+/// Accepts the server's certificate when it is the pinned one, whatever its
+/// name or issuer, and checks the handshake was signed with its key.
+#[cfg(feature = "tls")]
+#[derive(Debug)]
+struct Pinned {
+    sha256: [u8; 32],
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+#[cfg(feature = "tls")]
+impl rustls::client::danger::ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let seen = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+        if seen.as_ref() == self.sha256 {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "the daemon's certificate is not the pinned one".to_owned(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
 }
 
 #[cfg(test)]
@@ -544,6 +614,36 @@ mod tests {
     )]
 
     use super::*;
+
+    /// The pinned certificate is accepted whatever its name, and any other
+    /// refused.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn only_the_pinned_certificate_is_trusted() {
+        use rustls::client::danger::ServerCertVerifier as _;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let cert = CertificateDer::from(b"a certificate".to_vec());
+        let other = CertificateDer::from(b"another".to_vec());
+        let digest = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
+        let pin: [u8; 32] = digest.as_ref().try_into().unwrap();
+        let pinned = Pinned {
+            sha256: pin,
+            algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        };
+        let name = ServerName::try_from("node.example").unwrap();
+        let check =
+            |c: &CertificateDer<'_>| pinned.verify_server_cert(c, &[], &name, &[], UnixTime::now());
+        assert!(check(&cert).is_ok());
+        assert!(check(&other).is_err());
+        assert!(pinned_config(pin).is_ok());
+        assert!(
+            Client::builder("https://node.example:18081")
+                .pinned_certificate(pin)
+                .build()
+                .is_ok()
+        );
+    }
 
     /// A one-shot loopback server that cannot outlive the test.
     ///

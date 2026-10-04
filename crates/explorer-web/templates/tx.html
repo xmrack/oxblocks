@@ -36,8 +36,10 @@
     number names the RingCT scheme that hid them. Types 1 and 2 are the
     original scheme, types 3 and 4 replaced its range proofs with
     Bulletproofs, type 5 added CLSAG signatures, and type 6 uses
-    Bulletproofs+. Up to type 6, each is smaller and faster to verify than the
-    one before it, and none of them is more private. Type 7 is FCMP++. It
+    Bulletproofs+. Type 1 signs a transaction's inputs together and type 2
+    signs each on its own, and both were in use at once. From type 3 to
+    type 6, each is smaller and faster to verify than the one before it.
+    None of them is more private than another. Type 7 is FCMP++. It
     keeps RingCT's hidden amounts and Bulletproofs+, and replaces the ring
     signature with a proof that each input spends one of the outputs in a
     tree of every spendable output, so it is the first of these to widen the
@@ -81,8 +83,8 @@
     transaction that chose its own would stand out. It was 11, and has been
     16 since August 2022, except when spending an old public amount too rare
     to find decoys for. Before that the sender chose it, above a minimum
-    that rose over time, and before RingCT one input's ring could be larger
-    than another's. The earliest
+    that rose over time, and until November 2019 one input's ring could be
+    larger than another's. The earliest
     transactions often used a ring of one, which has no decoys and shows the
     output spent. A coinbase creates coins instead of spending them, so it
     has no ring.</p></details>
@@ -174,7 +176,12 @@
       <p class="empty indented">
         This input has no decoys, so the output below is the one it spent.
       </p>
+      {% else if i.ages.is_none() %}
+      <p class="empty indented">
+        This node could not read the chain's height, so the members' ages are unknown.
+      </p>
       {% else %}
+      {% if let Some(ages) = i.ages %}
       <figure class="ring-ages">
         <figcaption>Ring member ages
           <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
@@ -191,15 +198,16 @@
         <svg class="strip" viewBox="0 0 {{ crate::html::STRIP_WIDTH }} {{ crate::html::STRIP_HEIGHT }}"
              role="img" aria-label="Ring member ages, oldest at the left and this transaction at the right">
           <rect class="track" x="0" y="0" rx="3" width="{{ crate::html::STRIP_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"/>
-          {% for t in i.ages.ticks %}<line class="grid" x1="{{ t.x }}" y1="0" x2="{{ t.x }}" y2="{{ crate::html::STRIP_BAND }}"/>{% endfor %}
-          {% for m in i.ages.marks %}<rect class="halo" x="{{ m.halo }}" y="0" rx="2" width="{{ crate::html::HALO_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"><title>{{ m.label }} old</title></rect>{% endfor %}
-          {% for m in i.ages.marks %}<rect class="stem" x="{{ m.stem }}" y="0" width="{{ crate::html::STEM_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"/>{% endfor %}
+          {% for t in ages.ticks %}<line class="grid" x1="{{ t.x }}" y1="0" x2="{{ t.x }}" y2="{{ crate::html::STRIP_BAND }}"/>{% endfor %}
+          {% for m in ages.marks %}<rect class="halo" x="{{ m.halo }}" y="0" rx="2" width="{{ crate::html::HALO_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"><title>{{ m.label }} old</title></rect>{% endfor %}
+          {% for m in ages.marks %}<rect class="stem" x="{{ m.stem }}" y="0" width="{{ crate::html::STEM_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"/>{% endfor %}
           <rect class="frame" x="0" y="0" rx="3" width="{{ crate::html::STRIP_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"/>
-          {% for t in i.ages.ticks %}<text class="tick" x="{{ t.x }}" y="{{ crate::html::TICK_BASELINE }}" text-anchor="middle">{{ t.label }}</text>{% endfor %}
+          {% for t in ages.ticks %}<text class="tick" x="{{ t.x }}" y="{{ crate::html::TICK_BASELINE }}" text-anchor="middle">{{ t.label }}</text>{% endfor %}
           <text class="tick edge" x="{{ crate::html::STRIP_WIDTH }}" y="{{ crate::html::TICK_BASELINE }}" text-anchor="end">this tx</text>
         </svg>
         </div>
       </figure>
+      {% endif %}
       {% endif %}
       <div class="scroll">
       <table>

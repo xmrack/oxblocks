@@ -31,10 +31,12 @@ pub struct AppState {
 /// the pool it was built from.
 ///
 /// Every caller asks for the same window, so the answer is the same for all
-/// of them until a block arrives or the pool is fetched again: the tip's hash
-/// names the window and the chain below it, and the pool is the very
-/// snapshot, compared by identity and held so that its address cannot be
-/// reused. Built by one caller at a time.
+/// of them until a block arrives or the pool changes: the tip's hash names
+/// the window and the chain below it, and the pool is named by what the
+/// answer reads of it, each transaction's hash and arrival in order. Built by
+/// one caller at a time, and a caller that waited for another's build takes
+/// that answer, whatever arrived meanwhile, so a wave of callers costs one
+/// build however long it takes.
 #[derive(Default)]
 pub struct RecentAnswer {
     kept: std::sync::Mutex<Option<KeptRecent>>,
@@ -43,30 +45,53 @@ pub struct RecentAnswer {
 
 struct KeptRecent {
     tip: String,
-    pool: Arc<monerod_rpc::types::GetTransactionPool>,
+    pool: Vec<(String, u64)>,
+    built: u64,
     body: axum::body::Bytes,
 }
 
+/// What a recent answer reads of `pool`, in order.
+fn pool_key(pool: &monerod_rpc::types::GetTransactionPool) -> Vec<(String, u64)> {
+    pool.transactions
+        .iter()
+        .map(|t| (t.id_hash.clone(), t.receive_time))
+        .collect()
+}
+
 impl RecentAnswer {
-    fn get(
-        &self,
-        tip: &str,
-        pool: &Arc<monerod_rpc::types::GetTransactionPool>,
-    ) -> Option<axum::body::Bytes> {
+    fn get(&self, tip: &str, pool: &[(String, u64)]) -> Option<axum::body::Bytes> {
         let kept = self.kept.lock().ok()?;
         kept.as_ref()
-            .filter(|k| k.tip == tip && Arc::ptr_eq(&k.pool, pool))
+            .filter(|k| k.tip == tip && k.pool == pool)
             .map(|k| k.body.clone())
     }
 
-    fn keep(
-        &self,
-        tip: String,
-        pool: Arc<monerod_rpc::types::GetTransactionPool>,
-        body: axum::body::Bytes,
-    ) {
+    /// How many answers have been built, to tell one built since.
+    fn built(&self) -> u64 {
+        self.kept
+            .lock()
+            .ok()
+            .and_then(|k| k.as_ref().map(|k| k.built))
+            .unwrap_or(0)
+    }
+
+    /// The answer built after the `since`th, if there is one.
+    fn since(&self, since: u64) -> Option<axum::body::Bytes> {
+        let kept = self.kept.lock().ok()?;
+        kept.as_ref()
+            .filter(|k| k.built > since)
+            .map(|k| k.body.clone())
+    }
+
+    fn keep(&self, tip: String, pool: Vec<(String, u64)>, body: axum::body::Bytes) {
         if let Ok(mut kept) = self.kept.lock() {
-            *kept = Some(KeptRecent { tip, pool, body });
+            let built = kept.as_ref().map_or(0, |k| k.built).saturating_add(1);
+            *kept = Some(KeptRecent {
+                tip,
+                pool,
+                built,
+                body,
+            });
         }
     }
 }
@@ -93,15 +118,20 @@ pub fn echo(arg: &str) -> String {
 
 /// Map a chain failure onto an answer.
 ///
-/// Not found is the caller's, anything else is ours or the daemon's.
+/// Not found and a range too large are the caller's; a full budget is ours,
+/// for now; anything else is ours or the daemon's.
 fn on_chain_error(e: &ChainError, what: &str) -> ApiError {
-    if e.is_not_found() {
-        ApiError::not_found(what.to_owned())
-    } else {
-        // The operator gets the detail; the client does not. See
-        // ChainError::public_message.
-        tracing::warn!("{what}: {e}");
-        ApiError::daemon(e.public_message())
+    match e {
+        _ if e.is_not_found() => ApiError::not_found(what.to_owned()),
+        ChainError::RangeTooLarge { .. } => ApiError::bad_request(e.public_message()),
+        ChainError::Busy(_) => ApiError::busy(e.public_message()),
+        ChainError::NeedsUnrestricted(_) => ApiError::unsupported(e.public_message()),
+        _ => {
+            // The operator gets the detail; the client does not. See
+            // ChainError::public_message.
+            tracing::warn!("{what}: {e}");
+            ApiError::daemon(e.public_message())
+        }
     }
 }
 
@@ -183,9 +213,8 @@ pub async fn transaction(
     let entry = &entry;
     let tx = decode_tx(&hash, entry)?;
 
-    // One /get_outs per input. Never batched across the transaction: monerod
-    // fails the whole request if any single index is out of range, which would
-    // let one bad input blank every ring on the page.
+    // One /get_outs for the transaction, and one per input where monerod
+    // refuses that, so one bad input cannot blank every ring on the page.
     let rings = state.chain.resolve_rings(&tx).await;
 
     // A confirmed transaction already carries its confirmation count, so the
@@ -499,18 +528,17 @@ pub async fn fee_estimate(
     State(state): Shared,
     ApiQuery(q): ApiQuery<GraceQuery>,
 ) -> Result<ApiOk<FeeData>, ApiError> {
-    // The parameter is honoured only when it is all digits and at most
-    // MAX_GRACE_BLOCKS. Anything else takes the window wallets use, because
-    // this one is a query hint rather than the subject of the request.
-    let asked = q
-        .grace_blocks
-        .as_deref()
-        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&g| g <= monerod_rpc::types::MAX_GRACE_BLOCKS);
-    let grace_blocks = match asked {
-        Some(g) => g,
+    // Absent, it is the window wallets use. A value that is not a number of
+    // at most MAX_GRACE_BLOCKS is refused, as every argument here is.
+    let most = monerod_rpc::types::MAX_GRACE_BLOCKS;
+    let grace_blocks = match q.grace_blocks.as_deref() {
         None => wallet_grace_blocks(tip_hard_fork(&state).await),
+        Some(text) => decimal(text).filter(|&g| g <= most).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "grace_blocks is not a number of at most {most}: {}",
+                echo(text)
+            ))
+        })?,
     };
 
     let estimate = state
@@ -657,11 +685,17 @@ pub async fn transactions(
             .await
             .map_err(|e| {
                 let partial = serde_json::json!({ "blocks": [] });
-                if e.is_not_found() {
-                    ApiError::not_found(format!("Cant get block: {start}"))
-                } else {
-                    tracing::warn!("blocks {start} to {end}: {e}");
-                    ApiError::daemon(format!("Cant get transactions in block: {start}"))
+                match e {
+                    _ if e.is_not_found() => {
+                        ApiError::not_found(format!("Cant get block: {start}"))
+                    }
+                    ChainError::RangeTooLarge { .. } | ChainError::Busy(_) => {
+                        on_chain_error(&e, "")
+                    }
+                    _ => {
+                        tracing::warn!("blocks {start} to {end}: {e}");
+                        ApiError::daemon(format!("Cant get transactions in block: {start}"))
+                    }
                 }
                 .with_partial(partial)
             })?;
@@ -1385,30 +1419,39 @@ pub async fn transactions_recent(
             .info()
             .await
             .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
-        Ok::<_, ApiError>((info, state.chain.mempool().await.ok()))
-    };
-    let kept = |info: &monerod_rpc::types::GetInfo, pool: &Option<Arc<_>>| {
-        pool.as_ref()
-            .and_then(|p| state.recent.get(&info.top_block_hash, p))
-            .map(super::envelope::ok_response)
+        let pool = state.chain.mempool().await.map_err(|e| match e {
+            ChainError::NeedsUnrestricted(what) => ApiError::unsupported(format!(
+                "{what} needs an unrestricted daemon; this one blocks /get_transaction_pool"
+            )),
+            other => on_chain_error(&other, "Cant get the mempool"),
+        })?;
+        Ok::<_, ApiError>((info, pool))
     };
 
     let (info, pool) = tip_and_pool().await?;
-    if let Some(answer) = kept(&info, &pool) {
-        return Ok(answer);
+    if let Some(answer) = state.recent.get(&info.top_block_hash, &pool_key(&pool)) {
+        return Ok(super::envelope::ok_response(answer));
     }
+    let before = state.recent.built();
     let _turn = state.recent.turn.lock().await;
+    if let Some(answer) = state.recent.since(before) {
+        return Ok(super::envelope::ok_response(answer));
+    }
     let (info, pool) = tip_and_pool().await?;
-    if let Some(answer) = kept(&info, &pool) {
-        return Ok(answer);
+    let key = pool_key(&pool);
+    if let Some(answer) = state.recent.get(&info.top_block_hash, &key) {
+        return Ok(super::envelope::ok_response(answer));
     }
 
     let (from_height, to_height) = recent_window(info.height, state.limits.recent_blocks);
+    // Blocks too large to fetch together cost the window its oldest, rather
+    // than the answer: a caller cannot ask for a narrower one.
     let window = state
         .chain
-        .blocks_in_range(from_height, to_height, false)
+        .newest_in_range(from_height, to_height, false)
         .await
         .map_err(|e| on_chain_error(&e, "Cant get recent blocks"))?;
+    let from_height = window.first().map_or(from_height, |b| b.header.height);
 
     // The pool is listed first: those are more recent than any mined
     // transaction, and a caller reaching for this endpoint is reaching for a
@@ -1416,7 +1459,7 @@ pub async fn transactions_recent(
     // `txs` would name a set and then withhold it.
     let mut txs = Vec::new();
     let mut mempool_txs_no = 0;
-    for entry in pool.iter().flat_map(|p| p.transactions.iter()) {
+    for entry in &pool.transactions {
         let Ok(tx) = entry.parse_json() else { continue };
         let inputs = unexpanded_inputs(&tx);
         txs.push(TxDetail::build_pool(entry, &tx, &inputs, info.height));
@@ -1434,12 +1477,9 @@ pub async fn transactions_recent(
         to_height,
         txs,
     })?;
-    // A pool that could not be had is answered as empty, and not kept.
-    if let Some(pool) = pool {
-        state
-            .recent
-            .keep(info.top_block_hash.clone(), pool, body.clone());
-    }
+    state
+        .recent
+        .keep(info.top_block_hash.clone(), key, body.clone());
     Ok(super::envelope::ok_response(body))
 }
 
@@ -1715,10 +1755,12 @@ mod tests {
         })
     }
 
-    /// A daemon whose chain is block 0 alone, a coinbase, with the tip hash
-    /// `tip` holds, and an empty pool.
+    /// A daemon whose chain is block 0 alone, a coinbase, `size` bytes, with
+    /// the tip hash `tip` holds, and an empty pool, or one it fails to send.
     fn recent_daemon(
         tip: Arc<std::sync::atomic::AtomicU64>,
+        pool: bool,
+        size: u64,
     ) -> explorer_core::fake_daemon::FakeDaemon {
         let coinbase = "aa".repeat(32);
         explorer_core::fake_daemon::FakeDaemon::start(move |what, _| {
@@ -1729,7 +1771,7 @@ mod tests {
                 "hash": format!("{tip:064x}"), "difficulty": 1, "difficulty_top64": 0,
                 "wide_difficulty": "0x1", "cumulative_difficulty": 1,
                 "cumulative_difficulty_top64": 0, "wide_cumulative_difficulty": "0x1",
-                "reward": 1, "block_size": 1, "num_txes": 0, "pow_hash": "",
+                "reward": 1, "block_size": size, "num_txes": 0, "pow_hash": "",
                 "miner_tx_hash": coinbase,
             });
             let ok = |r: serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": r});
@@ -1753,7 +1795,9 @@ mod tests {
                     "block_height": 0, "block_timestamp": 0, "confirmations": 1, "in_pool": false,
                     "double_spend_seen": false, "output_indices": [],
                 }], "status": "OK"}),
-                "get_transaction_pool" => serde_json::json!({"transactions": [], "status": "OK"}),
+                "get_transaction_pool" if pool => {
+                    serde_json::json!({"transactions": [], "status": "OK"})
+                }
                 _ => serde_json::json!({"status": "Failed"}),
             }
         })
@@ -1770,7 +1814,7 @@ mod tests {
     #[tokio::test]
     async fn the_recent_answer_is_built_once_per_tip_and_pool() {
         let tip = Arc::new(std::sync::atomic::AtomicU64::new(1));
-        let daemon = recent_daemon(Arc::clone(&tip));
+        let daemon = recent_daemon(Arc::clone(&tip), true, 1);
         let state = state_on(&daemon);
         let together = tokio::join!(
             transactions_recent(state.clone()),
@@ -1812,28 +1856,127 @@ mod tests {
         );
     }
 
-    /// A pool is the very snapshot the answer was built from, not one that
-    /// reads the same, and the tip is its hash.
+    /// A range too large is the caller's to narrow, a full budget is ours
+    /// for a moment, and a daemon without the call is this deployment's.
+    #[test]
+    fn chain_failures_are_answered_by_whose_they_are() {
+        let status = |e: ChainError| on_chain_error(&e, "x").status;
+        let large = ChainError::RangeTooLarge {
+            start: 1,
+            end: 2,
+            kib: 3,
+        };
+        assert_eq!(status(large), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status(ChainError::Busy("ranges")),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(ChainError::NeedsUnrestricted("the mempool")),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(ChainError::Unavailable("down".to_owned())),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status(ChainError::BlockNotFound(BlockId::Height(9))),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            on_chain_error(&ChainError::Busy("ranges"), "x").outcome,
+            super::super::envelope::Outcome::Error
+        );
+    }
+
+    /// A pool that cannot be had fails the answer rather than reading as
+    /// empty.
+    #[tokio::test]
+    async fn the_recent_answer_needs_the_pool() {
+        let tip = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let daemon = recent_daemon(tip, false, 1);
+        let err = transactions_recent(state_on(&daemon)).await.err().unwrap();
+        assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(daemon.count("get_block_headers_range"), 0);
+    }
+
+    /// A window too large to fetch together is served from its newest block.
+    #[tokio::test]
+    async fn a_recent_window_too_large_is_served_from_its_newest() {
+        let tip = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let huge = (explorer_core::rpc_source::MAX_RANGE_KIB + 1) << 10;
+        let daemon = recent_daemon(tip, true, huge);
+        let answer = transactions_recent(state_on(&daemon)).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_of(answer).await).unwrap();
+        assert_eq!(body["data"]["from_height"], 0);
+        assert_eq!(body["data"]["txs"].as_array().unwrap().len(), 1);
+    }
+
+    /// A caller that waited while another built takes that answer rather
+    /// than build again.
+    #[tokio::test]
+    async fn a_caller_that_waited_takes_the_answer_built_meanwhile() {
+        let tip = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let daemon = recent_daemon(tip, true, 1);
+        let state = state_on(&daemon);
+        let turn = state.recent.turn.lock().await;
+        let waiting = tokio::spawn(transactions_recent(state.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        state.recent.keep(
+            "another tip".to_owned(),
+            Vec::new(),
+            axum::body::Bytes::from_static(b"built meanwhile"),
+        );
+        drop(turn);
+        let answer = body_of(waiting.await.unwrap().unwrap()).await;
+        assert_eq!(&answer[..], b"built meanwhile");
+        assert_eq!(daemon.count("get_block_headers_range"), 0);
+    }
+
+    /// What a recent answer reads of the pool: each hash and arrival, in
+    /// order.
+    #[test]
+    fn a_pool_is_named_by_its_hashes_and_arrivals() {
+        let tx = |h: &str, t: u64| {
+            serde_json::json!({
+                "id_hash": h, "blob_size": 1, "fee": 1, "max_used_block_id_hash": "",
+                "max_used_block_height": 0, "kept_by_block": false, "last_failed_height": 0,
+                "last_failed_id_hash": "", "receive_time": t, "relayed": true,
+                "last_relayed_time": 0, "do_not_relay": false, "double_spend_seen": false,
+                "tx_blob": "",
+            })
+        };
+        let pool: monerod_rpc::types::GetTransactionPool = serde_json::from_value(
+            serde_json::json!({"status": "OK", "transactions": [tx("a", 5), tx("b", 7)]}),
+        )
+        .unwrap();
+        assert_eq!(pool_key(&pool), [("a".to_owned(), 5), ("b".to_owned(), 7)]);
+    }
+
+    /// A kept answer is for its own tip and for a pool holding the same
+    /// transactions, arrived at the same times, in the same order; and one
+    /// built since a caller arrived is that caller's.
     #[test]
     fn a_kept_recent_answer_is_for_its_own_tip_and_pool() {
-        let pool = || {
-            Arc::new(
-                serde_json::from_value::<monerod_rpc::types::GetTransactionPool>(
-                    serde_json::json!({"status": "OK"}),
-                )
-                .unwrap(),
-            )
-        };
-        let (a, b) = (pool(), pool());
+        let tx = |h: &str, t: u64| (h.to_owned(), t);
         let recent = RecentAnswer::default();
+        assert_eq!(recent.built(), 0);
         recent.keep(
             "t".to_owned(),
-            Arc::clone(&a),
+            vec![tx("a", 1), tx("b", 2)],
             axum::body::Bytes::from_static(b"x"),
         );
-        assert!(recent.get("t", &a).is_some());
-        assert!(recent.get("t", &b).is_none());
-        assert!(recent.get("u", &a).is_none());
+        assert!(recent.get("t", &[tx("a", 1), tx("b", 2)]).is_some());
+        assert!(recent.get("t", &[tx("b", 2), tx("a", 1)]).is_none());
+        assert!(recent.get("t", &[tx("a", 1), tx("b", 3)]).is_none());
+        assert!(recent.get("t", &[tx("a", 1)]).is_none());
+        assert!(recent.get("u", &[tx("a", 1), tx("b", 2)]).is_none());
+
+        let before = recent.built();
+        assert!(recent.since(before).is_none());
+        recent.keep("u".to_owned(), vec![], axum::body::Bytes::from_static(b"y"));
+        assert_eq!(recent.since(before).as_deref(), Some(&b"y"[..]));
+        assert!(recent.since(recent.built()).is_none());
     }
 
     /// A private lookup holds the range budget in proportion to what it
@@ -1920,17 +2063,23 @@ mod tests {
             })
         };
         let daemon = fee_daemon(17);
-        for g in ["18446744073709551615", "1001", "", "x"] {
-            let ApiOk(fee) = fee_estimate(state_on(&daemon), asking(g)).await.unwrap();
-            assert_eq!((fee.fee, fee.grace_blocks), (20_000, 1000), "{g:?}");
+        for g in ["18446744073709551615", "1001", "", "x", "-1", "+7"] {
+            let err = fee_estimate(state_on(&daemon), asking(g))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{g:?}");
         }
         let ApiOk(fee) = fee_estimate(state_on(&daemon), asking("1000"))
             .await
             .unwrap();
-        assert_eq!(fee.grace_blocks, 1000);
+        assert_eq!((fee.fee, fee.grace_blocks), (20_000, 1000));
         let ApiOk(fee) = fee_estimate(state_on(&daemon), asking("7")).await.unwrap();
         assert_eq!(fee.grace_blocks, 7);
-        assert_eq!(graces(&daemon), [1000, 1000, 1000, 1000, 1000, 7]);
+        let q = ApiQuery(GraceQuery { grace_blocks: None });
+        let ApiOk(fee) = fee_estimate(state_on(&daemon), q).await.unwrap();
+        assert_eq!(fee.grace_blocks, 1000);
+        assert_eq!(graces(&daemon), [1000, 7, 1000]);
 
         let before = fee_daemon(16);
         let q = ApiQuery(GraceQuery { grace_blocks: None });

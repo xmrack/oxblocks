@@ -1526,15 +1526,18 @@ pub enum NestedJsonError {
     /// error.
     #[error("monerod returned no decoded JSON for this object")]
     Absent,
+    /// The parser's reason, bounded and on one line, since it can quote the
+    /// document.
     #[error("monerod's decoded JSON did not parse: {0}")]
-    Malformed(#[from] serde_json::Error),
+    Malformed(String),
 }
 
 fn parse_nested_json<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T, NestedJsonError> {
     if raw.is_empty() {
         return Err(NestedJsonError::Absent);
     }
-    Ok(serde_json::from_str(raw)?)
+    serde_json::from_str(raw)
+        .map_err(|e| NestedJsonError::Malformed(crate::error::decode_detail(&e)))
 }
 
 /// A decoded transaction, total across every era of the chain: v1 pre-RingCT

@@ -67,7 +67,11 @@ fn diff(ours: &Value, theirs: &Value, path: &str, out: &mut Vec<String>) {
                     (None, Some(y)) => {
                         out.push(format!("{path}/{k}: missing from ours (xmrblocks {y})"));
                     }
-                    (Some(_), None) if k == "view_tag" => {}
+                    // A one-byte tag, as these pre-Carrot outputs carry.
+                    (Some(Value::String(t)), None)
+                        if k == "view_tag"
+                            && t.len() == 2
+                            && t.bytes().all(|b| b.is_ascii_hexdigit()) => {}
                     (Some(Value::Null), None) if FCMP_PP_KEYS.contains(&k.as_str()) => {}
                     (Some(x), None) => out.push(format!("{path}/{k}: extra in ours ({x})")),
                     (None, None) => unreachable!("key came from one of the two maps"),
@@ -256,38 +260,43 @@ fn a_captured_fcmp_pp_transaction_fills_the_fcmp_pp_keys() {
         ))
         .expect("serialises");
 
+        let (ids, tags, anchors): (&[u64], &[&str], &[&str]) = match entry.tx_hash.as_str() {
+            "c61a89a96da974dd4dfda3fc5098b9769ea3110dd6c55faeb9c117770c7a6a8e" => (
+                &[122, 123],
+                &["2dcfb0", "63bc5c"],
+                &[
+                    "ff912f8f997a8302c2f2e81db9ed4584",
+                    "4d8db2ee61f6a8eb341302b7aee4dc80",
+                ],
+            ),
+            "16152336142f941ddc6cc7c0df697ca1a393541d9661504c3b120996303c4949" => (
+                &[124, 125, 126, 127],
+                &["05483e", "eb5bd8", "5e5faf", "f802b0"],
+                &[
+                    "bd3d6a1ea09b614e0de1e80270a329aa",
+                    "ef983e3f234b840828f55832efbab2c9",
+                    "77b22255ca3cec609bba2c1c09e26fe8",
+                    "cdbcaf222121bf493b37d4526f0f63ea",
+                ],
+            ),
+            other => panic!("not in the capture: {other}"),
+        };
         assert_eq!(detail["reference_block"].as_u64(), Some(120));
+        assert_eq!(detail["n_tree_layers"].as_u64(), Some(2));
+        assert_eq!(detail["fcmp_pp_proof_size"].as_u64(), Some(6528));
+        let outputs = detail["outputs"].as_array().expect("outputs");
+        let field = |k: &str| -> Vec<Value> { outputs.iter().map(|o| o[k].clone()).collect() };
         assert_eq!(
-            detail["n_tree_layers"].as_u64(),
-            tx.n_tree_layers().map(u64::from)
+            field("unified_id"),
+            ids.iter().map(|&i| Value::from(i)).collect::<Vec<_>>()
         );
-        let proof = tx.rctsig_prunable.as_ref().and_then(|p| p.fcmp_pp_len());
         assert_eq!(
-            detail["fcmp_pp_proof_size"].as_u64(),
-            proof.map(|n| n as u64)
+            field("view_tag"),
+            tags.iter().map(|&t| Value::from(t)).collect::<Vec<_>>()
         );
-        let ids: Vec<u64> = detail["outputs"]
-            .as_array()
-            .expect("outputs")
-            .iter()
-            .map(|o| {
-                o["unified_id"]
-                    .as_u64()
-                    .expect("a confirmed output has one")
-            })
-            .collect();
-        assert_eq!(ids, entry.unified_ids);
-        for (out, vout) in detail["outputs"]
-            .as_array()
-            .expect("outputs")
-            .iter()
-            .zip(&tx.vout)
-        {
-            assert_eq!(out["view_tag"].as_str(), vout.target.view_tag());
-            assert_eq!(
-                out["encrypted_janus_anchor"].as_str(),
-                vout.target.encrypted_janus_anchor()
-            );
-        }
+        assert_eq!(
+            field("encrypted_janus_anchor"),
+            anchors.iter().map(|&a| Value::from(a)).collect::<Vec<_>>()
+        );
     }
 }

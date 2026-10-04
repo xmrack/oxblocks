@@ -99,7 +99,7 @@ fn router(config: &Config, state: Arc<AppState>) -> Router {
         .route("/search", get(html::search))
         .route("/static/style.css", get(html::stylesheet))
         .route("/health", get(health))
-        .fallback(html::not_found)
+        .fallback(not_found)
         .with_state(state)
         .route(
             "/robots.txt",
@@ -119,6 +119,7 @@ fn router(config: &Config, state: Arc<AppState>) -> Router {
             // Outermost of the middleware: a panic in a handler becomes a
             // 500 for that one request instead of killing the connection
             // task. This does not excuse panics -- it bounds them.
+            .layer(axum::middleware::from_fn(enveloped))
             .layer(CatchPanicLayer::new())
             .layer(
                 TraceLayer::new_for_http()
@@ -172,6 +173,41 @@ fn router(config: &Config, state: Arc<AppState>) -> Router {
     }
 
     app
+}
+
+/// Whether `path` is the JSON API's.
+fn is_api(path: &str) -> bool {
+    path.starts_with("/api/")
+}
+
+/// A path no route serves: the API's refusal under `/api/`, the page
+/// elsewhere.
+async fn not_found(
+    state: axum::extract::State<Arc<AppState>>,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    if is_api(uri.path()) {
+        api::envelope::ApiError::not_found("no such endpoint").into_response()
+    } else {
+        html::not_found(state).await.into_response()
+    }
+}
+
+/// An API answer the layers below wrote rather than a handler -- a timeout, a
+/// body over the limit, a panic, a method no route answers -- put in the
+/// envelope like any other.
+async fn enveloped(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let api = is_api(request.uri().path());
+    let response = next.run(request).await;
+    if !api || api::envelope::is_enveloped(&response) {
+        return response;
+    }
+    api::envelope::ApiError::of_status(response.status()).into_response()
 }
 
 /// The routes that never reach the daemon, served outside `--max-concurrent`
@@ -290,11 +326,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::try_new(&config.log)?)
         .init();
 
-    let node = monerod_rpc::Client::builder(&config.daemon_url)
+    let mut node = monerod_rpc::Client::builder(&config.daemon_url)
         .timeout(config.rpc_timeout())
         .max_response_bytes(config.max_response_bytes())
-        .user_agent(concat!("oxblocks/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+        .user_agent(concat!("oxblocks/", env!("CARGO_PKG_VERSION")));
+    if let Some(sha256) = config.daemon_cert_sha256 {
+        node = node.pinned_certificate(sha256);
+    }
+    let node = node.build()?;
 
     tracing::info!(daemon = %node.base_url(), "connecting to monerod");
 
@@ -818,5 +857,73 @@ mod tests {
             .expect("router responds");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Under `/api/`, an answer no endpoint wrote is in the envelope too: a
+    /// path naming no endpoint, a method none answers, a body over the
+    /// limit. Elsewhere the page or the bare status stands.
+    #[tokio::test]
+    async fn every_api_answer_is_enveloped() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let config = Config::parse_from(["oxblocks"]);
+        let ask = |method: &str, uri: &str, body: Vec<u8>| {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(axum::http::header::CONTENT_LENGTH, body.len())
+                .body(Body::from(body))
+                .unwrap();
+            router(&config, test_state()).oneshot(request)
+        };
+        let read = |r: axum::response::Response| async move {
+            let status = r.status();
+            let cors = r.headers().contains_key("access-control-allow-origin");
+            let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+            (status, cors, String::from_utf8_lossy(&body).into_owned())
+        };
+
+        let (status, cors, body) = read(ask("GET", "/api/nothing", vec![]).await.unwrap()).await;
+        assert_eq!((status, cors), (StatusCode::NOT_FOUND, true));
+        assert_eq!(
+            body,
+            r#"{"data":{"title":"no such endpoint"},"status":"fail"}"#
+        );
+        let (status, _, body) = read(ask("GET", "/api/block/", vec![]).await.unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains(r#""status":"fail""#), "{body}");
+
+        let (status, cors, body) = read(ask("POST", "/api/version", vec![]).await.unwrap()).await;
+        assert_eq!((status, cors), (StatusCode::METHOD_NOT_ALLOWED, true));
+        assert_eq!(
+            body,
+            r#"{"data":{"title":"Method Not Allowed"},"status":"fail"}"#
+        );
+
+        let over = vec![b'x'; config.max_body_bytes + 1];
+        let (status, cors, body) = read(ask("GET", "/api/version", over).await.unwrap()).await;
+        assert_eq!((status, cors), (StatusCode::PAYLOAD_TOO_LARGE, true));
+        assert!(body.contains(r#""status":"fail""#), "{body}");
+
+        let (status, cors, body) = read(ask("GET", "/nothing", vec![]).await.unwrap()).await;
+        assert_eq!((status, cors), (StatusCode::NOT_FOUND, false));
+        assert!(body.contains("<html"), "{body}");
+        let (status, cors, _) = read(ask("POST", "/mempool", vec![]).await.unwrap()).await;
+        assert_eq!((status, cors), (StatusCode::METHOD_NOT_ALLOWED, false));
+    }
+
+    /// A deadline passed is a 504 in the envelope under `/api/`, an `error`.
+    #[test]
+    fn an_answer_no_endpoint_wrote_takes_the_envelope_its_status_calls_for() {
+        let value = |s| api::envelope::ApiError::of_status(s);
+        let timeout = value(StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(timeout.outcome, api::envelope::Outcome::Error);
+        assert_eq!(timeout.message, "Gateway Timeout");
+        assert_eq!(
+            value(StatusCode::PAYLOAD_TOO_LARGE).outcome,
+            api::envelope::Outcome::Fail
+        );
     }
 }

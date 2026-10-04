@@ -55,8 +55,9 @@ listed below.</div>
   <dd>{% if outputs.as_str() == "0" %}No outputs yet{% else %}{{ outputs }} outputs, {{ added }} more than the block before{% endif %}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
     <p>How many outputs the tree under this block's root holds, and how many
-    it gained over the previous block's. An output joins the tree when it
-    unlocks: ten blocks after it is mined for most, sixty for a coinbase. Each
+    it gained over the previous block's. An output joins the tree in the
+    block nine after the one that mined it, 59 after for a coinbase, the last
+    block before it can be spent. Each
     one that joins adds to the anonymity set of every FCMP++ spend checked
     against this root or a later one.</p></details>
   </dd>

@@ -76,6 +76,13 @@ pub struct Config {
     )]
     pub daemon_url: String,
 
+    /// SHA-256 of the daemon's TLS certificate, in hex, colons allowed.
+    ///
+    /// For an `https://` daemon whose certificate no public CA signed, as
+    /// monerod's own is: that certificate is trusted, and no other.
+    #[arg(long, env = "OXBLOCKS_DAEMON_CERT_SHA256", value_parser = sha256_hex)]
+    pub daemon_cert_sha256: Option<[u8; 32]>,
+
     /// Address to listen on.
     #[arg(long, env = "OXBLOCKS_BIND", default_value = "127.0.0.1:8081")]
     pub bind: SocketAddr,
@@ -214,12 +221,32 @@ pub struct Config {
     pub log: String,
 }
 
+/// 32 bytes from 64 hex digits, optionally separated by colons.
+fn sha256_hex(text: &str) -> Result<[u8; 32], String> {
+    let digits: Vec<u8> = text.bytes().filter(|&b| b != b':').collect();
+    let bad = || format!("not a SHA-256 in hex: {text}");
+    if digits.len() != 64 {
+        return Err(bad());
+    }
+    let mut out = [0u8; 32];
+    for (byte, pair) in out.iter_mut().zip(digits.as_chunks::<2>().0) {
+        let pair = std::str::from_utf8(pair).map_err(|_| bad())?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|_| bad())?;
+    }
+    Ok(out)
+}
+
 impl Config {
     /// The configured bounds, or why they cannot be used.
     ///
     /// clap checks each one on its own. This is the pair that only makes sense
     /// together.
     pub fn limits(&self) -> Result<Limits, String> {
+        if self.daemon_cert_sha256.is_some() && !self.daemon_url.starts_with("https://") {
+            return Err("--daemon-cert-sha256 pins a certificate, which only an \
+                 https:// --daemon-url presents"
+                .to_owned());
+        }
         if self.postfix_min > self.postfix_max {
             return Err(format!(
                 "--postfix-min {} is above --postfix-max {}, which accepts no \
@@ -288,6 +315,33 @@ mod tests {
         for bad in ["0", "4097"] {
             assert!(Config::try_parse_from(["oxblocks", "--max-response-mib", bad]).is_err());
         }
+    }
+
+    /// A pin is 32 bytes of hex, as `openssl x509 -fingerprint -sha256`
+    /// prints it or bare, and only for a daemon reached over TLS.
+    #[test]
+    fn a_certificate_pin_is_a_sha256_for_an_https_daemon() {
+        let hex = "ab".repeat(32);
+        let colons = vec!["AB"; 32].join(":");
+        for pin in [&hex, &colons] {
+            let c = Config::parse_from([
+                "oxblocks",
+                "--daemon-url",
+                "https://node:18081",
+                "--daemon-cert-sha256",
+                pin,
+            ]);
+            assert_eq!(c.daemon_cert_sha256, Some([0xab; 32]));
+            assert!(c.limits().is_ok());
+        }
+        for bad in ["ab", &"zz".repeat(32), &"ab".repeat(33)] {
+            assert!(
+                Config::try_parse_from(["oxblocks", "--daemon-cert-sha256", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        let plain = Config::parse_from(["oxblocks", "--daemon-cert-sha256", &hex]);
+        assert!(plain.limits().is_err());
     }
 
     /// The request deadline must stay under the RPC deadline, or a client

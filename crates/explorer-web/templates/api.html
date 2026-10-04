@@ -34,11 +34,13 @@
 </p>
 
 <p>
-  <strong>Three answers are not enveloped</strong>, because the layers above
-  this API produce them. A request that outlives its deadline gets a bare
-  <code class="lit">504</code>. A request body over the limit gets a
-  <code class="lit">413</code>. A panic caught in a handler gets a
-  <code class="lit">500</code>.
+  That includes the answers no endpoint writes. A path under
+  <code class="lit">/api/</code> that names no endpoint gets a
+  <code class="lit">404</code>, and a method other than
+  <code class="lit">GET</code> gets a <code class="lit">405</code>. A request
+  that outlives its deadline gets a <code class="lit">504</code>, a request
+  body over the limit gets a <code class="lit">413</code>, and a panic caught
+  in a handler gets a <code class="lit">500</code>.
 </p>
 
 <h3>Status codes</h3>
@@ -52,11 +54,11 @@
   <thead><tr><th class="num">Code</th><th>Meaning</th></tr></thead>
   <tbody>
     <tr><td class="num">200</td><td>The answer is in <code class="lit">data</code>.</td></tr>
-    <tr><td class="num">400</td><td>The argument is not one this explorer reads, or a limit is over its cap.</td></tr>
+    <tr><td class="num">400</td><td>The argument is not one this explorer reads, or the request is over one of its limits.</td></tr>
     <tr><td class="num">404</td><td>The argument was well formed and the chain does not hold it.</td></tr>
     <tr><td class="num">500</td><td>A bug here.</td></tr>
     <tr><td class="num">502</td><td>The daemon could not be reached, or answered with something unusable.</td></tr>
-    <tr><td class="num">503</td><td>This deployment cannot serve the endpoint, because its daemon lacks the call.</td></tr>
+    <tr><td class="num">503</td><td>This deployment cannot serve the endpoint, because its daemon lacks the call, or the explorer is busy with other requests for now.</td></tr>
   </tbody>
 </table>
 </div>
@@ -190,6 +192,12 @@
     <code class="lit">400</code>, and the refusal is arithmetic on the two
     heights, so it costs the daemon nothing.
   </p>
+  <p>
+    <strong>The blocks in one range may hold {{ max_range_mib }} MiB at
+    most</strong>, by the sizes their headers give. A range holding more gets
+    a <code class="lit">400</code> once those headers are fetched, and a
+    narrower range is served.
+  </p>
   <p><a href="/api/blocks/{{ sample_range_start }}/{{ sample_height }}">/api/blocks/{{ sample_range_start }}/{{ sample_height }}</a></p>
   <pre class="blob">curl -s "$OXBLOCKS/api/blocks/{{ sample_range_start }}/{{ sample_height }}"</pre>
   <details class="response">
@@ -204,8 +212,9 @@
     One transaction, with <strong>every ring resolved</strong>. Each input
     lists its ring members with the height, one time key and source transaction
     of each. This is the only endpoint that resolves rings, because it costs
-    one daemon call for each input. An FCMP++ transaction has no rings to
-    resolve; it costs one call for its tree size instead.
+    a daemon call for the transaction's ring members, and one for each input
+    when the daemon refuses them together. An FCMP++ transaction has no rings
+    to resolve; it costs one call for its tree size instead.
   </p>
   <p>
     Returns a <a href="#shape-txdetail">transaction detail object</a>, and is
@@ -327,7 +336,11 @@
   <p>
     One page costs one header range, one call for each block that holds
     transactions, and one batched fetch. The cap stops a single request from
-    reaching a thousand blocks of the operator's daemon.
+    reaching a thousand blocks of the operator's daemon. A page whose blocks
+    hold more than {{ max_range_mib }} MiB, as
+    <a href="#blocks">/api/blocks</a> describes, gets a
+    <code class="lit">400</code>; ask for a smaller
+    <code class="lit">limit</code>.
   </p>
   <p>
     <code class="lit">total_page_no</code> rounds <em>up</em>, so the count
@@ -381,6 +394,12 @@
     wants. Rings stay unresolved, for the same reason as
     <a href="#private">the private lookup</a>.
   </p>
+  <p>
+    Where those blocks hold more than {{ max_range_mib }} MiB, the oldest are
+    left out, and <code class="lit">from_height</code> says where the window
+    begins. Like <a href="#mempool">/api/mempool</a>, it needs an
+    unrestricted daemon, and it fails rather than answer without the pool.
+  </p>
   <p><a href="/api/transactions/recent">/api/transactions/recent</a></p>
   <pre class="blob">curl -s "$OXBLOCKS/api/transactions/recent"</pre>
   <details class="response">
@@ -417,8 +436,10 @@
 <section class="endpoint" id="feeestimate">
   <h3><span class="verb">GET</span><code class="lit">/api/feeestimate?grace_blocks=</code></h3>
   <p>
-    The fee per byte that the daemon estimates.
-    <code class="lit">grace_blocks</code> defaults to 10.
+    The fee per byte that the daemon estimates over the next
+    <code class="lit">grace_blocks</code> blocks, at most 1000. Left out, it is
+    the window wallets use: 10 blocks, and 1000 from hard fork 17. A value that
+    is not such a number gets a <code class="lit">400</code>.
     <code class="lit">fee</code> and <code class="lit">fee_per_kb</code> report
     the same number. The estimate has been per byte since 2019, and the second
     key kept its old name.
@@ -600,7 +621,8 @@
   deployment enforces, set by the operator at startup. A request that asks for
   more than one of them allows gets a 400 that names the bound it crossed. The
   recent window is not a request parameter at all. It is fixed for every
-  caller.
+  caller, and shortened only as <a href="#recent">its endpoint</a>
+  describes.
 </p>
 
 <div class="scroll">
@@ -610,6 +632,7 @@
     <tr><td><code class="lit">/api/transactions</code> limit</td><td class="num">{{ max_transactions_limit }}</td></tr>
     <tr><td><code class="lit">/api/mempool</code> limit</td><td class="num">{{ max_mempool_limit }}</td></tr>
     <tr><td><code class="lit">/api/blocks</code> span</td><td class="num">{{ max_block_range }}</td></tr>
+    <tr><td>one range of blocks, by their sizes</td><td class="num">{{ max_range_mib }} MiB</td></tr>
     <tr><td>private lookup, postfix length</td><td class="num">{{ min_postfix_len }}&ndash;{{ max_postfix_len }}</td></tr>
     <tr><td>private lookup, expected matches</td><td class="num">{{ min_anonymity_set }}&ndash;{{ max_private_tx_matches }}</td></tr>
     <tr><td><code class="lit">/api/transactions/recent</code> window</td><td class="num">{{ recent_blocks }}</td></tr>

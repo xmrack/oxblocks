@@ -466,7 +466,7 @@ mod tests {
             .collect();
         assert_eq!(inside, ["Signature · 3,000 B", "Signature · 5,000 B"]);
 
-        let small = bar(&[64, 128, 64], 40_000);
+        let small = bar(&[64, 128, 64], 4_000);
         let labels = map_labels(&small).unwrap();
         let ring: Vec<_> = labels.sets[0]
             .outside
@@ -475,12 +475,20 @@ mod tests {
             .map(|l| l.text.as_str())
             .collect();
         assert_eq!(ring, ["Ring signature 256 B in 3"]);
-        let equal = map_labels(&bar(&[64, 64], 40_000)).unwrap();
+        let equal = map_labels(&bar(&[64, 64], 4_000)).unwrap();
         assert!(
             equal.sets[0]
                 .outside
                 .iter()
                 .any(|l| l.text == "Ring signature 64 B × 2")
+        );
+        // Too small beside the rest to draw apart, they are drawn as one.
+        let merged = map_labels(&bar(&[64, 128, 64], 40_000)).unwrap();
+        assert!(
+            merged.sets[0]
+                .outside
+                .iter()
+                .any(|l| l.text == "Ring signature 256 B")
         );
     }
 

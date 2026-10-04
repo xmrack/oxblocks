@@ -105,6 +105,11 @@ pub struct RpcChainSource {
     /// The chain bytes that ranges of blocks may hold at once, in KiB. See
     /// [`RANGE_KIB`].
     range_kib: Arc<Semaphore>,
+    /// The chain bytes that single blocks' transactions may hold at once, in
+    /// KiB. See [`BLOCK_KIB`].
+    block_kib: Arc<Semaphore>,
+    /// When [`Self::fresh_info`] last asked the daemon.
+    fresh_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// Outbound calls made since start.
     ///
     /// The number that matters for load on the operator's node, and not the
@@ -177,6 +182,42 @@ pub const MAX_RANGE_KIB: u64 = RANGE_KIB as u64 / 2;
 /// up: long enough to wait out a range or two, short enough to leave the
 /// request time to fetch once it has its share.
 pub const RANGE_WAIT: Duration = Duration::from_secs(5);
+
+/// The chain bytes, in KiB, that single blocks' transactions held at once
+/// may add up to: 32 MiB, apart from [`RANGE_KIB`], so that ranges waiting
+/// their turn never hold up a block page.
+pub const BLOCK_KIB: u32 = 32 * 1024;
+
+/// How long an answer from [`RpcChainSource::fresh_info`] stands in for the
+/// next one: long enough that a caller asking on every request costs the
+/// daemon one call a second, short enough to see a block just mined.
+pub const FRESH_INFO_GAP: Duration = Duration::from_secs(1);
+
+/// The most daemon calls one [`RpcChainSource::tree_sizes`] makes. The
+/// sender of a transaction picks its reference block, so a page of them can
+/// name as many heights as it has rows.
+pub const MAX_TREE_SIZE_CALLS: usize = 16;
+
+/// Wait for `kib` of `budget`, which holds `total`, or all of it if that is
+/// less. Busy after [`RANGE_WAIT`].
+async fn hold(
+    budget: &Arc<Semaphore>,
+    total: u32,
+    kib: u64,
+    what: &'static str,
+) -> Result<Held, ChainError> {
+    let share = u32::try_from(kib).unwrap_or(u32::MAX).clamp(1, total);
+    let permit = tokio::time::timeout(RANGE_WAIT, Arc::clone(budget).acquire_many_owned(share))
+        .await
+        .map_err(|_| ChainError::Busy(what))?
+        .ok();
+    Ok(Held { _permit: permit })
+}
+
+/// A block's size, in whole KiB, as its header gives it.
+const fn header_kib(h: &monerod_rpc::types::BlockHeader) -> u64 {
+    h.block_size.div_ceil(1024)
+}
 
 /// How many blocks sit on block `height`, in a chain of `chain_height`.
 const fn depth(chain_height: u64, height: u64) -> u64 {
@@ -354,7 +395,7 @@ impl RpcChainSource {
             //
             // What the daemon sends is sized by the daemon, so the caches
             // holding its strings are also held to a byte budget: about 230
-            // MiB in all, inside the 512 MiB `deploy/oxblocks.service` allows.
+            // MiB in all, inside the 1 GiB `deploy/oxblocks.service` allows.
             blocks_by_hash: Cache::expiring(512, Duration::from_secs(120))
                 .within_bytes(32 << 20, block_bytes),
             blocks_by_height: Cache::permanent(2048).within_bytes(48 << 20, block_bytes),
@@ -376,6 +417,8 @@ impl RpcChainSource {
             flights: Flights::default(),
             rpc_permits: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_RPC)),
             range_kib: Arc::new(Semaphore::new(RANGE_KIB as usize)),
+            block_kib: Arc::new(Semaphore::new(BLOCK_KIB as usize)),
+            fresh_at: std::sync::Mutex::new(None),
             rpc_calls: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -531,14 +574,26 @@ impl RpcChainSource {
 
     /// [`tree_size`](Self::tree_size) as of each of `heights`, asked together
     /// with the one `probe`, which has to be newer than all of them. A height
-    /// the daemon cannot answer for is left out.
+    /// the daemon cannot answer for is left out, and so is any past the
+    /// newest [`MAX_TREE_SIZE_CALLS`] not already kept.
     pub async fn tree_sizes(
         &self,
         heights: impl IntoIterator<Item = u64>,
         probe: u64,
         chain_height: u64,
     ) -> HashMap<u64, u64> {
-        let heights: std::collections::BTreeSet<u64> = heights.into_iter().collect();
+        let mut calls = 0;
+        let heights: std::collections::BTreeSet<u64> = heights
+            .into_iter()
+            .collect::<std::collections::BTreeSet<u64>>()
+            .into_iter()
+            .rev()
+            .filter(|h| {
+                let kept = self.tree_sizes.get(h).is_some();
+                calls += usize::from(!kept);
+                kept || calls <= MAX_TREE_SIZE_CALLS
+            })
+            .collect();
         let sizes = futures_util::future::join_all(
             heights
                 .iter()
@@ -632,9 +687,23 @@ impl RpcChainSource {
     ///
     /// For a caller whose answer turns on the newest block, which the cached
     /// info can be up to five seconds behind. The answer replaces the cached
-    /// one. It costs one daemon call, as looking up an unknown hash does.
+    /// one. It costs one daemon call, as looking up an unknown hash does, and
+    /// none when the daemon was asked less than [`FRESH_INFO_GAP`] ago.
     pub async fn fresh_info(&self) -> Result<Arc<GetInfo>, ChainError> {
+        let _turn = self.flights.enter(&Flight::Info).await;
+        let recent = self
+            .fresh_at
+            .lock()
+            .ok()
+            .and_then(|at| *at)
+            .is_some_and(|at| at.elapsed() < FRESH_INFO_GAP);
+        if recent && let Some(hit) = self.info.get(&()) {
+            return Ok(hit);
+        }
         let fresh: GetInfo = self.rpc("get_info", None::<()>).await?;
+        if let Ok(mut at) = self.fresh_at.lock() {
+            *at = Some(std::time::Instant::now());
+        }
         Ok(self.info.insert((), fresh))
     }
 
@@ -946,16 +1015,58 @@ impl RpcChainSource {
         with_tree: bool,
     ) -> Result<BlockRange, ChainError> {
         let headers = self.headers_range(start, end).await?.headers;
-
-        // The range's share of what ranges may hold at once, taken before any
-        // body or transaction is fetched. See [`RANGE_KIB`].
         let kib = headers
             .iter()
-            .map(|h| h.block_size.div_ceil(1024))
+            .map(header_kib)
             .fold(0u64, u64::saturating_add);
         if kib > MAX_RANGE_KIB {
             return Err(ChainError::RangeTooLarge { start, end, kib });
         }
+        self.range_of(headers, kib, start, end, with_tree).await
+    }
+
+    /// The newest of blocks `start` to `end` that one request may fetch
+    /// together: [`Self::blocks_in_range`] with the oldest left out, rather
+    /// than the range refused, when they hold more than [`MAX_RANGE_KIB`].
+    /// The newest block is never left out.
+    pub async fn newest_in_range(
+        &self,
+        start: u64,
+        end: u64,
+        with_tree: bool,
+    ) -> Result<BlockRange, ChainError> {
+        let mut headers = self.headers_range(start, end).await?.headers;
+        let mut kib = 0u64;
+        let keep = headers
+            .iter()
+            .rev()
+            .take_while(|h| {
+                let first = kib == 0;
+                kib = kib.saturating_add(header_kib(h));
+                first || kib <= MAX_RANGE_KIB
+            })
+            .count();
+        let dropped = headers.len().saturating_sub(keep);
+        headers.drain(..dropped);
+        let kib = headers
+            .iter()
+            .map(header_kib)
+            .fold(0u64, u64::saturating_add);
+        let start = headers.first().map_or(start, |h| h.height);
+        self.range_of(headers, kib, start, end, with_tree).await
+    }
+
+    /// [`Self::blocks_in_range`] once its headers are had and weighed.
+    async fn range_of(
+        &self,
+        headers: Vec<monerod_rpc::types::BlockHeader>,
+        kib: u64,
+        start: u64,
+        end: u64,
+        with_tree: bool,
+    ) -> Result<BlockRange, ChainError> {
+        // The range's share of what ranges may hold at once, taken before any
+        // body or transaction is fetched. See [`RANGE_KIB`].
         let held = self.hold_kib(kib).await?;
 
         // Blocks whose transactions are kept need neither body nor fetch for
@@ -1115,20 +1226,13 @@ impl RpcChainSource {
     /// caller about to fetch that much chain data whole. Busy after
     /// [`RANGE_WAIT`].
     pub async fn hold_kib(&self, kib: u64) -> Result<Held, ChainError> {
-        let share = u32::try_from(kib).unwrap_or(u32::MAX).clamp(1, RANGE_KIB);
-        let permit = tokio::time::timeout(
-            RANGE_WAIT,
-            Arc::clone(&self.range_kib).acquire_many_owned(share),
-        )
-        .await
-        .map_err(|_| ChainError::Busy("other ranges of blocks"))?
-        .ok();
-        Ok(Held { _permit: permit })
+        hold(&self.range_kib, RANGE_KIB, kib, "other ranges of blocks").await
     }
 
     /// Every transaction of `block`, the coinbase first and the rest in the
-    /// order it lists them, fetched whole while holding the block's size of
-    /// [`RANGE_KIB`], which the answer keeps until it is dropped.
+    /// order it lists them. Fetched whole while holding the block's size of
+    /// [`BLOCK_KIB`], which the answer keeps until it is dropped; kept ones
+    /// hold nothing.
     ///
     /// Refused when the daemon does not send one of them: the block without
     /// it would be a wrong answer, not a partial one.
@@ -1136,9 +1240,15 @@ impl RpcChainSource {
         &self,
         block: &GetBlock,
     ) -> Result<(FetchedTxs, Held), ChainError> {
-        let held = self
-            .hold_kib(block.block_header.block_size.div_ceil(1024))
-            .await?;
+        let kept = |txs| {
+            (
+                FetchedTxs {
+                    txs,
+                    missed: Vec::new(),
+                },
+                Held { _permit: None },
+            )
+        };
         let key = block
             .block_header
             .hash
@@ -1148,28 +1258,23 @@ impl RpcChainSource {
         let _turn = match key {
             Some(k) => {
                 if let Some(txs) = self.kept_block_txs(&k).await {
-                    return Ok((
-                        FetchedTxs {
-                            txs,
-                            missed: Vec::new(),
-                        },
-                        held,
-                    ));
+                    return Ok(kept(txs));
                 }
                 let turn = self.flights.enter(&Flight::BlockTxs(k)).await;
                 if let Some(txs) = self.kept_block_txs(&k).await {
-                    return Ok((
-                        FetchedTxs {
-                            txs,
-                            missed: Vec::new(),
-                        },
-                        held,
-                    ));
+                    return Ok(kept(txs));
                 }
                 Some(turn)
             }
             None => None,
         };
+        let held = hold(
+            &self.block_kib,
+            BLOCK_KIB,
+            block.block_header.block_size.div_ceil(1024),
+            "other blocks",
+        )
+        .await?;
         let listed = std::iter::once(&block.miner_tx_hash).chain(&block.tx_hashes);
         let hashes: Vec<Hash32> = listed.clone().filter_map(|h| h.parse().ok()).collect();
         let fetched = self.transactions(&hashes).await?;
@@ -1402,12 +1507,11 @@ impl RpcChainSource {
         }
     }
 
-    /// Resolve every input of a transaction, one request per input.
+    /// Resolve every input of a transaction: in one request, or, where
+    /// monerod refuses that because an index is out of range, one request
+    /// per input, for the reason on [`Self::resolve_ring`].
     ///
-    /// The requests are issued **concurrently**, not in sequence. They stay
-    /// one-per-input for the correctness reason on [`Self::resolve_ring`] --
-    /// monerod fails a whole batch if any index is out of range -- but nothing
-    /// requires waiting for each before starting the next.
+    /// The per-input requests are issued **concurrently**, not in sequence.
     ///
     /// This matters on real data: mainnet transaction bf1b4e2b…c193 has 195
     /// inputs, and resolving them in sequence took 6.1 seconds. The semaphore
@@ -2207,6 +2311,26 @@ mod tests {
         assert_eq!(daemon.count(TreeSizeQuery::ENDPOINT), 6);
     }
 
+    /// Past [`MAX_TREE_SIZE_CALLS`] heights not kept, the oldest are left out
+    /// unasked; kept ones are answered whatever their number.
+    #[tokio::test]
+    async fn tree_sizes_ask_about_the_newest_heights_only() {
+        let daemon = tree_daemon();
+        let src = daemon.source();
+        let kept = src.tree_sizes([3], 77, 1000).await;
+        assert_eq!(kept.len(), 1);
+        let many = 10..10 + MAX_TREE_SIZE_CALLS as u64 + 5;
+        let sizes = src.tree_sizes(many.clone().chain([3]), 77, 1000).await;
+        let mut got: Vec<u64> = sizes.into_keys().collect();
+        got.sort_unstable();
+        let newest = many.end - MAX_TREE_SIZE_CALLS as u64..many.end;
+        assert_eq!(got, std::iter::once(3).chain(newest).collect::<Vec<_>>());
+        assert_eq!(
+            daemon.count(TreeSizeQuery::ENDPOINT),
+            1 + MAX_TREE_SIZE_CALLS
+        );
+    }
+
     /// A daemon whose tip is whatever `tip` holds: its coinbase has unified id
     /// `tip * 10`, and the tree as of block `n - 1` has `1000 * tip + n`
     /// outputs, so an answer read under one tip differs from the next's.
@@ -2607,12 +2731,17 @@ mod tests {
             move |_, _| serde_json::json!({"txs": [ea.clone(), eb.clone()], "status": "OK"}),
         );
         let src = whole.source();
+        let ranges = Arc::clone(&src.range_kib)
+            .acquire_many_owned(RANGE_KIB)
+            .await
+            .unwrap();
         let (fetched, held) = src.block_transactions(&block).await.unwrap();
         assert_eq!(fetched.txs.len(), 2);
-        let all = RANGE_KIB as usize;
-        assert_eq!(src.range_kib.available_permits(), all - 3 * 1024);
+        let all = BLOCK_KIB as usize;
+        assert_eq!(src.block_kib.available_permits(), all - 3 * 1024);
         drop(held);
-        assert_eq!(src.range_kib.available_permits(), all);
+        assert_eq!(src.block_kib.available_permits(), all);
+        drop(ranges);
 
         let ea = entry(&a);
         let short = FakeDaemon::start(
@@ -2626,7 +2755,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(src.range_kib.available_permits(), all);
+        assert_eq!(src.block_kib.available_permits(), all);
     }
 
     /// A daemon that fails to answer a transaction's one `get_outs` is not
@@ -2691,6 +2820,8 @@ mod tests {
 
     /// Blocks from this height on are a MiB each; those below, 100 bytes.
     const LARGE_FROM: u64 = 1000;
+    /// A block larger than one range may hold.
+    const HUGE_AT: u64 = 2000;
 
     impl Chain {
         fn header(self, height: u64, orphan: bool) -> serde_json::Value {
@@ -2704,7 +2835,11 @@ mod tests {
                 "difficulty": 1, "difficulty_top64": 0, "wide_difficulty": "0x1",
                 "cumulative_difficulty": 1, "cumulative_difficulty_top64": 0,
                 "wide_cumulative_difficulty": "0x1", "reward": 1,
-                "block_size": if height >= LARGE_FROM { 1 << 20 } else { 100 },
+                "block_size": match height {
+                    HUGE_AT => (2 * MAX_RANGE_KIB) << 10,
+                    h if h >= LARGE_FROM => 1 << 20,
+                    _ => 100,
+                },
                 "num_txes": 0, "pow_hash": "", "miner_tx_hash": "",
             })
         }
@@ -2878,6 +3013,47 @@ mod tests {
         assert_eq!(blocks.len() as u64, most);
     }
 
+    /// The newest blocks of a range too large for one request are served in
+    /// its place, as many as fit, and a range that fits is served whole.
+    #[tokio::test]
+    async fn the_newest_of_a_range_too_large_are_served() {
+        let chain = Chain {
+            tip: LARGE_FROM + 100,
+            fork: 0,
+        };
+        let daemon = chain.daemon(&[], None);
+        let source = daemon.source();
+        let most = MAX_RANGE_KIB / 1024;
+        let end = LARGE_FROM + most + 5;
+
+        let blocks = source
+            .newest_in_range(LARGE_FROM - 3, end, false)
+            .await
+            .unwrap();
+        let heights: Vec<u64> = blocks.iter().map(|b| b.header.height).collect();
+        assert_eq!(heights, (end + 1 - most..=end).collect::<Vec<_>>());
+
+        let whole = source
+            .newest_in_range(LARGE_FROM - 3, LARGE_FROM + 2, false)
+            .await
+            .unwrap();
+        assert_eq!(whole.len(), 6);
+
+        // A newest block larger than a range may hold is still served alone.
+        let huge = Chain {
+            tip: HUGE_AT,
+            fork: 0,
+        };
+        let daemon = huge.daemon(&[], None);
+        let alone = daemon
+            .source()
+            .newest_in_range(HUGE_AT - 3, HUGE_AT, false)
+            .await
+            .unwrap();
+        let heights: Vec<u64> = alone.iter().map(|b| b.header.height).collect();
+        assert_eq!(heights, [HUGE_AT]);
+    }
+
     /// Without the tree the same range fetches no bodies at all.
     #[tokio::test]
     async fn a_range_that_does_not_show_the_tree_does_not_pay_for_it() {
@@ -3032,6 +3208,13 @@ mod tests {
         assert_eq!(src.fresh_info().await.unwrap().height, 101);
         assert_eq!(src.info().await.unwrap().height, 101);
         assert_eq!(src.rpc_calls(), 2);
+
+        // Asked again at once, the answer just had stands in.
+        assert_eq!(src.fresh_info().await.unwrap().height, 101);
+        assert_eq!(src.rpc_calls(), 2);
+        *src.fresh_at.lock().unwrap() = std::time::Instant::now().checked_sub(FRESH_INFO_GAP);
+        src.fresh_info().await.unwrap();
+        assert_eq!(src.rpc_calls(), 3);
     }
 
     /// An unreachable daemon marks the ring unavailable rather than erroring

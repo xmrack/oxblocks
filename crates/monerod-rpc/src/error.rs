@@ -33,6 +33,27 @@ pub(crate) fn printable(raw: &str, max: usize) -> String {
         .collect()
 }
 
+/// The most characters of a parser's reason kept: it can quote what the
+/// daemon sent, at any length.
+pub(crate) const MAX_DECODE_DETAIL: usize = 256;
+
+/// A parser's reason for refusing what the daemon sent, fit for a log line.
+#[must_use]
+pub(crate) fn decode_detail(e: &serde_json::Error) -> String {
+    printable(&e.to_string(), MAX_DECODE_DETAIL)
+}
+
+impl RpcError {
+    /// [`Self::Decode`], for `context`'s answer refused as `e`.
+    #[must_use]
+    pub(crate) fn decode(context: &'static str, e: &serde_json::Error) -> Self {
+        Self::Decode {
+            context,
+            detail: decode_detail(e),
+        }
+    }
+}
+
 impl Status {
     pub fn parse(raw: &str) -> Self {
         match raw {
@@ -119,11 +140,20 @@ pub enum RpcError {
         body: String,
     },
 
-    #[error("could not decode monerod's response to {context}: {source}")]
+    /// The parser's reason, which can quote the daemon's text, comes through
+    /// [`printable`].
+    /// TLS could not be set up as configured.
+    #[error("TLS could not be set up: {0}")]
+    Tls(String),
+
+    /// The user agent cannot be sent as a header.
+    #[error("the user agent cannot be sent: {0}")]
+    BadUserAgent(String),
+
+    #[error("could not decode monerod's response to {context}: {detail}")]
     Decode {
         context: &'static str,
-        #[source]
-        source: serde_json::Error,
+        detail: String,
     },
 
     /// A `.bin` endpoint answered with a body that is not portable storage.
@@ -173,6 +203,8 @@ impl RpcError {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
@@ -230,6 +262,26 @@ mod tests {
             .is_transient(),
             "a response that big will be just as big next time"
         );
+    }
+
+    /// A parser's reason quotes the daemon's text: kept to one line and a
+    /// bounded length however much it quotes.
+    #[test]
+    fn a_decode_error_neither_forges_a_line_nor_runs_on() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        enum Kind {
+            A,
+        }
+        let forged = serde_json::from_str::<Kind>("\"x\\nINFO forged \\u001b[31m\"").unwrap_err();
+        let e = RpcError::decode("get_info", &forged).to_string();
+        assert!(e.contains("x?INFO forged ?[31m"), "{e}");
+        assert!(!e.chars().any(char::is_control), "{e}");
+
+        let long = format!("\"{}\"", "y".repeat(100_000));
+        let huge = serde_json::from_str::<u64>(&long).unwrap_err();
+        let e = RpcError::decode("get_info", &huge).to_string();
+        assert!(e.len() < MAX_DECODE_DETAIL + 100, "{}", e.len());
     }
 
     #[test]
