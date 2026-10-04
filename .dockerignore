@@ -1,4 +1,13 @@
-target/
-.git/
-/tmp/
-docs/review/
+# Only what the build reads, so nothing else in the tree reaches the daemon.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/monerod-rpc/Cargo.toml
+!crates/monerod-rpc/src/
+!crates/explorer-core/Cargo.toml
+!crates/explorer-core/src/
+!crates/explorer-web/Cargo.toml
+!crates/explorer-web/src/
+!crates/explorer-web/static/
+!crates/explorer-web/templates/
+!fixtures/api-examples/

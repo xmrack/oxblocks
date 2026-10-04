@@ -140,8 +140,6 @@ pub enum RpcError {
         body: String,
     },
 
-    /// The parser's reason, which can quote the daemon's text, comes through
-    /// [`printable`].
     /// TLS could not be set up as configured.
     #[error("TLS could not be set up: {0}")]
     Tls(String),
@@ -150,6 +148,8 @@ pub enum RpcError {
     #[error("the user agent cannot be sent: {0}")]
     BadUserAgent(String),
 
+    /// The parser's reason, which can quote the daemon's text, is kept to
+    /// one bounded line.
     #[error("could not decode monerod's response to {context}: {detail}")]
     Decode {
         context: &'static str,

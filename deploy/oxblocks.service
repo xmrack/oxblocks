@@ -36,6 +36,7 @@ PrivateDevices=yes
 ProtectProc=invisible
 ProcSubset=pid
 ReadWritePaths=
+UMask=0077
 
 # --- privileges -----------------------------------------------------------
 NoNewPrivileges=yes
@@ -44,6 +45,9 @@ AmbientCapabilities=
 RestrictSUIDSGID=yes
 LockPersonality=yes
 RemoveIPC=yes
+PrivateIPC=yes
+# Sees no other user: every uid but its own and root's maps to nobody.
+PrivateUsers=yes
 
 # --- kernel ---------------------------------------------------------------
 ProtectKernelTunables=yes
@@ -70,6 +74,9 @@ IPAddressDeny=any
 IPAddressAllow=localhost
 # If the daemon or the reverse proxy is not on loopback, widen the two lines
 # above to exactly those addresses -- not to `any`.
+# Listens on the port in --bind and no other. Change both together.
+SocketBindDeny=any
+SocketBindAllow=tcp:8081
 
 # --- limits ---------------------------------------------------------------
 # The caches are bounded, so a figure that keeps rising with an idle explorer

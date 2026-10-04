@@ -67,13 +67,20 @@ Run `oxblocks --help` for the full text of each option.
 
 ```bash
 docker build -t oxblocks .
-docker run --rm -p 8081:8081 oxblocks \
-  --bind 0.0.0.0:8081 --daemon-url http://DAEMON-HOST:18081
+docker run --rm -p 127.0.0.1:8081:8081 \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --memory 1g --pids-limit 128 \
+  oxblocks --bind 0.0.0.0:8081 --daemon-url http://DAEMON-HOST:18081
 ```
 
 The image is distroless. It runs as the `nonroot` user. It holds one binary and
 has no shell and no package manager. The stylesheet is compiled into the binary,
-so you do not need to mount an asset directory.
+so you do not need to mount an asset directory. It writes nothing, needs no
+capabilities, and runs under the same memory limit as the systemd unit.
+
+Publish the port on `127.0.0.1` for a reverse proxy on the same host. A bare
+`-p 8081:8081` listens on every interface, and Docker's own firewall rules let
+it past the host's firewall.
 
 Bind to `0.0.0.0` inside the container. The default of `127.0.0.1` is not
 reachable from outside it.
@@ -83,8 +90,10 @@ To reach a daemon on the Docker host:
 * **Linux.** Share the host network instead of publishing a port:
 
   ```bash
-  docker run --rm --network host oxblocks \
-    --bind 127.0.0.1:8081 --daemon-url http://127.0.0.1:18081
+  docker run --rm --network host \
+    --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --memory 1g --pids-limit 128 \
+    oxblocks --bind 127.0.0.1:8081 --daemon-url http://127.0.0.1:18081
   ```
 
 * **Docker Desktop.** Keep `-p 8081:8081` and use
@@ -103,8 +112,10 @@ sudo systemctl enable --now oxblocks
 
 The unit runs the explorer under a dynamic user with no capabilities, a
 read-only filesystem, no writable paths, no executable memory, and a syscall
-filter. It allows IPv4 and IPv6 sockets to localhost only. Widen
-`IPAddressAllow` only to the hosts that your daemon and proxy use.
+filter. It sees no other user and allows IPv4 and IPv6 sockets to localhost
+only. Widen `IPAddressAllow` only to the hosts that your daemon and proxy use. It
+may listen on port 8081 alone: if you change `--bind`, change `SocketBindAllow`
+to match.
 
 Put a TLS reverse proxy in front of the explorer. oxblocks serves plain HTTP.
 
