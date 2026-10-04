@@ -4,8 +4,8 @@
 {% block content %}
 <h1>Block {{ height }}<span class="sub">{{ timestamp_utc }} UTC</span></h1>
 {% if orphan %}
-<div class="notice">This block is not on the main chain. Another block at
-height {{ height }} won, and this one's transactions count only where that
+<div class="notice">This block is not on the main chain. Another block with
+number {{ height }} won, and this one's transactions count only where that
 block's do too.</div>
 {% endif %}
 {% if unreadable > 0 %}
@@ -17,7 +17,7 @@ listed below.</div>
 <dl class="kv">
   <dt>Hash</dt><dd class="hash">{{ hash }}</dd>
   <dt>Previous</dt><dd><a class="hash" href="/block/{{ prev_hash }}">{{ prev_hash }}</a></dd>
-  <dt>Height</dt><dd>{{ height }}{% if orphan %} <span class="tag bad">orphaned</span>{% else if depth > 0 %} <span class="tag">{{ depth }} deep</span>{% endif %}</dd>
+  <dt>Block number</dt><dd>{{ height }}{% if orphan %} <span class="tag bad">orphaned</span>{% else if depth > 0 %} <span class="tag">{{ depth }} deep</span>{% endif %}</dd>
   <dt>Timestamp</dt><dd>{{ timestamp }} &mdash; {{ timestamp_utc }} UTC <span class="tag">{{ age }} ago</span></dd>
   <dt>Size</dt><dd>{{ size }} bytes{% if weight != size %} <span class="tag">weight {{ weight }}</span>{% endif %}</dd>
   <dt>Transactions</dt><dd>{{ tx_count }}</dd>

@@ -1499,7 +1499,7 @@ pub async fn block(
             chain,
             StatusCode::NOT_FOUND,
             "No such block",
-            &format!("{} is not a block height or a block hash.", echo(&raw)),
+            &format!("{} is not a block number or a block hash.", echo(&raw)),
         );
     };
 
@@ -2422,7 +2422,7 @@ pub async fn search(State(state): Shared, Query(q): Query<SearchQuery>) -> Respo
         chain,
         StatusCode::NOT_FOUND,
         "Nothing found",
-        "Enter a block height, a block hash, or a transaction hash. Monero has \
+        "Enter a block number, a block hash, or a transaction hash. Monero has \
          no address index, so addresses cannot be searched.",
         Some(raw),
     )
@@ -2656,7 +2656,7 @@ mod tests {
             detail: "d".to_owned(),
         };
         let html = page.render().expect("renders");
-        assert!(html.contains("3185431"));
+        assert!(html.contains("Blocks <b>3185431</b>"), "{html}");
         assert!(html.contains("mainnet"));
         assert!(html.contains("691253322598"));
     }
@@ -3246,6 +3246,24 @@ mod tests {
     /// It first read "51 recipients", which the Outputs column beside it
     /// already said -- a tag that repeats an adjacent cell costs a reader
     /// attention and tells them nothing.
+    /// A block is named by its number on every page, never by "height".
+    #[test]
+    fn a_block_is_called_by_its_number() {
+        let index = index_page().render().expect("renders");
+        assert!(index.contains(r#"<th class="num">Block</th>"#), "{index}");
+        assert!(index.contains(r#"placeholder="Block number, block hash, or transaction hash""#));
+        let block = block_page().render().expect("renders");
+        assert!(block.contains("<dt>Block number</dt>"), "{block}");
+        let tx = tx_page().render().expect("renders");
+        assert!(
+            tx.contains(r#"<th class="num">Block number</th><th>Output key</th>"#),
+            "{tx}"
+        );
+        for html in [index, block, tx] {
+            assert!(!html.to_lowercase().contains(">height<"));
+        }
+    }
+
     #[test]
     fn the_p2pool_tag_says_more_than_the_output_count_does() {
         let html = block_page().render().expect("renders");

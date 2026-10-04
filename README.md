@@ -124,7 +124,7 @@ Put a TLS reverse proxy in front of the explorer. oxblocks serves plain HTTP.
 | Path | Page |
 | --- | --- |
 | `/` and `/page/<n>` | Recent blocks. |
-| `/block/<height or hash>` | One block and the transactions in it. |
+| `/block/<number or hash>` | One block and the transactions in it. |
 | `/tx/<hash>` | One transaction, with inputs, outputs and ring member ages. |
 | `/tx/<hash>/paths` | Where the transaction's outputs sit in the FCMP++ curve tree, one output or all of them. |
 | `/mempool` | Transactions that wait to be mined. Click a column heading to sort. |
@@ -163,7 +163,7 @@ The HTTP status says the same thing.
 | 502 | The daemon could not be reached, or answered with something unusable. |
 | 503 | This deployment cannot serve the endpoint, because of how its daemon is built or configured. |
 
-Arguments are read as given. A height is decimal digits, a hash is 64 hex
+Arguments are read as given. A block number is decimal digits, a hash is 64 hex
 characters of either case, and a postfix is hex. Anything else is a 400, and so
 is a `page` or `limit` that is not a plain number.
 
@@ -172,15 +172,15 @@ everything and deletes the characters it does not recognise before it parses.
 
 | Endpoint | Returns |
 | --- | --- |
-| `/api/block/<height or hash>` | One block with its transactions. |
+| `/api/block/<number or hash>` | One block with its transactions. |
 | `/api/transaction/<hash>` | One transaction, with rings expanded. |
 | `/api/transaction/<hash>/paths?block=&from=&output=` | The curve-tree paths of up to 50 of the transaction's outputs, or of one, checked. |
-| `/api/rawblock/<height or hash>` | The block as the daemon holds it. |
+| `/api/rawblock/<number or hash>` | The block as the daemon holds it. |
 | `/api/rawtransaction/<hash>` | The transaction as the daemon holds it. |
 | `/api/transactions?page=&limit=` | Transactions by block, newest first. `limit` is at most 50. |
 | `/api/mempool?page=&limit=` | Transactions in the mempool. `limit` is at most 500. |
-| `/api/search/<height or hash>` | A block or a transaction, whichever matches. |
-| `/api/networkinfo` | Height, difficulty, hash rate and peer counts. |
+| `/api/search/<number or hash>` | A block or a transaction, whichever matches. |
+| `/api/networkinfo` | Block count, difficulty, hash rate and peer counts. |
 | `/api/feeestimate?grace_blocks=` | The current fee per byte. |
 | `/api/version` | The explorer version and the daemon version. |
 | `/api/blocks/<start>/<end>` | A range of blocks. 100 blocks at most. |
@@ -229,7 +229,7 @@ index to answer, and a short postfix makes it return hundreds of thousands of
 hashes. The explorer refuses that before it makes the call.
 
 `/api/blocks` serves 100 blocks at most (`--max-block-range`), because each
-block costs two RPC calls. The refusal is arithmetic on the two heights, so an
+block costs two RPC calls. The refusal is arithmetic on the two block numbers, so an
 over-wide range costs the daemon nothing.
 
 Every one of these four bounds trades how well a caller hides against what the
@@ -333,8 +333,8 @@ framework, and `monerod-rpc` cannot use either of the other two crates.
 
 The process keeps one thing in memory: a bounded cache. It caches an object
 named by hash at once, because a hash names one object forever. It caches an
-object named by height only when that height is more than 60 blocks deep,
-because a reorg gives a height to a different block. The same holds for an
+object named by block number only when that block is more than 60 blocks deep,
+because a reorg gives the number to a different block. The same holds for an
 output's path through the curve tree: one is kept once it has been checked up
 to the root its block records, and only as of a block that deep. Losing the
 cache costs speed, not correctness. `/health` reports the size and the hit counts.

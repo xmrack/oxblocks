@@ -92,9 +92,9 @@
   {% endif %}
   <dt>Unlock time</dt><dd>{{ unlock_time }}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
-    <p>The height or time before which these outputs cannot be spent. Almost
+    <p>The block number or time before which these outputs cannot be spent. Almost
     every transaction sets 0, which means no lock. Consensus locks every
-    coinbase for 60 blocks, so a coinbase reads its own height plus 60.</p></details>
+    coinbase for 60 blocks, so a coinbase reads its own block number plus 60.</p></details>
   </dd>
   {% if payment_id != "" %}<dt>Payment ID</dt><dd><span class="hash">{{ payment_id }}</span>
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
@@ -178,7 +178,7 @@
       </p>
       {% else if i.ages.is_none() %}
       <p class="empty indented">
-        This node could not read the chain's height, so the members' ages are unknown.
+        This node could not read how many blocks the chain has, so the members' ages are unknown.
       </p>
       {% else %}
       {% if let Some(ages) = i.ages %}
@@ -211,7 +211,7 @@
       {% endif %}
       <div class="scroll">
       <table>
-        <thead><tr><th class="num">#</th><th class="num">Height</th><th>Output key</th><th>In transaction</th></tr></thead>
+        <thead><tr><th class="num">#</th><th class="num">Block number</th><th>Output key</th><th>In transaction</th></tr></thead>
         <tbody>
         {% for m in i.ring %}
           <tr>

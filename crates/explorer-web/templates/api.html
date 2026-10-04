@@ -12,7 +12,7 @@
 
 <p>
   The example responses on this page were recorded from a regtest chain run by
-  monerod's FCMP++ branch, so their heights are small and their transactions
+  monerod's FCMP++ branch, so their block numbers are small and their transactions
   spend with FCMP++. Every hash and amount in them is one that chain holds.
 </p>
 
@@ -28,7 +28,7 @@
 
 <p>
   <code class="lit">fail</code> means the caller asked for something this
-  explorer will not answer, such as an argument that does not parse or a height
+  explorer will not answer, such as an argument that does not parse or a block number
   past the tip. <code class="lit">error</code> means this explorer or its daemon
   could not answer.
 </p>
@@ -78,7 +78,7 @@
   <li><a href="#transactions"><span class="verb">GET</span><code>/api/transactions</code><span class="what">Recent blocks, page by page</span></a></li>
   <li><a href="#mempool"><span class="verb">GET</span><code>/api/mempool</code><span class="what">Transactions waiting to be mined</span></a></li>
   <li><a href="#recent"><span class="verb">GET</span><code>/api/transactions/recent</code><span class="what">Recent blocks and the pool at once</span></a></li>
-  <li><a href="#search"><span class="verb">GET</span><code>/api/search/&lt;query&gt;</code><span class="what">A height or hash, looked up</span></a></li>
+  <li><a href="#search"><span class="verb">GET</span><code>/api/search/&lt;query&gt;</code><span class="what">A block number or hash, looked up</span></a></li>
   <li><a href="#feeestimate"><span class="verb">GET</span><code>/api/feeestimate</code><span class="what">The daemon's fee estimate</span></a></li>
   <li><a href="#health"><span class="verb">GET</span><code>/health</code><span class="what">Liveness and cache occupancy</span></a></li>
 </ul>
@@ -147,10 +147,10 @@
 </section>
 
 <section class="endpoint" id="block">
-  <h3><span class="verb">GET</span><code class="lit">/api/block/&lt;height|hash&gt;</code></h3>
+  <h3><span class="verb">GET</span><code class="lit">/api/block/&lt;number|hash&gt;</code></h3>
   <p>
     One block and every transaction in it, coinbase first. The argument is a
-    height when it is eight characters or fewer, and a block hash when it is
+    block number when it is eight characters or fewer, and a block hash when it is
     exactly 64 hex characters. Anything else gets a
     <code class="lit">400</code>. The bound of eight counts characters, not
     value.
@@ -169,7 +169,7 @@
 </section>
 
 <section class="endpoint" id="rawblock">
-  <h3><span class="verb">GET</span><code class="lit">/api/rawblock/&lt;height|hash&gt;</code></h3>
+  <h3><span class="verb">GET</span><code class="lit">/api/rawblock/&lt;number|hash&gt;</code></h3>
   <p>
     The block as monerod decoded it. The explorer sorts the keys of the
     daemon's own <code class="lit">json</code> document and adds nothing to it.
@@ -190,7 +190,7 @@
     Each block costs the daemon a call, so an unbounded range would let one
     request make millions of them. A wider range gets a
     <code class="lit">400</code>, and the refusal is arithmetic on the two
-    heights, so it costs the daemon nothing.
+    block numbers, so it costs the daemon nothing.
   </p>
   <p>
     <strong>The blocks in one range may hold {{ max_range_mib }} MiB at
@@ -210,7 +210,7 @@
   <h3><span class="verb">GET</span><code class="lit">/api/transaction/&lt;hash&gt;</code></h3>
   <p>
     One transaction, with <strong>every ring resolved</strong>. Each input
-    lists its ring members with the height, one time key and source transaction
+    lists its ring members with the block number, one time key and source transaction
     of each. This is the only endpoint that resolves rings, because it costs
     a daemon call for the transaction's ring members, and one for each input
     when the daemon refuses them together. An FCMP++ transaction has no rings
@@ -409,9 +409,9 @@
 </section>
 
 <section class="endpoint" id="search">
-  <h3><span class="verb">GET</span><code class="lit">/api/search/&lt;height|hash&gt;</code></h3>
+  <h3><span class="verb">GET</span><code class="lit">/api/search/&lt;number|hash&gt;</code></h3>
   <p>
-    Reads the shape of the argument. A short number is a height. 64 hex
+    Reads the shape of the argument. A short number is a block number. 64 hex
     characters are tried as a block hash and then as a transaction hash. The
     object that matches comes back with a <code class="lit">title</code> field
     naming what it is, either <code class="lit">"block"</code> or
@@ -422,7 +422,7 @@
     <strong>Addresses are not searchable.</strong> Monero has no address index.
     Building one needs a secret view key, which this explorer never asks for.
   </p>
-  <pre class="blob">curl -s "$OXBLOCKS/api/search/&lt;height|hash&gt;"</pre>
+  <pre class="blob">curl -s "$OXBLOCKS/api/search/&lt;number|hash&gt;"</pre>
   <details class="response">
     <summary>Example response, a block match</summary>
     <pre class="blob">{{ example_search_block }}</pre>
@@ -488,7 +488,7 @@
     <code class="lit">timestamp</code>, <code class="lit">timestamp_utc</code>,
     and <code class="lit">txs</code>, an array of
     <a href="#shape-txsummary">transaction summaries</a> with the coinbase
-    first. <code class="lit">current_height</code> is the height of the chain.
+    first. <code class="lit">current_height</code> is the number of blocks in the chain.
     <a href="#block">/api/block</a> reads it from the daemon's chain info,
     which the explorer holds for a few seconds, and
     <a href="#blocks">/api/blocks</a> works it out from the depth each header
@@ -506,7 +506,7 @@
     are in the block's body, after its transaction list, and no header call
     returns them, so from the fork on <a href="#blocks">/api/blocks</a> fetches
     every block's body. The root runs eight blocks ahead of the block: block H
-    carries the tree as it stands at height H + 8. A proof whose
+    carries the tree as it stands at block H + 8. A proof whose
     <code class="lit">reference_block</code> is R was therefore checked
     against the <code class="lit">tree_root</code> of block R &minus; 8, not
     of block R. For a reference block less than eight past the fork, block
@@ -528,7 +528,7 @@
     <code class="lit">fcmp_pp_proof_size</code>.
   </p>
   <p>
-    <code class="lit">reference_block</code> is the height the curve tree was
+    <code class="lit">reference_block</code> is the block number the curve tree was
     taken at when an FCMP++ transaction's inputs were proven: the tree of
     every output spendable with that block as the tip. Its root is in the
     body of block <code class="lit">reference_block</code> &minus; 8; see
