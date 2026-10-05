@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use crate::api::handlers::{AppState, Shared, echo};
 use crate::config::Theme;
 
+mod alt_graph;
 mod leaf_grid;
 mod map_labels;
 mod paths;
@@ -1102,30 +1103,8 @@ struct AltBlocksPage {
     version: &'static str,
     query: Option<String>,
     chain: Option<ChainStatus>,
-    chains: Vec<AltChainRow>,
-}
-
-struct AltChainRow {
-    /// The height of the chain's first block, where it diverged.
-    diverged: u64,
-    length: u64,
-    tip: u64,
-    block_hash: String,
-    difficulty: String,
-    parent: String,
-}
-
-/// An alternative chain as the page shows it. monerod's `height` is the
-/// tip's, and the chain runs `length` blocks down to where it diverged.
-fn alt_chain_row(c: &monerod_rpc::types::ChainInfo) -> AltChainRow {
-    AltChainRow {
-        diverged: c.height.saturating_add(1).saturating_sub(c.length),
-        length: c.length,
-        tip: c.height,
-        block_hash: c.block_hash.to_lowercase(),
-        difficulty: c.cumulative_difficulty().to_string(),
-        parent: c.main_chain_parent_block.to_lowercase(),
-    }
+    count: usize,
+    graph: alt_graph::AltGraph,
 }
 
 /// The JSON API's own documentation.
@@ -2370,7 +2349,29 @@ pub async fn alt_blocks(State(state): Shared) -> Page {
         Err(e) => return chain_error_page(chain, &e, "Could not load alternative chains"),
     };
 
-    let chains = alt.chains.iter().map(alt_chain_row).collect();
+    let info = match state.chain.info().await {
+        Ok(i) => i,
+        Err(e) => return chain_error_page(chain, &e, "Could not load alternative chains"),
+    };
+    let tip = info.height.saturating_sub(1);
+
+    let mut main = std::collections::BTreeMap::new();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for h in alt_graph::main_heights(&alt.chains, tip) {
+        match runs.last_mut() {
+            Some((_, end)) if *end + 1 == h => *end = h,
+            _ => runs.push((h, h)),
+        }
+    }
+    for (start, end) in runs {
+        if let Ok(r) = state.chain.headers_range(start, end).await {
+            main.extend(
+                r.headers
+                    .into_iter()
+                    .map(|h| (h.height, h.hash.to_lowercase())),
+            );
+        }
+    }
 
     render(
         StatusCode::OK,
@@ -2378,7 +2379,8 @@ pub async fn alt_blocks(State(state): Shared) -> Page {
             version: VERSION,
             query: None,
             chain,
-            chains,
+            count: alt.chains.len(),
+            graph: alt_graph::alt_graph(&alt.chains, tip, &info.top_block_hash, &main),
         },
     )
 }
@@ -5597,45 +5599,36 @@ mod tests {
         assert!(!html.contains("class=\"status\""));
     }
 
-    /// monerod's `height` for an alternative chain is its tip's, the block
-    /// `block_hash` names, so a three-block chain on 101, 102 and 103 comes
-    /// as height 103 and length 3.
     #[test]
-    fn an_alternative_chain_diverged_length_blocks_below_its_tip() {
-        let chain = |height: u64, length: u64| -> monerod_rpc::types::ChainInfo {
-            serde_json::from_value(serde_json::json!({
-                "block_hash": "AB".repeat(32), "height": height, "length": length,
-                "difficulty": 5, "difficulty_top64": 1, "wide_difficulty": "",
-                "main_chain_parent_block": "CD".repeat(32),
-            }))
-            .expect("a chain")
-        };
-        let row = alt_chain_row(&chain(103, 3));
-        assert_eq!((row.diverged, row.tip, row.length), (101, 103, 3));
-        assert_eq!(row.difficulty, ((1u128 << 64) + 5).to_string());
-        assert_eq!(
-            (row.block_hash, row.parent),
-            ("ab".repeat(32), "cd".repeat(32))
-        );
-        let row = alt_chain_row(&chain(50, 1));
-        assert_eq!((row.diverged, row.tip), (50, 50));
-
+    fn the_alt_blocks_page_draws_each_chain_off_the_main_chain() {
+        let chain: monerod_rpc::types::ChainInfo = serde_json::from_value(serde_json::json!({
+            "block_hash": "AB".repeat(32), "height": 103, "length": 1,
+            "difficulty": 5, "difficulty_top64": 0, "wide_difficulty": "",
+            "block_hashes": ["AB".repeat(32)],
+            "main_chain_parent_block": "CD".repeat(32),
+        }))
+        .expect("a chain");
+        let main = [(103, "ef".repeat(32))].into_iter().collect();
         let html = AltBlocksPage {
             version: "test",
             query: None,
             chain: None,
-            chains: vec![alt_chain_row(&chain(103, 3))],
+            count: 1,
+            graph: alt_graph::alt_graph(&[chain], 110, &"12".repeat(32), &main),
         }
         .render()
         .expect("renders");
+        assert!(html.contains("1 known to this node"));
+        assert!(html.contains(&format!(
+            r#"<a class="ag-h" href="/block/103">103</a><a class="hash" href="/block/{0}" title="{0}">efefefef</a><a class="hash ag-alt" href="/block/{1}" title="{1}">abababab</a>"#,
+            "ef".repeat(32),
+            "ab".repeat(32)
+        )), "{html}");
         assert!(
-            html.contains(
-                r#"<td class="num"><a href="/block/101">101</a></td>
-      <td class="num">103</td>
-      <td class="num">3</td>"#
-            ),
+            html.contains(r#"<div class="ag-gap">6 blocks</div>"#),
             "{html}"
         );
+        assert!(html.contains(&format!(r#"title="{0}">cdcdcdcd</a><span class="hash"></span><span class="ag-note">forked from</span>"#, "cd".repeat(32))), "{html}");
     }
 
     /// A block off the main chain says so, and links only by hash: its

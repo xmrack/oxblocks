@@ -1,40 +1,23 @@
 {% extends "base.html" %}
 {% block title %}Alternative chains &mdash; oxblocks{% endblock %}
 {% block content %}
-<h1>Alternative chains<span class="sub">{{ chains.len() }} known to this node</span></h1>
+<h1>Alternative chains<span class="sub">{{ count }} known to this node</span></h1>
 
-{% if chains.is_empty() %}
+{% if count == 0 %}
 <p class="empty">
   This node is not tracking any alternative chain. That is the normal state:
   alternatives appear when two blocks are found at nearly the same time, and
   are usually resolved within a block or two.
 </p>
 {% else %}
-<div class="scroll">
-<table>
-  <thead>
-    <tr>
-      <th class="num">Diverged at</th>
-      <th class="num">Tip</th>
-      <th class="num">Blocks</th>
-      <th>Tip hash</th>
-      <th class="num">Cumulative difficulty</th>
-      <th>Forked from</th>
-    </tr>
-  </thead>
-  <tbody>
-  {% for c in chains %}
-    <tr>
-      <td class="num"><a href="/block/{{ c.diverged }}">{{ c.diverged }}</a></td>
-      <td class="num">{{ c.tip }}</td>
-      <td class="num">{{ c.length }}</td>
-      <td><span class="hash">{{ c.block_hash }}</span></td>
-      <td class="num">{{ c.difficulty }}</td>
-      <td><a class="hash" href="/block/{{ c.parent }}">{{ c.parent }}</a></td>
-    </tr>
-  {% endfor %}
-  </tbody>
-</table>
+<div class="alt-graph">
+<svg width="{{ graph.width }}" height="{{ graph.height }}" viewBox="0 0 {{ graph.width }} {{ graph.height }}" aria-hidden="true">{% for (class, d) in graph.paths %}<path class="{{ class }}" d="{{ d }}"/>{% endfor %}{% for (class, x, y) in graph.blocks %}<rect class="{{ class }}" x="{{ x - 5 }}" y="{{ y - 5 }}" width="10" height="10" rx="2"/>{% endfor %}</svg>
+<div>
+{% for row in graph.rows %}{% match row %}{% when alt_graph::Row::Block with { height, main, on_main, alts, tip, parent } %}<div class="ag-row">{% if *on_main %}<a class="ag-h" href="/block/{{ height }}">{{ height }}</a>{% else %}<span class="ag-h">{{ height }}</span>{% endif %}{% if let Some(h) = main %}<a class="hash" href="/block/{{ h }}" title="{{ h }}">{{ alt_graph::short(h) }}</a>{% else %}<span class="hash"></span>{% endif %}{% for a in alts %}{% if let Some(h) = a %}<a class="hash ag-alt" href="/block/{{ h }}" title="{{ h }}">{{ alt_graph::short(h) }}</a>{% else %}<span class="hash"></span>{% endif %}{% endfor %}{% if *tip %}<span class="tag">tip</span>{% endif %}{% if *parent %}<span class="ag-note">forked from</span>{% endif %}</div>
+{% when alt_graph::Row::Gap(_) %}<div class="ag-gap">{{ row.gap_text() }}</div>
+{% when alt_graph::Row::Tail %}<div class="ag-gap"></div>
+{% endmatch %}{% endfor %}
+</div>
 </div>
 
 <p class="empty">

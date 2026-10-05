@@ -573,6 +573,25 @@ dl.kv.spaced { margin-top: 0.8rem; }
 .tree-field .tf-brk { stroke: var(--fg-faint); stroke-width: 1; fill: none; }
 .tree-field .tf-meas { fill: var(--fg-muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .tree-field .tf-short { fill: var(--accent); font-weight: 600; }
+
+/* ---------- alternative chains ---------- */
+
+.alt-graph { display: grid; grid-template-columns: auto minmax(0, 1fr); overflow-x: auto; margin-bottom: 1rem; }
+.alt-graph svg { display: block; }
+.ag-row, .ag-gap { display: flex; align-items: center; gap: 0.9rem; white-space: nowrap; font-size: 0.9rem; }
+.ag-row { height: 36px; }
+.ag-gap { height: 30px; color: var(--fg-faint); font-size: 0.8rem; }
+.ag-h { min-width: 4.6em; font-variant-numeric: tabular-nums; }
+.alt-graph .hash { display: inline-block; min-width: 8.5ch; font-size: 0.85rem; color: var(--fg-muted); }
+.alt-graph a.ag-alt { color: var(--accent); }
+.ag-note { font-size: 0.8rem; color: var(--fg-faint); }
+.ag-ln { fill: none; stroke: var(--fg-faint); stroke-width: 2; }
+.ag-alt.ag-ln { stroke: var(--accent); stroke-width: 1.6; }
+.ag-dash { stroke-dasharray: 2 5; stroke-linecap: round; }
+.ag-fade { stroke-dasharray: 1 4; opacity: 0.6; }
+.ag-blk { fill: var(--fg-muted); stroke: var(--bg); stroke-width: 2; }
+.ag-tip { fill: var(--fg); }
+.ag-altb { fill: var(--bg); stroke: var(--accent); stroke-width: 1.8; }
 @media (prefers-reduced-motion: no-preference) {
   .tree-field .tf-bloom { animation: tf-breathe 6s ease-in-out infinite alternate; }
 }
