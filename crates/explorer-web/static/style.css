@@ -567,14 +567,9 @@ dl.kv.spaced { margin-top: 0.8rem; }
 .tree-field .tf-name { fill: var(--fg); font-size: 13px; font-weight: 600; }
 .tree-field .tf-cv { fill: var(--fg-muted); font-weight: 400; }
 .tree-field .tf-sub { fill: var(--fg-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
-.tree-field .tf-hash {
-  fill: var(--fg-muted);
-  font: 10.5px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-}
 .tree-field .tf-lnk { fill: var(--accent); }
 .tree-field .tf-name.tf-sm { font-size: 11.5px; }
 .tree-field .tf-sub.tf-sm { font-size: 10.5px; }
-.tree-field .tf-hash.tf-sm { font-size: 9px; }
 .tree-field .tf-brk { stroke: var(--fg-faint); stroke-width: 1; fill: none; }
 .tree-field .tf-meas { fill: var(--fg-muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .tree-field .tf-short { fill: var(--accent); font-weight: 600; }

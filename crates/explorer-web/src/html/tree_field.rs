@@ -121,8 +121,6 @@ pub struct RowLabel {
 }
 
 pub struct Line {
-    /// `sub`, or `hash` for a line of the root hash.
-    pub class: &'static str,
     pub y: String,
     pub text: String,
     /// A block the line ends with, linked.
@@ -152,7 +150,6 @@ pub fn tree_field(
         .unwrap_or(n);
     let l = Layout::new(n, seed)?;
     let about = About {
-        root,
         as_of,
         root_block,
         aria: aria(&l, as_of, root_block),
@@ -164,14 +161,13 @@ pub fn tree_field(
 }
 
 /// What the pictures say beside the tree's shape.
-struct About<'a> {
-    root: Option<&'a str>,
+struct About {
     as_of: Option<u64>,
     root_block: Option<u64>,
     aria: String,
 }
 
-fn picture(l: &Layout, f: &Frame, art: Vec<Stroke>, about: &About<'_>) -> TreeField {
+fn picture(l: &Layout, f: &Frame, art: Vec<Stroke>, about: &About) -> TreeField {
     let wide = f.wide();
     let (axis, ticks, leads) = axis(l, f);
     let (brackets, measures) = measures(l, f);
@@ -251,8 +247,7 @@ impl Layout {
         let low = sizes.iter().position(|&s| s <= MAX_EXACT).unwrap_or(top);
         let nb = usize::try_from(at_u(&sizes, low)).unwrap_or(1).max(1);
 
-        // Room under the root for its hash, and the most for the last gap,
-        // where the strands open.
+        // The most room for the last gap, where the strands open.
         let rows = top - low + 1;
         let mut ys = vec![0.0; top + 1];
         let mut y = ROOT_Y;
@@ -262,8 +257,6 @@ impl Layout {
                 196.0
             } else if i == rows - 2 {
                 if low == 0 { 150.0 } else { 128.0 }
-            } else if i == 0 {
-                112.0
             } else {
                 96.0
             };
@@ -742,14 +735,10 @@ fn axis(l: &Layout, f: &Frame) -> (String, String, Vec<String>) {
     (axis, ticks, leads)
 }
 
-fn labels(l: &Layout, f: &Frame, about: &About<'_>) -> Vec<RowLabel> {
+fn labels(l: &Layout, f: &Frame, about: &About) -> Vec<RowLabel> {
     let wide = f.wide();
     let x = if wide { 13.0 } else { 11.0 };
-    let (first, step, hash_step) = if wide {
-        (15.0, 12.0, 12.0)
-    } else {
-        (12.5, 11.5, 10.5)
-    };
+    let (first, step) = if wide { (15.0, 12.0) } else { (12.5, 11.5) };
     rows(l)
         .map(|lv| {
             let y = l.y(lv);
@@ -760,62 +749,44 @@ fn labels(l: &Layout, f: &Frame, about: &About<'_>) -> Vec<RowLabel> {
                 _ if lv == l.top => ("Root".to_owned(), wide.then(|| curve.to_owned())),
                 _ => (format!("Layer {lv}"), wide.then(|| curve.to_owned())),
             };
-            let mut texts: Vec<(&'static str, String, Option<u64>)> = Vec::new();
+            let mut texts: Vec<(String, Option<u64>)> = Vec::new();
             if lv == l.top {
                 if !wide {
-                    texts.push(("sub", curve.to_owned(), None));
-                }
-                if let Some(root) = about.root {
-                    let chars: Vec<char> = root.chars().collect();
-                    for line in chars.chunks(16) {
-                        texts.push(("hash", line.iter().collect(), None));
-                    }
+                    texts.push((curve.to_owned(), None));
                 }
                 if let Some(b) = about.root_block {
-                    texts.push(("sub", "in block ".to_owned(), Some(b)));
+                    texts.push(("in block ".to_owned(), Some(b)));
                 }
             } else if lv == 0 {
                 if !wide {
-                    texts.push(("sub", grouped(l.n), None));
+                    texts.push((grouped(l.n), None));
                 }
                 if let Some(b) = about.as_of {
-                    texts.push(("sub", "as of block ".to_owned(), Some(b)));
+                    texts.push(("as of block ".to_owned(), Some(b)));
                 }
             } else {
                 let size = l.size(lv);
                 let nodes = format!("{} node{}", grouped(size), plural(size));
                 let groups = format!("{} under each", children(lv));
                 if wide {
-                    texts.push(("sub", format!("{nodes} · {groups}"), None));
+                    texts.push((format!("{nodes} · {groups}"), None));
                 } else if lv < l.low {
-                    texts.push(("sub", format!("{curve} · {}", grouped(size)), None));
-                    texts.push(("sub", groups, None));
+                    texts.push((format!("{curve} · {}", grouped(size)), None));
+                    texts.push((groups, None));
                 } else {
-                    texts.push(("sub", curve.to_owned(), None));
-                    texts.push(("sub", nodes, None));
-                    texts.push(("sub", groups, None));
+                    texts.push((curve.to_owned(), None));
+                    texts.push((nodes, None));
+                    texts.push((groups, None));
                 }
             }
 
-            // Hash lines follow closer together, and the root's block a
-            // little apart from them.
-            let mut at_y = y + 4.5 + first;
-            let mut was_hash = false;
             let lines = texts
                 .into_iter()
-                .map(|(class, text, block)| {
-                    if was_hash && class != "hash" {
-                        at_y += 2.0;
-                    }
-                    let line = Line {
-                        class,
-                        y: num(at_y),
-                        text,
-                        block,
-                    };
-                    at_y += if class == "hash" { hash_step } else { step };
-                    was_hash = class == "hash";
-                    line
+                .zip(0u32..)
+                .map(|((text, block), i)| Line {
+                    y: num(f64::from(i).mul_add(step, y + 4.5 + first)),
+                    text,
+                    block,
                 })
                 .collect();
 
@@ -1011,17 +982,8 @@ mod tests {
         assert_eq!(lines(label(&wide, "Layer 2")), ["3 nodes · 18 under each"]);
         let root = label(&wide, "Root");
         assert_eq!(root.aside.as_deref(), Some("Selene"));
-        assert_eq!(
-            lines(root),
-            [
-                &ROOT[..16],
-                &ROOT[16..32],
-                &ROOT[32..48],
-                &ROOT[48..],
-                "in block "
-            ]
-        );
-        assert_eq!(root.lines[4].block, Some(329));
+        assert_eq!(lines(root), ["in block "]);
+        assert_eq!(root.lines[0].block, Some(329));
         assert_eq!(label(&wide, "Outputs").lines[0].block, Some(337));
 
         let notes: Vec<(&str, Option<&str>)> = wide
