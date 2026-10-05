@@ -25,7 +25,8 @@ pub struct AltGraph {
     pub width: u64,
     pub height: u64,
     pub paths: Vec<(&'static str, String)>,
-    pub blocks: Vec<(&'static str, u64, u64)>,
+    /// Class, centre and side.
+    pub blocks: Vec<(&'static str, u64, u64, u64)>,
     pub rows: Vec<Row>,
 }
 
@@ -185,7 +186,12 @@ pub fn alt_graph(
                 if *on_main {
                     let top = if *is_tip { cy } else { y };
                     paths.push(("ag-ln", format!("M{x0} {top}V{}", y + rh)));
-                    blocks.push((if *is_tip { "ag-blk ag-tip" } else { "ag-blk" }, x0, cy));
+                    if *is_tip {
+                        blocks.push(("ag-ring", x0, cy, 18));
+                        blocks.push(("ag-blk ag-tip", x0, cy, 10));
+                    } else {
+                        blocks.push(("ag-blk", x0, cy, 10));
+                    }
                 }
                 for f in forks.iter().filter(|f| f.shown(*height)) {
                     let x = lane_x(f.lane + 1);
@@ -201,7 +207,7 @@ pub fn alt_graph(
                     } else {
                         paths.push(("ag-ln ag-alt", format!("M{x} {cy}V{}", y + rh)));
                     }
-                    blocks.push(("ag-blk ag-altb", x, cy));
+                    blocks.push(("ag-blk ag-altb", x, cy, 10));
                 }
                 prev = Some(*height);
             }
@@ -403,6 +409,12 @@ mod tests {
             g.blocks.iter().filter(|b| b.0 == "ag-blk ag-tip").count(),
             1
         );
-        assert_eq!(g.blocks.iter().filter(|b| b.1 == lane_x(0)).count(), 2);
+        assert_eq!(
+            g.blocks
+                .iter()
+                .filter(|b| b.0 != "ag-ring" && b.1 == lane_x(0))
+                .count(),
+            2
+        );
     }
 }

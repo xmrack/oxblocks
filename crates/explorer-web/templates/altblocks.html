@@ -10,17 +10,20 @@
   are usually resolved within a block or two.
 </p>
 {% else %}
+<figure class="alt-panel">
 <div class="alt-graph">
-<svg width="{{ graph.width }}" height="{{ graph.height }}" viewBox="0 0 {{ graph.width }} {{ graph.height }}" aria-hidden="true">{% for (class, d) in graph.paths %}<path class="{{ class }}" d="{{ d }}"/>{% endfor %}{% for (class, x, y) in graph.blocks %}<rect class="{{ class }}" x="{{ x - 5 }}" y="{{ y - 5 }}" width="10" height="10" rx="2"/>{% endfor %}</svg>
+<svg width="{{ graph.width }}" height="{{ graph.height }}" viewBox="0 0 {{ graph.width }} {{ graph.height }}" aria-hidden="true">{% for (class, d) in graph.paths %}<path class="{{ class }}" d="{{ d }}"/>{% endfor %}{% for (class, x, y, side) in graph.blocks %}<rect class="{{ class }}" x="{{ x - side / 2 }}" y="{{ y - side / 2 }}" width="{{ side }}" height="{{ side }}" rx="{{ side / 5 }}"/>{% endfor %}</svg>
 <div>
+<div class="ag-head"><span class="ag-h">Height</span><span class="hash">Main chain</span><span class="hash">Alternative</span></div>
 {% for row in graph.rows %}{% match row %}{% when alt_graph::Row::Block with { height, main, on_main, alts, tip, parent } %}<div class="ag-row">{% if *on_main %}<a class="ag-h" href="/block/{{ height }}">{{ height }}</a>{% else %}<span class="ag-h">{{ height }}</span>{% endif %}{% if let Some(h) = main %}<a class="hash" href="/block/{{ h }}" title="{{ h }}">{{ alt_graph::short(h) }}</a>{% else %}<span class="hash"></span>{% endif %}{% for a in alts %}{% if let Some(h) = a %}<a class="hash ag-alt" href="/block/{{ h }}" title="{{ h }}">{{ alt_graph::short(h) }}</a>{% else %}<span class="hash"></span>{% endif %}{% endfor %}{% if *tip %}<span class="tag">tip</span>{% endif %}{% if *parent %}<span class="ag-note">forked from</span>{% endif %}</div>
 {% when alt_graph::Row::Gap(_) %}<div class="ag-gap">{{ row.gap_text() }}</div>
 {% when alt_graph::Row::Tail %}<div class="ag-gap"></div>
 {% endmatch %}{% endfor %}
 </div>
 </div>
+</figure>
 
-<p class="empty">
+<p class="empty alt-note">
   An alternative chain is a branch this node has seen but not adopted. Its
   blocks are valid; they simply lost. A chain longer than one or two blocks is
   worth noticing.
