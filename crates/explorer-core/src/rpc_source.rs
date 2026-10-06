@@ -1279,7 +1279,9 @@ impl RpcChainSource {
         let hashes: Vec<Hash32> = listed.clone().filter_map(|h| h.parse().ok()).collect();
         let fetched = self.transactions(&hashes).await?;
         let expected = listed.count();
-        if fetched.txs.len() != expected {
+        // An orphan's coinbase, and any transaction only it mined, are on no
+        // chain the daemon can return them from.
+        if fetched.txs.len() != expected && !block.block_header.orphan_status {
             return Err(ChainError::BadAnswer {
                 what: "get_transactions",
                 detail: format!(
@@ -2756,6 +2758,11 @@ mod tests {
             })
         ));
         assert_eq!(src.block_kib.available_permits(), all);
+
+        block.block_header.orphan_status = true;
+        let (fetched, _held) = src.block_transactions(&block).await.unwrap();
+        assert_eq!(fetched.txs.len(), 1);
+        assert_eq!(fetched.missed, ["bb".repeat(32)]);
     }
 
     /// A daemon that fails to answer a transaction's one `get_outs` is not

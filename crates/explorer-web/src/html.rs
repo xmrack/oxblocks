@@ -91,6 +91,8 @@ struct BlockPage {
     tx_count: usize,
     /// Transactions the daemon sent that did not decode, so have no row.
     unreadable: usize,
+    /// An orphan's transactions the daemon does not have.
+    unlisted: usize,
     /// Not on the main chain: reached by its hash, an alternative block.
     orphan: bool,
     reward: String,
@@ -1518,7 +1520,8 @@ pub async fn block(
         })
         .collect::<Vec<_>>();
     let unreadable = fetched.txs.len().saturating_sub(txs.len());
-    let tx_count = table_tx_count(&txs) + unreadable;
+    let unlisted = fetched.missed.len();
+    let tx_count = table_tx_count(&txs) + unreadable + unlisted;
     if let Some((key, dir)) = active {
         sort_block_rows(&mut txs, key, dir);
     }
@@ -1573,6 +1576,7 @@ pub async fn block(
             weight: header.block_weight,
             tx_count,
             unreadable,
+            unlisted,
             orphan: header.orphan_status,
             reward: xmr(header.reward),
             difficulty: header.difficulty().to_string(),
@@ -3938,6 +3942,7 @@ mod tests {
             weight: 40_490,
             tx_count: table_tx_count(&txs),
             unreadable: 0,
+            unlisted: 0,
             orphan: false,
             reward: "0.60160672".to_owned(),
             difficulty: "691253322598".to_owned(),
@@ -5691,6 +5696,21 @@ mod tests {
             html.contains(
                 "2 of this block's transactions could not\nbe read, so they are not\nlisted below."
             ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn an_orphans_unlisted_transactions_are_counted_and_noted() {
+        let mut page = block_page();
+        page.orphan = true;
+        assert!(!page.render().expect("renders").contains("neither on"));
+        page.unlisted = 1;
+        page.tx_count += 1;
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Transactions</dt><dd>4</dd>"));
+        assert!(
+            html.contains("1 of its transactions is neither on\nthe main chain nor in the mempool, so it is not listed below."),
             "{html}"
         );
     }

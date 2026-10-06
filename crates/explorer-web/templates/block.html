@@ -6,7 +6,8 @@
 {% if orphan %}
 <div class="notice">This block is not on the main chain. Another block with
 number {{ height }} won, and this one's transactions count only where that
-block's do too.</div>
+block's do too.{% if unlisted > 0 %} {{ unlisted }} of its transactions {% if unlisted == 1 %}is{% else %}are{% endif %} neither on
+the main chain nor in the mempool, so {% if unlisted == 1 %}it is{% else %}they are{% endif %} not listed below.{% endif %}</div>
 {% endif %}
 {% if unreadable > 0 %}
 <div class="notice">{{ unreadable }} of this block's transactions could not
