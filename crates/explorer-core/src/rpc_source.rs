@@ -7,9 +7,9 @@ use monerod_rpc::types::error_code;
 use monerod_rpc::types::{
     FeeEstimate, GetAlternateChains, GetBlock, GetBlockHeader, GetBlockHeadersRange,
     GetBlockHeadersRangeRequest, GetBlockRequest, GetFeeEstimateRequest, GetInfo, GetOutsRequest,
-    GetTransactionPool, GetTransactionPoolStats, GetTransactionsRequest, GetTxidsLooseRequest,
-    GetTxidsLooseResponse, OutKey, OutKeyRequest, PathQuery, TreePaths, TreeSizeQuery, TxEntry,
-    TxInToKey, TxJson,
+    GetTransactionPoolHashes, GetTransactionPoolStats, GetTransactionsRequest,
+    GetTxidsLooseRequest, GetTxidsLooseResponse, OutKey, OutKeyRequest, PathQuery, PoolTxInfo,
+    TreePaths, TreeSizeQuery, TxEntry, TxInToKey, TxJson,
 };
 use monerod_rpc::{Client, RpcError};
 
@@ -35,6 +35,12 @@ pub struct FetchedTxs {
     pub txs: Vec<TxEntry>,
     /// Hashes monerod does not have, as it returned them.
     pub missed: Vec<String>,
+}
+
+/// The mempool, newest first.
+#[derive(Debug, Default)]
+pub struct Mempool {
+    pub transactions: Vec<Arc<PoolTxInfo>>,
 }
 
 /// Put a fetched batch back into the order it was asked for.
@@ -69,9 +75,11 @@ pub struct RpcChainSource {
     /// invalidated.
     info: Cache<(), GetInfo>,
     /// The mempool, newest first, for as long as a page takes to ask for it
-    /// twice: a pool of thousands is megabytes for the daemon to write. As
-    /// large as the client's response ceiling allows.
-    pool: Cache<(), GetTransactionPool>,
+    /// twice.
+    pool: Cache<(), Mempool>,
+    /// Every pool transaction fetched so far and still in the pool, so that a
+    /// refresh fetches only those that arrived since.
+    pool_txs: std::sync::Mutex<HashMap<Hash32, Arc<PoolTxInfo>>>,
     /// Curve-tree sizes keyed by the block they were taken at, cached only once
     /// that block is buried past [`REORG_WINDOW`]: a reorg gives a height a
     /// different block, and with it a different tree.
@@ -405,6 +413,7 @@ impl RpcChainSource {
             // short enough that the height on screen is never visibly stale.
             info: Cache::expiring(1, Duration::from_secs(5)),
             pool: Cache::expiring(1, Duration::from_secs(2)),
+            pool_txs: std::sync::Mutex::default(),
             tree_sizes: Cache::permanent(4096),
             // The keys of a replaced tip are never asked for again; they
             // expire rather than wait to be pushed out.
@@ -1368,10 +1377,12 @@ impl RpcChainSource {
 
     /// The mempool.
     ///
-    /// Blocked under `--restricted-rpc`, so a restricted daemon surfaces as
-    /// [`ChainError::NeedsUnrestricted`] rather than as a generic failure --
-    /// the page is unavailable by configuration, not broken.
-    pub async fn mempool(&self) -> Result<Arc<GetTransactionPool>, ChainError> {
+    /// `/get_transaction_pool` sends every transaction in full on every call,
+    /// hundreds of megabytes for a pool of thousands. This asks for the pool's
+    /// hashes and fetches only the transactions not already held.
+    ///
+    /// A restricted daemon answers for the transactions it would relay.
+    pub async fn mempool(&self) -> Result<Arc<Mempool>, ChainError> {
         if let Some(hit) = self.pool.get(&()) {
             return Ok(hit);
         }
@@ -1379,16 +1390,47 @@ impl RpcChainSource {
         if let Some(hit) = self.pool.get(&()) {
             return Ok(hit);
         }
-        let mut pool: GetTransactionPool = self
-            .bare("get_transaction_pool", &serde_json::json!({}))
-            .await
-            .map_err(|e| match &e {
-                RpcError::Http { status: 404, .. } => ChainError::NeedsUnrestricted("the mempool"),
-                _ => ChainError::from(e),
-            })?;
+        let listed: GetTransactionPoolHashes = self
+            .bare("get_transaction_pool_hashes", &serde_json::json!({}))
+            .await?;
+        let hashes: HashSet<Hash32> = listed
+            .tx_hashes
+            .iter()
+            .filter_map(|h| h.parse().ok())
+            .collect();
 
-        newest_first(&mut pool.transactions);
-        Ok(self.pool.insert((), pool))
+        let new: Vec<Hash32> = {
+            let held = self.held_pool();
+            hashes
+                .iter()
+                .filter(|h| !held.contains_key(h))
+                .copied()
+                .collect()
+        };
+        // One batch at a time, so that only one batch's blobs are held.
+        for batch in new.chunks(MAX_TXS_PER_CALL) {
+            let fetched = self.transactions(batch).await?;
+            let mut held = self.held_pool();
+            for e in &fetched.txs {
+                if let (Some(info), Ok(h)) = (pool_entry(e), e.tx_hash.parse::<Hash32>()) {
+                    held.insert(h, Arc::new(info));
+                }
+            }
+        }
+
+        let mut transactions: Vec<Arc<PoolTxInfo>> = {
+            let mut held = self.held_pool();
+            held.retain(|h, _| hashes.contains(h));
+            held.values().cloned().collect()
+        };
+        newest_first(&mut transactions);
+        Ok(self.pool.insert((), Mempool { transactions }))
+    }
+
+    fn held_pool(&self) -> std::sync::MutexGuard<'_, HashMap<Hash32, Arc<PoolTxInfo>>> {
+        self.pool_txs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The pool's aggregate figures, without the pool.
@@ -1686,8 +1728,42 @@ enum Batch {
 /// monerod returns the pool in its own internal order, which is neither
 /// arrival order nor stable between calls. Newest first is the only order a
 /// pool listing means anything in, so the pool is sorted here.
-fn newest_first(txs: &mut [monerod_rpc::types::PoolTxInfo]) {
-    txs.sort_by_key(|t| std::cmp::Reverse(t.receive_time));
+fn newest_first(txs: &mut [Arc<PoolTxInfo>]) {
+    txs.sort_by(|a, b| {
+        b.receive_time
+            .cmp(&a.receive_time)
+            .then_with(|| a.id_hash.cmp(&b.id_hash))
+    });
+}
+
+/// A pool transaction as `/get_transactions` sent it, in the shape
+/// `/get_transaction_pool` would have, without the blob. `None` once mined.
+fn pool_entry(e: &TxEntry) -> Option<PoolTxInfo> {
+    if !e.in_pool {
+        return None;
+    }
+    let fee = e
+        .parse_json()
+        .ok()
+        .map_or(0, |tx| crate::tx::TxFacts::from_entry(e, &tx).fee);
+    Some(PoolTxInfo {
+        id_hash: e.tx_hash.to_lowercase(),
+        tx_json: e.as_json.clone(),
+        blob_size: e.raw_hex_len().map_or(0, |n| (n / 2) as u64),
+        weight: 0,
+        fee,
+        max_used_block_id_hash: String::new(),
+        max_used_block_height: 0,
+        kept_by_block: false,
+        last_failed_height: 0,
+        last_failed_id_hash: String::new(),
+        receive_time: e.received_timestamp,
+        relayed: e.relayed,
+        last_relayed_time: 0,
+        do_not_relay: false,
+        double_spend_seen: e.double_spend_seen,
+        tx_blob: String::new(),
+    })
 }
 
 /// A transaction's inputs, listed but not expanded.
@@ -1873,7 +1949,7 @@ mod tests {
     /// show the oldest unconfirmed transaction as the newest.
     #[test]
     fn the_pool_is_ordered_by_arrival_newest_first() {
-        let mut pool: Vec<monerod_rpc::types::PoolTxInfo> = [30u64, 10, 20]
+        let mut pool: Vec<Arc<PoolTxInfo>> = [30u64, 10, 20]
             .into_iter()
             .map(|t| {
                 serde_json::from_value(serde_json::json!({
@@ -1892,6 +1968,7 @@ mod tests {
                     "double_spend_seen": false,
                     "tx_blob": "",
                 }))
+                .map(Arc::new)
                 .expect("a minimal pool entry")
             })
             .collect();
@@ -2470,7 +2547,7 @@ mod tests {
         for _ in 0..3 {
             assert!(src.mempool().await.unwrap().transactions.is_empty());
         }
-        assert_eq!(daemon.count("get_transaction_pool"), 1);
+        assert_eq!(daemon.count("get_transaction_pool_hashes"), 1);
     }
 
     /// Pages missing the pool together share one fetch of it.
@@ -2483,7 +2560,62 @@ mod tests {
         let src = daemon.source();
         let all = futures_util::future::join_all((0..6).map(|_| src.mempool())).await;
         assert!(all.iter().all(Result::is_ok));
-        assert_eq!(daemon.count("get_transaction_pool"), 1);
+        assert_eq!(daemon.count("get_transaction_pool_hashes"), 1);
+    }
+
+    /// A refresh fetches only the transactions that arrived since the last,
+    /// and forgets those that left.
+    #[tokio::test]
+    async fn the_pool_fetches_only_what_arrived_since() {
+        let pool = Arc::new(std::sync::Mutex::new(vec![1u64, 2]));
+        let listed = Arc::clone(&pool);
+        let daemon = FakeDaemon::start(move |what, body| match what {
+            "get_transaction_pool_hashes" => serde_json::json!({
+                "tx_hashes": listed.lock().unwrap().iter().map(|n| format!("{n:064x}")).collect::<Vec<_>>(),
+                "status": "OK",
+            }),
+            "get_transactions" => serde_json::json!({
+                "txs": body["txs_hashes"].as_array().unwrap().iter().map(|h| {
+                    let n = u64::from_str_radix(&h.as_str().unwrap()[48..], 16).unwrap();
+                    serde_json::json!({
+                        "tx_hash": h, "in_pool": true, "received_timestamp": n * 100,
+                        "as_hex": "ab".repeat(n as usize),
+                        "as_json": serde_json::json!({
+                            "version": 2, "unlock_time": 0, "extra": [], "vin": [], "vout": [],
+                            "rct_signatures": {"type": 6, "txnFee": n * 10},
+                        }).to_string(),
+                    })
+                }).collect::<Vec<_>>(),
+                "status": "OK",
+            }),
+            _ => {
+                serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": Chain { tip: 9, fork: 0 }.info()})
+            }
+        });
+        let mut src = daemon.source();
+        src.pool = Cache::expiring(1, Duration::ZERO);
+        let seen = |p: &Mempool| {
+            p.transactions
+                .iter()
+                .map(|t| (t.receive_time, t.fee, t.blob_size))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            seen(&src.mempool().await.unwrap()),
+            [(200, 20, 2), (100, 10, 1)]
+        );
+        *pool.lock().unwrap() = vec![2, 3];
+        assert_eq!(
+            seen(&src.mempool().await.unwrap()),
+            [(300, 30, 3), (200, 20, 2)]
+        );
+        let asked: Vec<usize> = daemon
+            .bodies("get_transactions")
+            .iter()
+            .map(|b| b["txs_hashes"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(asked, [2, 1]);
     }
 
     /// The tip missed at once is asked for once.

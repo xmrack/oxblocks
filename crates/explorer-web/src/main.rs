@@ -358,9 +358,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             if info.restricted {
                 tracing::warn!(
-                    "this daemon is restricted: /get_transaction_pool, \
-                     get_alternate_chains and get_alt_blocks_hashes are blocked, \
-                     so the mempool and alt-block pages will be unavailable"
+                    "this daemon is restricted: get_alternate_chains and \
+                     get_alt_blocks_hashes are blocked, so the alt-block pages \
+                     will be unavailable, and the mempool lists only what it relays"
                 );
             }
         }

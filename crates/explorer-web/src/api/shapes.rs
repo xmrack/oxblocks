@@ -289,12 +289,7 @@ impl TxDetail {
     }
 
     /// The same shape for a transaction still in the pool, built from the pool
-    /// listing itself.
-    ///
-    /// `/get_transaction_pool` already carries each transaction's JSON, so
-    /// asking `/get_transactions` for the same hashes is a round trip spent
-    /// re-fetching what the daemon has already sent. A pool entry states its
-    /// own size and fee, which is why `TxFacts` has a second constructor.
+    /// listing itself, which carries each transaction's JSON, size and fee.
     pub fn build_pool(
         info: &PoolTxInfo,
         tx: &TxJson,

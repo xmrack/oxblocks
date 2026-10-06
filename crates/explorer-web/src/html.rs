@@ -8,7 +8,7 @@
 //! Content-Security-Policy is `default-src 'none'; style-src 'self'`, so the
 //! browser enforces that independently of what these templates emit.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use askama::Template;
 use axum::extract::{Path, Query, State};
@@ -1040,11 +1040,11 @@ impl RowCache {
 
 fn pool_rows(
     rows: &RowCache,
-    pool: &[PoolTxInfo],
+    pool: &[Arc<PoolTxInfo>],
     active: Option<(SortKey, SortDir)>,
     asked_at: u64,
 ) -> Vec<PoolRow> {
-    let mut listed: Vec<&PoolTxInfo> = pool.iter().collect();
+    let mut listed: Vec<&PoolTxInfo> = pool.iter().map(|t| &**t).collect();
     if let Some((key, dir)) = active {
         sort_rows(&mut listed, dir, |t| key.of(t, asked_at));
     }
@@ -2289,17 +2289,6 @@ pub async fn mempool(State(state): Shared, Query(q): Query<SortQuery>) -> Page {
 
     let pool = match state.chain.mempool().await {
         Ok(p) => p,
-        Err(ChainError::NeedsUnrestricted(what)) => {
-            return error_page(
-                chain,
-                StatusCode::NOT_IMPLEMENTED,
-                "The mempool is unavailable",
-                &format!(
-                    "Showing {what} needs an unrestricted daemon. This one runs with \
-                     --restricted-rpc, which blocks /get_transaction_pool."
-                ),
-            );
-        }
         Err(e) => return chain_error_page(chain, &e, "Could not load the mempool"),
     };
 
@@ -4118,6 +4107,7 @@ mod tests {
             pool_tx(970, 100, 1_000),
             pool_tx(980, 200, 3_000),
         ];
+        let pool = pool.map(Arc::new);
         let rows = |key, dir| pool_rows(&RowCache::default(), &pool, Some((key, dir)), 1_000);
 
         assert_eq!(fees(&rows(SortKey::Fee, SortDir::Asc)), [100, 200, 300]);
@@ -4190,7 +4180,7 @@ mod tests {
             })).collect::<Vec<_>>(),
         })
         .to_string();
-        let rows = pool_rows(&RowCache::default(), &[tx], None, 0);
+        let rows = pool_rows(&RowCache::default(), &[Arc::new(tx)], None, 0);
         assert_eq!((rows[0].inputs, rows[0].outputs), (3, 5));
 
         let html = mempool_page(None).render().expect("renders");
@@ -4212,8 +4202,8 @@ mod tests {
     /// rows shown are the top of the whole pool, and says so.
     #[test]
     fn a_long_pool_shows_the_top_of_its_sorted_whole() {
-        let pool: Vec<PoolTxInfo> = (1..=MEMPOOL_ROWS as u64 + 20)
-            .map(|fee| pool_tx(0, fee, 1))
+        let pool: Vec<Arc<PoolTxInfo>> = (1..=MEMPOOL_ROWS as u64 + 20)
+            .map(|fee| Arc::new(pool_tx(0, fee, 1)))
             .collect();
         let rows = pool_rows(
             &RowCache::default(),
@@ -4320,7 +4310,7 @@ mod tests {
     /// whichever direction was asked for, rather than flipping arbitrarily.
     #[test]
     fn rows_tied_on_the_sort_key_keep_their_original_order() {
-        let pool = [pool_tx(5, 100, 1), pool_tx(5, 200, 2), pool_tx(5, 300, 3)];
+        let pool = [pool_tx(5, 100, 1), pool_tx(5, 200, 2), pool_tx(5, 300, 3)].map(Arc::new);
         for dir in [SortDir::Desc, SortDir::Asc] {
             let rows = pool_rows(
                 &RowCache::default(),

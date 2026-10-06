@@ -66,9 +66,8 @@ impl Default for Limits {
 pub struct Config {
     /// monerod RPC URL. Must be an UNRESTRICTED daemon.
     ///
-    /// Under `--restricted-rpc` monerod blocks /get_transaction_pool,
-    /// get_alternate_chains and get_alt_blocks_hashes, which removes the
-    /// mempool and alt-block pages.
+    /// Under `--restricted-rpc` monerod blocks get_alternate_chains and
+    /// get_alt_blocks_hashes, which removes the alt-block pages.
     #[arg(
         long,
         env = "OXBLOCKS_DAEMON_URL",

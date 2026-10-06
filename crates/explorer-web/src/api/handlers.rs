@@ -51,7 +51,7 @@ struct KeptRecent {
 }
 
 /// What a recent answer reads of `pool`, in order.
-fn pool_key(pool: &monerod_rpc::types::GetTransactionPool) -> Vec<(String, u64)> {
+fn pool_key(pool: &explorer_core::rpc_source::Mempool) -> Vec<(String, u64)> {
     pool.transactions
         .iter()
         .map(|t| (t.id_hash.clone(), t.receive_time))
@@ -758,14 +758,9 @@ pub async fn mempool(
     // MAX_MEMPOOL_LIMIT.
     let (page, limit) = q.parse(MAX_MEMPOOL_LIMIT, MAX_MEMPOOL_LIMIT)?;
 
-    let pool = state.chain.mempool().await.map_err(|e| match e {
-        ChainError::NeedsUnrestricted(what) => ApiError::unsupported(format!(
-            "{what} needs an unrestricted daemon; this one blocks /get_transaction_pool"
-        )),
-        other => {
-            tracing::warn!("mempool: {other}");
-            ApiError::daemon(other.public_message())
-        }
+    let pool = state.chain.mempool().await.map_err(|e| {
+        tracing::warn!("mempool: {e}");
+        ApiError::daemon(e.public_message())
     })?;
 
     let txs_no = pool.transactions.len() as u64;
@@ -1403,11 +1398,8 @@ pub struct RecentData {
 ///
 /// **The window is bounded; the pool beside it is not.** Every unconfirmed
 /// transaction is listed, because counting them in `mempool_txs_no` and then
-/// withholding them was a real bug here. monerod offers no paging on
-/// `/get_transaction_pool` either, so the whole pool is fetched for the
-/// `/mempool` page and for `/api/mempool` regardless — capping the listing
-/// would shrink the response without shrinking the fetch. During a mempool
-/// flood this is the most expensive endpoint here; see
+/// withholding them was a real bug here. During a mempool flood this is the
+/// most expensive endpoint here; see
 /// `deploy/oxblocks.service`, which sizes `MemoryMax` against
 /// `--max-concurrent` for exactly this family of requests.
 pub async fn transactions_recent(
@@ -1419,12 +1411,11 @@ pub async fn transactions_recent(
             .info()
             .await
             .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
-        let pool = state.chain.mempool().await.map_err(|e| match e {
-            ChainError::NeedsUnrestricted(what) => ApiError::unsupported(format!(
-                "{what} needs an unrestricted daemon; this one blocks /get_transaction_pool"
-            )),
-            other => on_chain_error(&other, "Cant get the mempool"),
-        })?;
+        let pool = state
+            .chain
+            .mempool()
+            .await
+            .map_err(|e| on_chain_error(&e, "Cant get the mempool"))?;
         Ok::<_, ApiError>((info, pool))
     };
 
@@ -1795,8 +1786,8 @@ mod tests {
                     "block_height": 0, "block_timestamp": 0, "confirmations": 1, "in_pool": false,
                     "double_spend_seen": false, "output_indices": [],
                 }], "status": "OK"}),
-                "get_transaction_pool" if pool => {
-                    serde_json::json!({"transactions": [], "status": "OK"})
+                "get_transaction_pool_hashes" if pool => {
+                    serde_json::json!({"tx_hashes": [], "status": "OK"})
                 }
                 _ => serde_json::json!({"status": "Failed"}),
             }
@@ -1946,10 +1937,12 @@ mod tests {
                 "tx_blob": "",
             })
         };
-        let pool: monerod_rpc::types::GetTransactionPool = serde_json::from_value(
-            serde_json::json!({"status": "OK", "transactions": [tx("a", 5), tx("b", 7)]}),
-        )
-        .unwrap();
+        let pool = explorer_core::rpc_source::Mempool {
+            transactions: [tx("a", 5), tx("b", 7)]
+                .into_iter()
+                .map(|t| Arc::new(serde_json::from_value(t).unwrap()))
+                .collect(),
+        };
         assert_eq!(pool_key(&pool), [("a".to_owned(), 5), ("b".to_owned(), 7)]);
     }
 

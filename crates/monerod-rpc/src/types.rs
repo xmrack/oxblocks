@@ -775,6 +775,22 @@ impl TxEntry {
 }
 
 // ---------------------------------------------------------------------------
+// /get_transaction_pool_hashes
+// ---------------------------------------------------------------------------
+
+/// `/get_transaction_pool_hashes`: the pool's hashes alone. An empty pool
+/// omits `tx_hashes`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetTransactionPoolHashes {
+    #[serde(default)]
+    pub tx_hashes: Vec<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub untrusted: bool,
+}
+
+// ---------------------------------------------------------------------------
 // /get_transaction_pool
 // ---------------------------------------------------------------------------
 

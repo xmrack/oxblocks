@@ -80,8 +80,8 @@ pub enum ChainError {
 
     /// The call needs an unrestricted daemon and this one is restricted.
     ///
-    /// monerod blocks `/get_transaction_pool`, `get_alternate_chains`,
-    /// `get_coinbase_tx_sum` and `/get_alt_blocks_hashes` under
+    /// monerod blocks `get_alternate_chains`, `get_coinbase_tx_sum` and
+    /// `/get_alt_blocks_hashes` under
     /// `--restricted-rpc`, so these pages are unavailable by configuration
     /// rather than broken.
     #[error("{0} requires an unrestricted monerod")]
