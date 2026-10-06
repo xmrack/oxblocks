@@ -605,6 +605,13 @@ dl.kv.spaced { margin-top: 0.8rem; }
 .ag-ring { fill: none; stroke: var(--fg-faint); stroke-width: 1; }
 .ag-altb { fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1.8; }
 .alt-note { max-width: 36rem; margin: 0 auto; text-align: center; }
+@media (max-width: 640px) {
+  .alt-panel { width: auto; padding: 0.7rem 0.8rem 0.4rem 0.3rem; }
+  .ag-head, .ag-row, .ag-gap { gap: 0.8rem; }
+  .ag-h { width: 4.1rem; }
+  .alt-graph .hash { width: 4.8rem; }
+  .alt-graph .ag-main, .ag-note { display: none; }
+}
 @media (prefers-reduced-motion: no-preference) {
   .tree-field .tf-bloom { animation: tf-breathe 6s ease-in-out infinite alternate; }
 }

@@ -5625,7 +5625,7 @@ mod tests {
         .expect("renders");
         assert!(html.contains("1 known to this node"));
         assert!(html.contains(&format!(
-            r#"<a class="ag-h" href="/block/103">103</a><a class="hash" href="/block/{0}" title="{0}">efefefef</a><a class="hash ag-alt" href="/block/{1}" title="{1}">abababab</a>"#,
+            r#"<a class="ag-h" href="/block/103">103</a><a class="hash ag-main" href="/block/{0}" title="{0}">efefefef</a><a class="hash ag-alt" href="/block/{1}" title="{1}">abababab</a>"#,
             "ef".repeat(32),
             "ab".repeat(32)
         )), "{html}");
