@@ -381,15 +381,32 @@ impl Layout {
         )
     }
 
-    /// How far the rule of `level` widens past the lowest drawn layer.
-    fn widening(&self, level: usize) -> f64 {
-        let k = (self.low - level) as f64;
-        (1.0 / RULED - 1.0).mul_add(k / self.low as f64, 1.0)
+    /// `x` on the lowest drawn layer spread out to the outputs' row.
+    fn widened(x: f64) -> f64 {
+        (x - CENTRE).mul_add(1.0 / RULED, CENTRE)
     }
 
-    /// `x` spread out by the rule of `level`'s widening.
-    fn widened(&self, level: usize, x: f64) -> f64 {
-        (x - CENTRE).mul_add(self.widening(level), CENTRE)
+    /// Where the drop from `x` on the lowest drawn layer crosses the row of
+    /// `level`, so that a rule ends on the drops that bound its subtree.
+    ///
+    /// A drop is [`s_curve`] with both handles half its height, so at `t` it
+    /// has come `1.5t - 1.5t² + t³` of the way down and `3t² - 2t³` of the
+    /// way across. The first only rises, so `t` is found by halving.
+    fn dropped(&self, level: usize, x: f64) -> f64 {
+        let (y0, y1) = (self.y(self.low), self.y(0));
+        let down = ((self.y(level) - y0) / (y1 - y0)).clamp(0.0, 1.0);
+        let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+        for _ in 0..40 {
+            let t = f64::midpoint(lo, hi);
+            if t.mul_add(t - 1.5, 1.5) * t < down {
+                lo = t;
+            } else {
+                hi = t;
+            }
+        }
+        let t = f64::midpoint(lo, hi);
+        let across = t * t * 2.0f64.mul_add(-t, 3.0);
+        (Self::widened(x) - x).mul_add(across, x)
     }
 
     /// A number in [0, 1) that the root hash and `parts` fix.
@@ -623,7 +640,7 @@ fn drops(l: &Layout) -> Stroke {
         for (x, o) in [(at(xs, a), -0.7), (at(xs, b), 0.7)] {
             d.push_str(&s_curve(
                 (x + o, y0),
-                (l.widened(0, x + o), y1),
+                (Layout::widened(x + o), y1),
                 reach,
                 reach,
                 0.0,
@@ -648,9 +665,9 @@ fn rules(l: &Layout) -> Vec<Stroke> {
                 .map(|&(a, b)| {
                     format!(
                         "M{} {}H{}",
-                        num(l.widened(lv, at(xs, a) - 0.7)),
+                        num(l.dropped(lv, at(xs, a) - 0.7)),
                         num(y),
-                        num(l.widened(lv, at(xs, b) + 0.7))
+                        num(l.dropped(lv, at(xs, b) + 0.7))
                     )
                 })
                 .collect();
@@ -836,7 +853,7 @@ fn measures(l: &Layout, f: &Frame) -> (String, Vec<Measure>) {
         if last > 0 {
             let (_, x1) = l.ends();
             out.push(Measure {
-                x: num(f.x(l.widened(0, x1 + 0.7))),
+                x: num(f.x(Layout::widened(x1 + 0.7))),
                 y: num(l.y(0) + 16.0),
                 anchor: "end",
                 before: "last group ".to_owned(),
