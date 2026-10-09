@@ -222,6 +222,7 @@
     with <a href="#search">/api/search</a> on a transaction hash, which
     answers through this one. It also
     serves a transaction in the pool, which reports
+    <code class="lit">in_pool</code> <code class="lit">true</code>,
     <code class="lit">block_height</code> 0,
     <code class="lit">confirmations</code> 0, and the time it arrived in place
     of a block timestamp.
@@ -292,8 +293,9 @@
   <p>
     Every transaction whose hash <em>ends</em> with the hex postfix you give.
     The caller picks the one it wants on its own machine, so the explorer never
-    learns which one that was. Returns <code class="lit">txs</code> and
-    <code class="lit">missed_txs</code>.
+    learns which one that was. Returns <code class="lit">txs</code>,
+    <code class="lit">txs_no</code>, the number of transactions in
+    <code class="lit">txs</code>, and <code class="lit">missed_txs</code>.
   </p>
   <p>
     Rings stay <strong>unresolved</strong> here. Each input carries its amount
@@ -393,6 +395,13 @@
     window, so the request says nothing about which transaction the caller
     wants. Rings stay unresolved, for the same reason as
     <a href="#private">the private lookup</a>.
+  </p>
+  <p>
+    The pool comes first. Each pool transaction has
+    <code class="lit">in_pool</code> <code class="lit">true</code>, and
+    <code class="lit">mempool_txs_no</code> counts them. Every transaction
+    after them is from a block and has <code class="lit">in_pool</code>
+    <code class="lit">false</code>.
   </p>
   <p>
     Where those blocks hold more than {{ max_range_mib }} MiB, the oldest are
@@ -567,9 +576,17 @@
   <p>
     Everything in the summary, plus <code class="lit">block_height</code>,
     <code class="lit">confirmations</code>, <code class="lit">current_height</code>,
+    <code class="lit">in_pool</code>,
     <code class="lit">timestamp</code>, <code class="lit">timestamp_utc</code>,
     <code class="lit">inputs</code>, <code class="lit">outputs</code> and
     <code class="lit">anonymity_set</code>.
+  </p>
+  <p>
+    <code class="lit">in_pool</code> is <code class="lit">true</code> for a
+    transaction that waits in the pool and <code class="lit">false</code> for
+    one in a block. A pool transaction also reports
+    <code class="lit">block_height</code> 0 and
+    <code class="lit">confirmations</code> 0.
   </p>
   <p>
     <code class="lit">anonymity_set</code> is how many

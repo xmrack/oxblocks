@@ -7,6 +7,7 @@
     "current_height": 432,
     "extra": "0404bed5d589cfdb283c542b4fe5df3fc50924592ab172405538c4f84afb59b436186b7e22d4eefbffbe429abc729e9badc7288088e5e30117ee7bd6426a0847746e419752625bdae8678069e802b314df17984d57e1d36a425584ecd774cd518f323789817ccac40f1507cb63c2c54b3229ca901fec0db334079efa581caaf99330020901f2f6322e39d969ae",
     "fcmp_pp_proof_size": 6528,
+    "in_pool": false,
     "inputs": [
       {
         "amount": 0,

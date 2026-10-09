@@ -1137,6 +1137,8 @@ fn whole_byte_suffix(postfix: &str) -> &str {
 pub struct PrivateTxData {
     missed_txs: Vec<String>,
     txs: Vec<TxDetail>,
+    /// How many transactions `txs` holds.
+    txs_no: u64,
 }
 
 /// What a private lookup of `matches` transactions holds of the range
@@ -1255,6 +1257,7 @@ pub async fn transaction_private(
 
     Ok(ApiOk(PrivateTxData {
         missed_txs: fetched.missed,
+        txs_no: txs.len() as u64,
         txs,
     }))
 }

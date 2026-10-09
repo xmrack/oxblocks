@@ -115,6 +115,9 @@ pub struct TxDetail {
     pub extra: String,
     /// See [`TxSummary::fcmp_pp_proof_size`].
     pub fcmp_pp_proof_size: Option<u64>,
+    /// Whether the transaction waits in the pool rather than sits in a block.
+    /// A pool transaction also reads `block_height` 0 and `confirmations` 0.
+    pub in_pool: bool,
     /// `null`, not `[]`, for a coinbase transaction, which spends nothing.
     pub inputs: Option<Vec<ApiInput>>,
     pub mixin: u64,
@@ -245,6 +248,7 @@ struct Placement {
     block_height: u64,
     timestamp: u64,
     confirmations: u64,
+    in_pool: bool,
 }
 
 impl Placement {
@@ -256,6 +260,7 @@ impl Placement {
             block_height: entry.block_height,
             timestamp: entry.block_timestamp,
             confirmations: current_height.saturating_sub(entry.block_height),
+            in_pool: false,
         }
     }
 
@@ -264,6 +269,7 @@ impl Placement {
             block_height: 0,
             timestamp: received,
             confirmations: 0,
+            in_pool: true,
         }
     }
 }
@@ -370,6 +376,7 @@ impl TxDetail {
             current_height,
             extra: f.extra_hex(),
             fcmp_pp_proof_size: f.fcmp_pp.and_then(|x| x.proof_size),
+            in_pool: at.in_pool,
             inputs,
             mixin: f.ring_size as u64,
             n_tree_layers: f.fcmp_pp.and_then(|x| x.n_tree_layers),
@@ -518,6 +525,7 @@ mod tests {
             current_height: 0,
             extra: String::new(),
             fcmp_pp_proof_size: None,
+            in_pool: false,
             inputs: Some(vec![ApiInput {
                 amount: 0,
                 key_image: String::new(),
@@ -608,7 +616,7 @@ mod tests {
             keys.iter().any(|k| k == "inputs") && keys.iter().any(|k| k == "outputs"),
             "the containing fields themselves were missed"
         );
-        assert_eq!(keys.len(), 24, "TxDetail has 24 fields of its own");
+        assert_eq!(keys.len(), 25, "TxDetail has 25 fields of its own");
 
         // A value that happens to be a string must not be read as a key.
         let probe = ApiOutput {

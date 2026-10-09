@@ -97,7 +97,8 @@ def main():
     if private.get("rct_type") != 7:
         for i in private.get("inputs") or []:
             i["mixins"] = None
-    write("transaction_private", {"data": {"missed_txs": [], "txs": [private]},
+    write("transaction_private", {"data": {"missed_txs": [], "txs": [private],
+                                           "txs_no": 1},
                                   "status": "success"})
 
     # /api/transactions/recent takes no parameters and bounds only its block

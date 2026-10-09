@@ -13,8 +13,10 @@
 //!
 //! The keys in [`FCMP_PP_KEYS`] are absent from the captures, so they are
 //! checked on the oxblocks side only: each must be `null` on these pre-FCMP++
-//! blocks, except `view_tag`, which a tagged output carries. Every key the
-//! captures do contain must be present and equal.
+//! blocks, except `view_tag`, which a tagged output carries. `in_pool` is
+//! absent from them too, and must be `false`, since every captured
+//! transaction is mined. Every key the captures do contain must be present
+//! and equal.
 
 #![allow(
     clippy::unwrap_used,
@@ -73,6 +75,7 @@ fn diff(ours: &Value, theirs: &Value, path: &str, out: &mut Vec<String>) {
                             && t.len() == 2
                             && t.bytes().all(|b| b.is_ascii_hexdigit()) => {}
                     (Some(Value::Null), None) if FCMP_PP_KEYS.contains(&k.as_str()) => {}
+                    (Some(Value::Bool(false)), None) if k == "in_pool" => {}
                     (Some(x), None) => out.push(format!("{path}/{k}: extra in ours ({x})")),
                     (None, None) => unreachable!("key came from one of the two maps"),
                 }
