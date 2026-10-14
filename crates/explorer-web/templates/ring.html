@@ -6,7 +6,7 @@
 <h1>How this spend stays private</h1>
 <p class="lede">{% if decoys %}This transaction spends {{ inputs.len() }} output{% if inputs.len() != 1 %}s{% endif %} without saying which.
 Each input hides the output it spends among a ring of others, and {{ signed_by }} shows that one of them is being spent.{% else %}Every ring in this transaction holds a single output, so it does not hide which output{% if inputs.len() != 1 %}s{% endif %} it spends.{% endif %}
-{{ era }} {% if decoys %}Here is what each part does.{% else %}Here is what it still proves.{% endif %}</p>
+{{ era }}{% if !decoys %} Here is what it still proves.{% endif %}</p>
 {% if !held %}
 <p class="empty tight">This node no longer holds this transaction's {% if cn %}signatures{% else %}signatures and range proofs{% endif %}, so their bytes are not shown here. What each part does is the same.</p>
 {% endif %}

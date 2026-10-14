@@ -5,7 +5,7 @@
 <p class="crumb"><a href="/tx/{{ hash }}">Transaction</a> <span class="hash">{{ hash }}</span></p>
 <h1>How this spend stays private</h1>
 <p class="lede">This transaction spends {{ inputs.len() }} output{% if inputs.len() != 1 %}s{% endif %} without saying which.
-{% if let Some(bytes) = proof_size %}Its {{ bytes }}-byte FCMP++ proof{% else %}Its FCMP++ proof{% endif %} is what makes that possible. Here is what each part does.</p>
+{% if let Some(bytes) = proof_size %}Its {{ bytes }}-byte FCMP++ proof{% else %}Its FCMP++ proof{% endif %} is what makes that possible.</p>
 {% if proof_size.is_none() %}
 <p class="empty tight">This node no longer holds this transaction's proof, so its bytes are not shown here. What each part does is the same.</p>
 {% endif %}
