@@ -64,6 +64,8 @@ struct PathsPage {
     /// root down, and in all.
     kept: Vec<KeptRow>,
     stored: Option<String>,
+    /// What a wallet keeps of the leaves.
+    leaf_bytes: Option<String>,
     /// The same paths kept apart, when more than one is shown and they share
     /// groups.
     stored_apart: Option<String>,
@@ -127,26 +129,46 @@ struct StatusRow {
 struct LayerView {
     name: String,
     curve: &'static str,
+    /// What a wallet keeps of the layer.
+    bytes: String,
     groups: Vec<GroupView>,
 }
 
 struct GroupView {
     caption: String,
     members: Vec<Chip>,
+    /// The node of the layer above the group hashes to, `None` for the root.
+    parent: Option<String>,
 }
 
 struct Chip {
     short: String,
     full: String,
+    /// "Node 19,141", its place in the layer.
+    place: String,
     on: bool,
 }
 
 struct LeafGroupView {
     caption: String,
     rows: Vec<LeafRow>,
+    /// The node of layer 1 the group hashes to, or the root.
+    parent: String,
+}
+
+/// Where a group of `layer` hashes to, in a tree of `depth` layers above
+/// the leaves.
+fn parent_of(g: &Group, depth: usize) -> String {
+    if g.layer + 1 >= depth {
+        "the root".to_owned()
+    } else {
+        format!("node {} of layer {}", grouped(g.index()), g.layer + 1)
+    }
 }
 
 struct LeafRow {
+    /// The key's first characters, for the group's overview.
+    short: String,
     position: String,
     unified_id: u64,
     kind: &'static str,
@@ -338,6 +360,10 @@ fn page(
     let grid = leaf_grid(&placed, paths.n_leaf_tuples, &every_output);
 
     let (layers, leaf_groups, kept) = union(&placed, &every_output, &shown);
+    let leaf_bytes = kept
+        .last()
+        .filter(|k| k.name == "Outputs")
+        .map(|k| k.bytes.clone());
     // The grid's columns run from the leaves up, one a layer, and what a
     // wallet keeps runs from the root down.
     let footers = grid.as_ref().map_or_else(Vec::new, |g| {
@@ -401,6 +427,7 @@ fn page(
         layers,
         leaf_groups,
         kept,
+        leaf_bytes,
         stored,
         stored_apart,
         waiting,
@@ -510,13 +537,15 @@ fn union(
 
     let layers = (1..=depth)
         .rev()
-        .map(|layer| LayerView {
+        .zip(&kept)
+        .map(|(layer, k)| LayerView {
             name: if layer == depth {
                 "Root".to_owned()
             } else {
                 format!("Layer {layer}")
             },
             curve: Curve::of_layer(layer).name(),
+            bytes: k.bytes.clone(),
             groups: groups
                 .range((layer, 0)..=(layer, u64::MAX))
                 .map(|(_, (g, members, lit))| GroupView {
@@ -524,15 +553,22 @@ fn union(
                     members: members
                         .iter()
                         .zip(lit)
-                        .map(|(m, &on)| {
+                        .zip(g.start..)
+                        .map(|((m, &on), place)| {
                             let full = explorer_core::hex::encode(m);
                             Chip {
                                 short: full.get(..8).unwrap_or_default().to_owned(),
                                 full,
+                                place: if layer == depth {
+                                    "The root".to_owned()
+                                } else {
+                                    format!("Node {}", grouped(place))
+                                },
                                 on,
                             }
                         })
                         .collect(),
+                    parent: (layer < depth).then(|| parent_of(g, depth)),
                 })
                 .collect(),
         })
@@ -542,10 +578,15 @@ fn union(
         .values()
         .map(|(g, members)| LeafGroupView {
             caption: group_caption(g, "output"),
+            parent: parent_of(g, depth),
             rows: members
                 .iter()
                 .zip(g.start..)
                 .map(|(l, position)| LeafRow {
+                    short: explorer_core::hex::encode(l.output_key)
+                        .get(..8)
+                        .unwrap_or_default()
+                        .to_owned(),
                     position: grouped(position),
                     unified_id: l.unified_id,
                     kind: match l.kind {
@@ -759,6 +800,15 @@ mod tests {
             ]
         );
         assert!(html.contains("<title>Layer 1, Selene: 2 nodes, 18–19 of 20</title>"));
+        // The climb runs from the leaves up, each group naming what it
+        // hashes to, and gives the members on the path in full.
+        let at = |needle: &str| html.find(needle).unwrap_or_else(|| panic!("no {needle}"));
+        assert!(
+            at("these leaves make node 19 of layer 1.") < at("these nodes make node 1 of layer 2.")
+        );
+        assert!(at("these nodes make node 1 of layer 2.") < at("these nodes make the root."));
+        assert!(html.contains("<dt>Node 19</dt><dd class=\"hash\">"));
+        assert!(html.contains("<b>Output 1</b><span>leaf 752</span>"));
         assert!(!html.contains("leads to the root") && !html.contains("tag ok"));
         // An output's tag sits beside its leaf, not after the hashes.
         assert!(html.contains("<td class=\"num\">752</td>"));

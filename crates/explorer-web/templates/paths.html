@@ -80,49 +80,61 @@ outputs marked are the ones whose paths do not.</div>
 
 {% if !kept.is_empty() %}
 <details class="path-data">
-<summary>The path data, member by member</summary>
-{% for l in layers %}
-<section class="path-layer">
-<h2>{{ l.name }} <span class="curve">{{ l.curve }}</span></h2>
-{% for g in l.groups %}
-<p class="group-h">{{ g.caption }}</p>
-<div class="chips">{% for c in g.members %}<span class="chip{% if c.on %} on{% endif %}" title="{{ c.full }}">{{ c.short }}</span>{% endfor %}</div>
-{% endfor %}
-</section>
-{% endfor %}
-
-{% if !leaf_groups.is_empty() %}
-<section class="path-layer">
-<h2>Outputs <span class="curve">the leaves</span>
+<summary>The climb, group by group</summary>
+<p class="climb-intro">What a wallet holds to prove {% if outputs_total == 1 %}its output is{% else %}these outputs are{% endif %} in the tree, from the leaves up. Each group hashes to one member of the group above it, and the root at the top is the one the block records. The members on the path are marked, with their values in full.</p>
+<ol class="climb">
+{% for g in leaf_groups %}
+<li class="step s-leaves">
+  <div class="step-h"><span class="step-name">Outputs <span class="curve">the leaves</span>
   <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
   <p>Each leaf is an output's one-time key and amount commitment, as they
   are on the chain. The tree turns them into six numbers: the coordinates of
   the key, of the point its key image is made from, and of the commitment.
   For an output from before Carrot it first clears any torsion from the key
   and commitment, and hashes the key to that point the older way; that is
-  the legacy kind. A group of 38 hashes to one node of layer 1.</p></details>
-</h2>
-{% for g in leaf_groups %}
-<p class="group-h">{{ g.caption }}</p>
-<div class="scroll">
-<table class="leaves">
-  <thead><tr><th class="num">Leaf</th><th class="num">Unified ID</th><th>Output</th><th>Kind</th><th>Key and commitment</th></tr></thead>
-  <tbody>
-  {% for r in g.rows %}
-  <tr{% if r.on %} class="on"{% endif %}>
-    <td class="num">{{ r.position }}</td>
-    <td class="num">{{ r.unified_id }}</td>
-    <td>{% if let Some(k) = r.output %}<span class="tag">output {{ k }}</span>{% endif %}</td>
-    <td>{{ r.kind }}</td>
-    <td class="pair"><span class="hash">{{ r.key }}</span><span class="hash">{{ r.commitment }}</span></td>
-  </tr>
-  {% endfor %}
-  </tbody>
-</table>
-</div>
+  the legacy kind. A group of 38 hashes to one node of layer 1.</p></details></span>
+  {% if loop.first %}{% if let Some(b) = leaf_bytes %}<span class="step-bytes">{{ b }} bytes</span>{% endif %}{% endif %}</div>
+  <p class="group-h">{{ g.caption }}</p>
+  <div class="chips">{% for r in g.rows %}<span class="chip{% if r.on %} on{% else if r.output.is_some() %} other{% endif %}" title="Leaf {{ r.position }}, unified id {{ r.unified_id }}{% if let Some(k) = r.output %}, output {{ k }}{% endif %}&#10;key {{ r.key }}&#10;commitment {{ r.commitment }}">{{ r.short }}{% if let Some(k) = r.output %}<b>{{ k }}</b>{% endif %}</span>{% endfor %}</div>
+  <div class="mine">{% for r in g.rows %}{% if let Some(k) = r.output %}
+  <div class="leaf-card{% if r.on %} on{% endif %}">
+    <div class="lc-h"><b>Output {{ k }}</b><span>leaf {{ r.position }}</span><span>unified id {{ r.unified_id }}</span><span>{{ r.kind }}</span></div>
+    <dl><dt>Key</dt><dd class="hash">{{ r.key }}</dd><dt>Commitment</dt><dd class="hash">{{ r.commitment }}</dd></dl>
+  </div>{% endif %}{% endfor %}
+  </div>
+  <details class="all-leaves"><summary>Every leaf of the group, in full</summary>
+  <div class="scroll">
+  <table class="leaves">
+    <thead><tr><th class="num">Leaf</th><th class="num">Unified ID</th><th>Output</th><th>Kind</th><th>Key and commitment</th></tr></thead>
+    <tbody>
+    {% for r in g.rows %}
+    <tr{% if r.on %} class="on"{% endif %}>
+      <td class="num">{{ r.position }}</td>
+      <td class="num">{{ r.unified_id }}</td>
+      <td>{% if let Some(k) = r.output %}<span class="tag">output {{ k }}</span>{% endif %}</td>
+      <td>{{ r.kind }}</td>
+      <td class="pair"><span class="hash">{{ r.key }}</span><span class="hash">{{ r.commitment }}</span></td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  </details>
+  <p class="step-up">Hashed together, these leaves make {{ g.parent }}.</p>
+</li>
 {% endfor %}
-</section>
-{% endif %}
+{% for l in layers.iter().rev() %}
+<li class="step{% if l.name == "Root" %} s-root{% endif %} s-{% if l.curve == "Helios" %}h{% else %}s{% endif %}">
+  <div class="step-h"><span class="step-name">{{ l.name }} <span class="curve">{{ l.curve }}</span></span><span class="step-bytes">{{ l.bytes }} bytes</span></div>
+  {% for g in l.groups %}
+  {% if l.name != "Root" %}<p class="group-h">{{ g.caption }}</p>
+  <div class="chips">{% for c in g.members %}<span class="chip{% if c.on %} on{% endif %}" title="{{ c.place }}&#10;{{ c.full }}">{{ c.short }}</span>{% endfor %}</div>{% endif %}
+  <dl class="on-path">{% for c in g.members %}{% if c.on %}<dt>{{ c.place }}</dt><dd class="hash">{{ c.full }}</dd>{% endif %}{% endfor %}</dl>
+  {% if let Some(up) = g.parent %}<p class="step-up">Hashed together, these nodes make {{ up }}.</p>{% endif %}
+  {% endfor %}
+</li>
+{% endfor %}
+</ol>
 </details>
 {% endif %}
 </div>

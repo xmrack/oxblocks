@@ -857,15 +857,52 @@ details.path-data > summary:hover { text-decoration: underline; }
 details.path-data[open] > summary { border-radius: var(--radius) var(--radius) 0 0; border-bottom: 1px solid var(--line); }
 details.path-data > :not(summary) { margin-inline: 1.1rem; }
 details.path-data[open] { padding-bottom: 0.9rem; }
+/* The climb: each group on the path from the leaves up, joined by a rail,
+   each step marked in its curve's colour. */
+.climb-intro { font-size: 0.89rem; color: var(--fg-muted); margin: 0.9rem 0 0.4rem; }
+ol.climb { list-style: none; margin: 0; padding: 0 0 0 1.4rem; position: relative; }
+ol.climb::before { content: ""; position: absolute; left: 0.42rem; top: 1.1rem; bottom: 1.4rem; width: 2px; background: var(--line); }
+.step { position: relative; padding: 0.9rem 0 0.4rem; }
+.step + .step { border-top: 1px solid var(--line); }
+.step::before {
+  content: ""; position: absolute; left: -1.32rem; top: 1.18rem; width: 11px; height: 11px;
+  border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px var(--bg-raised);
+}
+.step.s-h::before { background: var(--bg-raised); border: 2px solid var(--tree-helios); width: 7px; height: 7px; }
+.step.s-leaves::before { border-radius: 2px; background: var(--fg-muted); }
+.step-h { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+.step-name { font-weight: 650; font-size: 1.02rem; }
+.step-name .curve { color: var(--fg-faint); font-weight: 400; font-size: 0.8em; margin-left: 0.25rem; }
+.step-bytes { color: var(--fg-muted); font-size: 0.86rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.step .group-h { margin-top: 0.15rem; }
+.step-up { font-size: 0.84rem; color: var(--fg-muted); margin: 0.55rem 0 0; }
+.step-up::before { content: "\2191"; color: var(--accent); margin-right: 0.4rem; font-weight: 700; }
+dl.on-path { margin: 0.55rem 0 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0.15rem 0.8rem; font-size: 0.84rem; }
+dl.on-path:empty { display: none; }
+dl.on-path dt { color: var(--accent); font-weight: 600; }
+dl.on-path dd { margin: 0; overflow-wrap: anywhere; }
+.s-root dl.on-path dd { font-size: 0.95rem; }
+.chip b { font-weight: 700; margin-left: 0.3rem; }
+.chip.other { border-color: var(--accent); color: var(--accent); }
+.mine { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 30rem), 1fr)); gap: 0.6rem; margin: 0.7rem 0 0; }
+.leaf-card { border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: var(--radius); padding: 0.55rem 0.75rem; background: var(--bg-raised); font-size: 0.84rem; }
+.leaf-card.on { border-left-color: var(--accent); }
+.lc-h { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+.lc-h b { color: var(--fg); }
+.leaf-card dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0.1rem 0.7rem; margin: 0.4rem 0 0; }
+.leaf-card dt { color: var(--fg-faint); }
+.leaf-card dd { margin: 0; overflow-wrap: anywhere; }
+.leaf-card dd + dt + dd { color: var(--fg-muted); }
+details.all-leaves { margin: 0.5rem 0 0; font-size: 0.86rem; }
+details.all-leaves > summary { cursor: pointer; color: var(--accent); }
+details.all-leaves table.leaves { font-size: 0.84rem; }
 /* Small tables, sized to what they hold rather than stretched across. */
 table.leaves { width: auto; min-width: min(100%, 36rem); }
-table.leaves { margin-inline: auto; }
 /* A leaf's key over its commitment, each wrapping in two on a narrow
    screen rather than to a sliver. */
 table.leaves td.pair { min-width: 33ch; }
 table.leaves td.pair .hash { display: block; white-space: normal; overflow-wrap: anywhere; }
 table.leaves td.pair .hash + .hash { color: var(--fg-muted); }
-.path-layer h2 .curve { color: var(--fg-faint); font-weight: 400; font-size: 0.75em; margin-left: 0.3rem; }
 .group-h { font-size: 0.84rem; color: var(--fg-muted); margin: 0.5rem 0 0.35rem; }
 .chips { display: flex; flex-wrap: wrap; gap: 0.3rem; }
 .chip {
