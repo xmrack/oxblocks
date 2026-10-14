@@ -800,15 +800,35 @@ form.as-of button {
 .grid-legend i.kept { opacity: 0.42; }
 .grid-legend i.other { background: var(--bg-raised); border: 1px solid var(--accent); }
 
-/* Each output's place, under the legend it is read against. */
-.grid-outputs { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.3rem 1.2rem; margin: 0.45rem 0 0; font-size: 0.84rem; font-variant-numeric: tabular-nums; }
-/* The figure and what a wallet keeps for it, side by side when there is room:
-   the table reads the figure's columns layer by layer. */
-@media (min-width: 960px) {
-  .paths-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.6rem; align-items: start; }
-  .paths-pair .curve-tree { margin: 0; }
-  .paths-pair h2.kept-h { margin-top: 0.2rem; }
-  .paths-pair table.kept { width: 100%; margin-inline: 0; }
+/* The paths page: the figure, with what a wallet keeps of each layer under
+   its column, and the headline numbers beside it. */
+.paths-top { display: flex; flex-wrap: wrap; gap: 0.6rem 1.5rem; align-items: center; margin: 1.1rem 0 0.9rem; }
+.paths-top .tabs { margin: 0; }
+.paths-top form.as-of { margin: 0 0 0 auto; }
+.paths-card {
+  display: grid; grid-template-columns: minmax(0, 1fr) 16rem; gap: 2rem; align-items: center;
+  padding: 1.2rem 1.4rem 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg-raised);
+}
+.paths-figure { margin: 0; }
+.paths-figure figcaption {
+  font-size: 0.78rem; color: var(--fg-faint); text-transform: uppercase; letter-spacing: 0.045em; margin-bottom: 0.5rem;
+}
+.paths-figure .leaf-grid { max-width: 640px; margin: 0.4rem 0 0; }
+.paths-figure .grid-legend { justify-content: flex-start; }
+.leaf-grid .gfoot { fill: var(--fg-muted); font-size: 7.5px; font-variant-numeric: tabular-nums; }
+.leaf-grid .gfoot .b { fill: var(--fg); font-weight: 600; }
+.paths-side { margin: 0; }
+.paths-side dt { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.045em; color: var(--fg-faint); margin-top: 0.75rem; }
+.paths-side dt:first-child { margin-top: 0; }
+.paths-side dd { margin: 0.1rem 0 0; font-variant-numeric: tabular-nums; }
+.paths-side dd.big { font-size: 1.35rem; font-weight: 650; }
+.paths-side dd.sub { color: var(--fg-muted); font-size: 0.84rem; }
+.paths-side dd.hash { font-size: 0.72rem; color: var(--fg-muted); word-break: break-all; }
+.paths-side .which { color: var(--fg-muted); }
+.paths-page .notice { margin-top: 0.8rem; }
+@media (max-width: 860px) {
+  .paths-card { grid-template-columns: 1fr; gap: 1.1rem; padding: 0.9rem; }
+  .paths-top form.as-of { margin-left: 0; }
 }
 /* The paths page's prose runs the width of the page. */
 .lede.full, .paths-page .keeps { max-width: none; }
@@ -818,11 +838,6 @@ form.as-of button {
 }
 .facts.wait .facts-h { color: var(--accent); font-weight: 600; }
 .facts.wait .keeps + .keeps { margin-top: 0.5rem; }
-h2.kept-h { margin-top: 1.6rem; }
-table.kept td.layer { color: var(--accent); }
-table.kept td.layer .curve { display: block; color: var(--fg-faint); font-size: 0.8em; }
-table.kept td.place { white-space: normal; font-variant-numeric: tabular-nums; }
-table.kept tfoot td { font-weight: 600; border-bottom: 0; }
 details.path-data {
   margin: 1.6rem 0 0;
   border: 1px solid var(--line);
@@ -843,8 +858,8 @@ details.path-data[open] > summary { border-radius: var(--radius) var(--radius) 0
 details.path-data > :not(summary) { margin-inline: 1.1rem; }
 details.path-data[open] { padding-bottom: 0.9rem; }
 /* Small tables, sized to what they hold rather than stretched across. */
-table.kept, table.leaves { width: auto; min-width: min(100%, 36rem); }
-table.kept, table.leaves { margin-inline: auto; }
+table.leaves { width: auto; min-width: min(100%, 36rem); }
+table.leaves { margin-inline: auto; }
 /* A leaf's key over its commitment, each wrapping in two on a narrow
    screen rather than to a sliver. */
 table.leaves td.pair { min-width: 33ch; }

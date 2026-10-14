@@ -44,16 +44,19 @@ struct PathsPage {
     /// The first block whose tree holds the outputs. They share the
     /// transaction's lock, so they join together.
     joins: Option<u64>,
+    leaves: String,
+    n_layers: usize,
     root_block: Option<(u64, String)>,
     root_check: &'static str,
     outputs_total: usize,
-    /// The output shown alone, counted from 1, or `None` for all of them.
-    showing: Option<usize>,
-    tabs: Vec<Tab>,
+    /// Windows of outputs, when the transaction has more than one daemon
+    /// call answers for.
     windows: Vec<Tab>,
     statuses: Vec<StatusRow>,
     /// The part of the tree the paths climb through. See [`leaf_grid`].
     grid: Option<LeafGrid>,
+    /// Under each of the grid's columns, what a wallet keeps of that layer.
+    footers: Vec<Footer>,
     /// From the root down, the leaves' parents last.
     layers: Vec<LayerView>,
     leaf_groups: Vec<LeafGroupView>,
@@ -75,7 +78,21 @@ struct KeptRow {
     curve: &'static str,
     /// How many members are kept, and their places in the layer.
     place: String,
+    members: u64,
     bytes: String,
+}
+
+/// Room under the grid for its footers, in the drawing's units.
+pub const FOOT_ROOM: u32 = 28;
+
+/// What a wallet keeps of one layer, under its column of the grid.
+struct Footer {
+    x: u32,
+    /// How many members its groups hold.
+    count: String,
+    bytes: String,
+    /// The layer, and where its groups sit in it.
+    title: String,
 }
 
 /// Outputs that are not in the tree as of the block asked about.
@@ -169,6 +186,21 @@ pub async fn tree_paths(
         }
     };
 
+    // The page shows every output of a window together. One output asked
+    // for, as the transaction page links them, opens the window holding it.
+    let mut q = q;
+    if let Some(k) = q.output.take() {
+        if k == 0 || k > total {
+            return error_page(
+                chain,
+                StatusCode::NOT_FOUND,
+                "No such output",
+                &format!("Transaction {hash} has {total} output{}.", plural(total)),
+            );
+        }
+        q.from = (k - 1) / MAX_OUTPUTS * MAX_OUTPUTS;
+    }
+
     let found = match q.outputs(total) {
         Ok(which) => gather(&state, &entry, &tx, q.block, which).await,
         Err(e) => Err(e),
@@ -226,7 +258,7 @@ pub async fn tree_paths(
 
     render(
         StatusCode::OK,
-        &page(chain, hash, total, q.output, &paths, &entry.unified_ids),
+        &page(chain, hash, total, &paths, &entry.unified_ids),
     )
 }
 
@@ -240,15 +272,13 @@ fn page(
     chain: Option<ChainStatus>,
     hash: String,
     total: usize,
-    showing: Option<usize>,
     paths: &TxPaths,
     unified_ids: &[u64],
 ) -> PathsPage {
     let block = (paths.as_of_block != paths.tip).then_some(paths.as_of_block);
     let base = format!("/tx/{hash}/paths");
-    let link_as_of = |output: Option<usize>, from: usize, block: Option<u64>| {
+    let link_as_of = |from: usize, block: Option<u64>| {
         let parts: Vec<String> = [
-            output.map(|k| format!("output={k}")),
             (from > 0).then(|| format!("from={from}")),
             block.map(|b| format!("block={b}")),
         ]
@@ -261,35 +291,14 @@ fn page(
             format!("{base}?{}", parts.join("&"))
         }
     };
-    let link = |output: Option<usize>, from: usize| link_as_of(output, from, block);
-
-    // The window of outputs shown together, and the one holding the output
-    // shown alone.
-    let from = match showing {
-        Some(k) => (k - 1) / MAX_OUTPUTS * MAX_OUTPUTS,
-        None => paths.outputs.first().map_or(0, |o| o.index),
-    };
-    let window = from..(from + MAX_OUTPUTS).min(total);
-    let mut tabs = vec![Tab {
-        label: if total > MAX_OUTPUTS {
-            format!("Outputs {}–{}", window.start + 1, window.end)
-        } else {
-            "All outputs".to_owned()
-        },
-        href: link(None, from),
-        on: showing.is_none(),
-    }];
-    tabs.extend(window.map(|i| Tab {
-        label: format!("Output {}", i + 1),
-        href: link(Some(i + 1), 0),
-        on: showing == Some(i + 1),
-    }));
+    // The window of outputs shown together.
+    let from = paths.outputs.first().map_or(0, |o| o.index);
     let windows = if total > MAX_OUTPUTS {
         (0..total)
             .step_by(MAX_OUTPUTS)
             .map(|start| Tab {
-                label: format!("{}–{}", start + 1, (start + MAX_OUTPUTS).min(total)),
-                href: link(None, start),
+                label: format!("Outputs {}–{}", start + 1, (start + MAX_OUTPUTS).min(total)),
+                href: link_as_of(start, block),
                 on: start == from,
             })
             .collect()
@@ -329,6 +338,28 @@ fn page(
     let grid = leaf_grid(&placed, paths.n_leaf_tuples, &every_output);
 
     let (layers, leaf_groups, kept) = union(&placed, &every_output, &shown);
+    // The grid's columns run from the leaves up, one a layer, and what a
+    // wallet keeps runs from the root down.
+    let footers = grid.as_ref().map_or_else(Vec::new, |g| {
+        g.labels
+            .iter()
+            .zip(kept.iter().rev())
+            .map(|(l, k)| Footer {
+                x: l.x,
+                count: if k.name == "Outputs" {
+                    format!("{} leaves", grouped(k.members))
+                } else {
+                    grouped(k.members)
+                },
+                bytes: if k.name == "Outputs" {
+                    format!("{} bytes", k.bytes)
+                } else {
+                    k.bytes.clone()
+                },
+                title: format!("{}, {}: {}", k.name, k.curve, k.place),
+            })
+            .collect()
+    });
     let (stored, stored_apart) = stored_bytes(&placed);
 
     // Outputs of one transaction share its lock, so they join together.
@@ -337,10 +368,8 @@ fn page(
         .filter(|_| standings.iter().all(|&s| s == Standing::Waiting))
         .map(|joins| {
             let blocks_left = (joins > paths.tip).then(|| joins - paths.tip);
-            let href = (joins <= paths.tip).then(|| {
-                let from = if showing.is_some() { 0 } else { from };
-                link_as_of(showing, from, (joins != paths.tip).then_some(joins))
-            });
+            let href = (joins <= paths.tip)
+                .then(|| link_as_of(from, (joins != paths.tip).then_some(joins)));
             Waiting {
                 joins,
                 blocks_left,
@@ -357,17 +386,18 @@ fn page(
         as_of: paths.as_of_block,
         tip: paths.tip,
         block,
-        from: if showing.is_some() { 0 } else { from },
+        from,
         mined_in: paths.mined_in,
         joins,
+        leaves: grouped(paths.n_leaf_tuples),
+        n_layers: depth,
         root_block: paths.root_block.clone(),
         root_check: paths.root_check().as_str(),
         outputs_total: total,
-        showing,
-        tabs,
         windows,
         statuses,
         grid,
+        footers,
         layers,
         leaf_groups,
         kept,
@@ -442,6 +472,7 @@ fn union(
             name,
             curve,
             place,
+            members,
             bytes: grouped(members * each),
         }
     };
@@ -662,7 +693,7 @@ mod tests {
     fn every_path_of_the_captured_transaction_leads_to_its_blocks_root() {
         let paths = later();
         assert_eq!(paths.root_check(), RootCheck::Matches);
-        let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
+        let p = page(None, "ab".to_owned(), 4, &paths, &IDS);
         let leaves: Vec<&str> = p
             .statuses
             .iter()
@@ -708,7 +739,26 @@ mod tests {
 
         let html = p.render().unwrap();
         // A path that passes carries no tag.
-        assert!(html.contains(" at leaf 752</span>"), "{html}");
+        assert!(
+            html.contains("<dd><span class=\"which\">Output 1</span> 752</dd>"),
+            "{html}"
+        );
+        // Under each column, its members and its bytes, the leaves first.
+        let feet: Vec<(&str, &str)> = p
+            .footers
+            .iter()
+            .map(|f| (f.count.as_str(), f.bytes.as_str()))
+            .collect();
+        assert_eq!(
+            feet,
+            [
+                ("38 leaves", "2,432 bytes"),
+                ("2", "64"),
+                ("2", "64"),
+                ("1", "32")
+            ]
+        );
+        assert!(html.contains("<title>Layer 1, Selene: 2 nodes, 18–19 of 20</title>"));
         assert!(!html.contains("leads to the root") && !html.contains("tag ok"));
         // An output's tag sits beside its leaf, not after the hashes.
         assert!(html.contains("<td class=\"num\">752</td>"));
@@ -731,7 +781,7 @@ mod tests {
     #[test]
     fn the_grid_draws_the_groups_the_paths_climb_through() {
         let paths = later();
-        let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
+        let p = page(None, "ab".to_owned(), 4, &paths, &IDS);
         let g = p.grid.as_ref().unwrap();
 
         let leaves = classes(g, true);
@@ -746,13 +796,13 @@ mod tests {
         assert_eq!(&labels[1..], ["L1", "L2", "Root"]);
     }
 
-    /// Shown alone, an output is solid and the transaction's others in its
-    /// group are outlined.
+    /// An output of the transaction outside the window shown is outlined in
+    /// the group it shares with those shown.
     #[test]
-    fn one_output_shown_alone_outlines_the_others() {
+    fn outputs_outside_the_window_are_outlined() {
         let mut paths = later();
         paths.outputs.truncate(1);
-        let p = page(None, "ab".to_owned(), 4, Some(1), &paths, &IDS);
+        let p = page(None, "ab".to_owned(), 4, &paths, &IDS);
         let g = p.grid.as_ref().unwrap();
         let leaves = classes(g, true);
         assert_eq!(leaves.iter().filter(|&&c| c == "on").count(), 1);
@@ -771,7 +821,7 @@ mod tests {
             ROOT_806,
         );
         assert_eq!(paths.root_check(), RootCheck::Unchecked);
-        let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
+        let p = page(None, "ab".to_owned(), 4, &paths, &IDS);
         assert!(
             p.statuses
                 .iter()
@@ -787,13 +837,12 @@ mod tests {
         assert!(html.contains("Not in the tree as of block 801"));
         assert!(html.contains("These outputs join\nthe curve tree as of block 810."));
         assert!(html.contains("Show their paths as of block 810"));
-        assert!(html.contains("mined in block</dt><dd><a href=\"/block/801\">801</a>"));
-        assert!(html.contains("Added to the tree in block</dt><dd><a href=\"/block/810\">810</a>"));
+        assert!(html.contains("Outputs mined in block <a href=\"/block/801\">801</a>."));
 
         // With the tip short of block 810, it says how long there is to go.
         let mut early = paths;
         early.tip = 805;
-        let p = page(None, "ab".to_owned(), 4, None, &early, &IDS);
+        let p = page(None, "ab".to_owned(), 4, &early, &IDS);
         let w = p.waiting.as_ref().unwrap();
         assert_eq!(
             (w.blocks_left, w.minutes, w.href.as_deref()),
@@ -802,9 +851,6 @@ mod tests {
         let html = p.render().unwrap();
         assert!(html.contains("Not in the tree yet"));
         assert!(html.contains("5 blocks after the tip,\nin about 10 minutes"));
-        assert!(
-            html.contains("Added to the tree in block</dt><dd>810, 5 blocks after the tip</dd>")
-        );
     }
 
     #[test]
@@ -815,7 +861,7 @@ mod tests {
             &"00".repeat(32),
         );
         assert_eq!(paths.root_check(), RootCheck::Fails);
-        let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
+        let p = page(None, "ab".to_owned(), 4, &paths, &IDS);
         assert!(
             p.statuses
                 .iter()
@@ -831,7 +877,7 @@ mod tests {
         let mut paths = later();
         paths.outputs[2].placed = None;
         assert_eq!(paths.root_check(), RootCheck::Fails);
-        let p = page(None, "ab".to_owned(), 4, None, &paths, &IDS);
+        let p = page(None, "ab".to_owned(), 4, &paths, &IDS);
         assert_eq!(
             (p.statuses[2].check, p.statuses[2].joins),
             ("no path from the daemon", None)
@@ -841,7 +887,7 @@ mod tests {
             o.placed = None;
         }
         assert!(
-            page(None, "ab".to_owned(), 4, None, &paths, &IDS)
+            page(None, "ab".to_owned(), 4, &paths, &IDS)
                 .waiting
                 .is_none()
         );
@@ -854,24 +900,37 @@ mod tests {
         assert_eq!(paths.standing(&paths.outputs[2]), Standing::Missing);
     }
 
+    /// Every output of a window shows at once. A transaction with more
+    /// outputs than one daemon call answers for gets a window each, and the
+    /// links keep the block asked about.
     #[test]
-    fn links_keep_the_block_and_the_output() {
+    fn windows_keep_the_block() {
         let mut paths = later();
         paths.tip = 900;
-        let p = page(None, "ab".to_owned(), 4, Some(2), &paths, &IDS);
-        let hrefs: Vec<&str> = p.tabs.iter().map(|t| t.href.as_str()).collect();
+        assert!(
+            page(None, "ab".to_owned(), 4, &paths, &IDS)
+                .windows
+                .is_empty()
+        );
+
+        let p = page(None, "ab".to_owned(), 120, &paths, &IDS);
+        let hrefs: Vec<&str> = p.windows.iter().map(|t| t.href.as_str()).collect();
         assert_eq!(
             hrefs,
             [
                 "/tx/ab/paths?block=814",
-                "/tx/ab/paths?output=1&block=814",
-                "/tx/ab/paths?output=2&block=814",
-                "/tx/ab/paths?output=3&block=814",
-                "/tx/ab/paths?output=4&block=814",
+                "/tx/ab/paths?from=50&block=814",
+                "/tx/ab/paths?from=100&block=814",
             ]
         );
-        assert!(p.tabs[2].on);
-        assert!(p.windows.is_empty());
+        let labels: Vec<&str> = p.windows.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Outputs 1–50", "Outputs 51–100", "Outputs 101–120"]
+        );
+        assert!(p.windows[0].on);
+        let html = p.render().unwrap();
+        assert!(!html.contains("output="));
     }
 
     #[test]

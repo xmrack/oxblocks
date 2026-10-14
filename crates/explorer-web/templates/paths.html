@@ -4,53 +4,39 @@
 <div class="paths-page">
 <p class="crumb"><a href="/tx/{{ hash }}">Transaction</a> <span class="hash">{{ hash }}</span></p>
 <h1>Paths through the curve tree</h1>
-<p class="lede full">To spend an output, its owner proves that it is one of the
-tree's leaves by climbing from that leaf to the root. The climb needs the
-output's path: the group of outputs it sits in, and at every layer above, the
-group holding its ancestor. These are the paths of this transaction's
+<p class="lede full">To spend an output, its owner proves it is one of the curve
+tree's leaves by climbing from that leaf to the root through one group at every
+layer. A wallet keeps those groups. These are the paths of this transaction's
 {% if outputs_total == 1 %}output{% else %}outputs{% endif %} as of block
 {{ as_of }}{% if as_of == tip %}, the tip{% endif %}, each recomputed here from
 its leaves up.</p>
 
-<div class="facts"><div class="facts-h">The tree</div><dl>
-<dt>{% if outputs_total == 1 %}Output{% else %}Outputs{% endif %} mined in block</dt><dd><a href="/block/{{ mined_in }}">{{ mined_in }}</a></dd>
-{% if let Some(j) = joins %}<dt>Added to the tree in block</dt><dd>{% if *j <= tip %}<a href="/block/{{ j }}">{{ j }}</a>{% else %}{{ j }}, {{ *j - tip }} {% if *j - tip == 1 %}block{% else %}blocks{% endif %} after the tip{% endif %}</dd>{% endif %}
-{% if let Some((b, root)) = root_block %}<dt>Root</dt><dd><span class="hash">{{ root }}</span>, in block <a href="/block/{{ b }}">{{ b }}</a>
-{% if root_check == "fails" %} <span class="tag bad">a path does not lead here</span>{% endif %}</dd>{% endif %}
-</dl>
-{% if root_check == "fails" %}
-<div class="notice">Not every output's path from the daemon leads to the root
-this block records. The groups are shown as the daemon sent them, and the
-outputs marked below are the ones whose paths do not.</div>
-{% endif %}
+<div class="paths-top">
+{% if !windows.is_empty() %}<nav class="tabs" aria-label="Outputs, {{ crate::tree_paths::MAX_OUTPUTS }} at a time">{% for w in windows %}<a href="{{ w.href }}"{% if w.on %} class="on" aria-current="page"{% endif %}>{{ w.label }}</a>{% endfor %}</nav>{% endif %}
 <form class="as-of" method="get" action="/tx/{{ hash }}/paths">
-{% if let Some(k) = showing %}<input type="hidden" name="output" value="{{ k }}">{% endif %}{% if from > 0 %}<input type="hidden" name="from" value="{{ from }}">{% endif %}
+{% if from > 0 %}<input type="hidden" name="from" value="{{ from }}">{% endif %}
 <label>As of block <input name="block" inputmode="numeric" pattern="[0-9]*" placeholder="{{ tip }}"{% if let Some(b) = block %} value="{{ b }}"{% endif %}></label>
-<button type="submit">Show</button>{% if as_of == tip %} <span class="tag">tip</span>{% endif %}{% if block.is_some() %} <a href="/tx/{{ hash }}/paths{% if let Some(k) = showing %}?output={{ k }}{% else if from > 0 %}?from={{ from }}{% endif %}">back to the tip</a>{% endif %}
+<button type="submit">Show</button>{% if as_of == tip %} <span class="tag">tip</span>{% endif %}{% if block.is_some() %} <a href="/tx/{{ hash }}/paths{% if from > 0 %}?from={{ from }}{% endif %}">back to the tip</a>{% endif %}
 </form>
 </div>
 
-
-{% if !windows.is_empty() %}<nav class="tabs" aria-label="Outputs, {{ crate::tree_paths::MAX_OUTPUTS }} at a time">{% for w in windows %}<a href="{{ w.href }}"{% if w.on %} class="on" aria-current="page"{% endif %}>{{ w.label }}</a>{% endfor %}</nav>{% endif %}
-<nav class="tabs" aria-label="Which paths">{% for t in tabs %}<a href="{{ t.href }}"{% if t.on %} class="on" aria-current="page"{% endif %}>{{ t.label }}</a>{% endfor %}</nav>
-
 {% if let Some(w) = waiting %}
 <div class="facts wait"><div class="facts-h">Not in the tree {% if w.blocks_left.is_some() %}yet{% else %}as of block {{ as_of }}{% endif %}</div>
-<p class="keeps">{% if showing.is_some() || outputs_total == 1 %}This output joins{% else %}These outputs join{% endif %}
+<p class="keeps">{% if outputs_total == 1 %}This output joins{% else %}These outputs join{% endif %}
 the curve tree as of block {{ w.joins }}{% if let Some(n) = w.blocks_left %}, {{ n }} block{% if *n != 1 %}s{% endif %} after the tip,
-in about {{ w.minutes }} minutes{% endif %}. Until then {% if showing.is_some() || outputs_total == 1 %}it has{% else %}they have{% endif %} no path to show.</p>
+in about {{ w.minutes }} minutes{% endif %}. Until then {% if outputs_total == 1 %}it has{% else %}they have{% endif %} no path to show.</p>
 <p class="keeps">An output joins the tree only once it unlocks, and it cannot be
 spent before: the spending transaction's proof has to show it among the
 tree's leaves. Most outputs unlock nine blocks after the block that mined
 them, a coinbase's 59 blocks after, and an output whose transaction sets an
 unlock time of its own at the block that time names.</p>
-{% if let Some(href) = w.href %}<p class="keeps"><a href="{{ href }}">Show {% if showing.is_some() || outputs_total == 1 %}its path{% else %}their paths{% endif %} as of block {{ w.joins }}</a></p>{% endif %}
+{% if let Some(href) = w.href %}<p class="keeps"><a href="{{ href }}">Show {% if outputs_total == 1 %}its path{% else %}their paths{% endif %} as of block {{ w.joins }}</a></p>{% endif %}
+<p class="keeps">{% if outputs_total == 1 %}Output{% else %}Outputs{% endif %} mined in block <a href="/block/{{ mined_in }}">{{ mined_in }}</a>.</p>
 </div>
 {% else %}
-<div class="paths-pair">
-{% if let Some(g) = grid %}
-<figure class="curve-tree">
-  <figcaption>{% if showing.is_some() %}This output's path{% else %}The paths together{% endif %}
+<div class="paths-card">
+<figure class="paths-figure">
+  <figcaption>The paths together
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
     <p>The part of the tree these paths climb through. Each row is one group
     of up to 38 outputs, the tree's leaves in the order they joined it, and
@@ -59,47 +45,40 @@ unlock time of its own at the block that time names.</p>
     above, and so on to the root. The solid cells are on the paths shown.
     The tinted rest of each of their groups is what a wallet keeps with them:
     to prove an output is in the tree, it needs every member of every group
-    on the output's path.</p></details>
+    on the output's path. Under each column, how many members its groups
+    hold and what they take in bytes: 64 a leaf, the output's one-time key
+    and commitment, and 32 a node, a point of its layer's curve.</p></details>
   </figcaption>
-  <svg class="leaf-grid" viewBox="0 0 {{ g.width }} {{ g.height }}" role="img" aria-label="{{ g.summary }}">
+  {% if let Some(g) = grid %}
+  <svg class="leaf-grid" viewBox="0 0 {{ g.width }} {{ g.height + crate::html::paths::FOOT_ROOM }}" role="img" aria-label="{{ g.summary }}">
     <defs><pattern id="leaf-cells" width="{{ crate::html::leaf_grid::PITCH }}" height="{{ crate::html::leaf_grid::PITCH }}" patternUnits="userSpaceOnUse"><rect class="base" width="{{ crate::html::leaf_grid::CELL }}" height="{{ crate::html::leaf_grid::CELL }}" rx="1"/></pattern></defs>
     {% for l in g.labels %}<text class="glabel" x="{{ l.x }}" y="13">{{ l.text }}</text>{% endfor %}
     {% for b in g.bars %}<rect x="0" y="{{ b.y }}" width="{{ b.width }}" height="{{ crate::html::leaf_grid::CELL }}" fill="url(#leaf-cells)"/>{% endfor %}
     {% for c in g.cells %}<rect class="cell {{ c.class }}" x="{{ c.x }}" y="{{ c.y }}" width="{{ crate::html::leaf_grid::CELL }}" height="{{ crate::html::leaf_grid::CELL }}" rx="1"><title>{{ c.title }}</title></rect>{% endfor %}
     {% for d in g.brackets %}<path class="bracket" d="{{ d }}"/>{% endfor %}
+    {% for f in footers %}<g class="gfoot"><title>{{ f.title }}</title><text x="{{ f.x }}" y="{{ g.height + 12 }}">{{ f.count }}</text><text class="b" x="{{ f.x }}" y="{{ g.height + 23 }}">{{ f.bytes }}</text></g>{% endfor %}
   </svg>
-  <p class="grid-legend"><span><i class="on"></i>On {% if showing.is_some() %}this path{% else %}these paths{% endif %}</span><span><i class="kept"></i>Rest of each group, also stored</span>{% if g.has_others %}<span><i class="other"></i>The transaction's other outputs</span>{% endif %}</p>
-  <p class="grid-outputs">{% for s in statuses %}<span>{{ s.label }} {% if let Some(leaf) = s.leaf %}at leaf {{ leaf }}{% else if let Some(b) = s.joins %}joins as of block {{ b }}{% endif %}{% if !s.check.is_empty() %} <span class="tag bad">{{ s.check }}</span>{% endif %}</span>{% endfor %}</p>
+  <p class="grid-legend"><span><i class="on"></i>On these paths</span><span><i class="kept"></i>Rest of each group, also stored</span>{% if g.has_others %}<span><i class="other"></i>The transaction's other outputs</span>{% endif %}</p>
+  {% endif %}
 </figure>
+
+<dl class="paths-side">
+{% if let Some(bytes) = stored %}<dt>A wallet keeps</dt><dd class="big">{{ bytes }} bytes</dd>{% if let Some(apart) = stored_apart %}<dd class="sub">{{ apart }} kept path by path: these paths share groups</dd>{% endif %}{% endif %}
+<dt>{% if statuses.len() == 1 %}Leaf{% else %}Leaves{% endif %}</dt>
+{% for s in statuses %}<dd>{% if statuses.len() > 1 %}<span class="which">{{ s.label }}</span> {% endif %}{% if let Some(leaf) = s.leaf %}{{ leaf }}{% else if let Some(b) = s.joins %}joins as of block {{ b }}{% endif %}{% if !s.check.is_empty() %} <span class="tag bad">{{ s.check }}</span>{% endif %}</dd>{% endfor %}
+<dt>In the tree</dt><dd>{% if let Some(j) = joins %}from block {% if *j <= tip %}<a href="/block/{{ j }}">{{ j }}</a>{% else %}{{ j }}{% endif %}, {% endif %}mined in <a href="/block/{{ mined_in }}">{{ mined_in }}</a></dd>
+<dt>Tree</dt><dd>{{ leaves }} outputs, {{ n_layers }} layers</dd>
+{% if let Some((b, root)) = root_block %}<dt>Root</dt><dd><a href="/block/{{ b }}">block {{ b }}</a>{% if root_check == "fails" %} <span class="tag bad">a path does not lead here</span>{% endif %}</dd><dd class="hash">{{ root }}</dd>{% endif %}
+</dl>
+</div>
+{% if root_check == "fails" %}
+<div class="notice">Not every output's path from the daemon leads to the root
+this block records. The groups are shown as the daemon sent them, and the
+outputs marked are the ones whose paths do not.</div>
+{% endif %}
 {% endif %}
 
 {% if !kept.is_empty() %}
-<div class="kept-side">
-<h2 class="kept-h">What a wallet keeps for {% if showing.is_some() || statuses.len() == 1 %}this path{% else %}these paths{% endif %}</h2>
-<p class="keeps">A wallet needs this path to spend the output, and keeps it
-current from its own sync as new blocks change it. The spend's proof hides which
-output it is, but looking a path up, here or on a node, shows which outputs you
-looked at.</p>
-<div class="scroll">
-<table class="kept">
-  <thead><tr><th>Layer</th><th>Kept</th><th class="num">Bytes</th></tr></thead>
-  <tbody>
-  {% for k in kept %}<tr><td class="layer">{{ k.name }}<span class="curve">{{ k.curve }}</span></td><td class="place">{{ k.place }}</td><td class="num">{{ k.bytes }}</td></tr>
-  {% endfor %}
-  </tbody>
-  {% if let Some(bytes) = stored %}<tfoot><tr><td colspan="2">In all</td><td class="num">{{ bytes }}</td></tr></tfoot>{% endif %}
-</table>
-</div>
-<p class="keeps">64 bytes a leaf, the output's one-time key and commitment, and
-32 bytes a node, a point of its layer's curve.{% if let Some(apart) = stored_apart %}
-Kept path by path, the same paths come to {{ apart }} bytes: they share groups.{% endif %}</p>
-</div>
-{% endif %}
-</div>
-{% endif %}
-
-{% if !kept.is_empty() %}
-
 <details class="path-data">
 <summary>The path data, member by member</summary>
 {% for l in layers %}
