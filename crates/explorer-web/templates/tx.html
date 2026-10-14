@@ -134,7 +134,7 @@
 
 <h2>{% if coinbase %}Inputs{% else %}{{ inputs.len() }} Input{% if inputs.len() != 1 %}s{% endif %}{% endif %}</h2>
 {% if coinbase %}
-<p class="empty">A coinbase transaction has no inputs because it creates new coins rather than spending existing ones. Since June 2022 Monero's tail emission creates 0.6 XMR in every block, and keeps doing so for good, so the supply never stops growing. The miner also collects the fees of the block's other transactions.</p>
+<p class="empty">A coinbase transaction has no inputs because it creates new coins rather than spending existing ones. Monero's tail emission keeps those new coins at no less than 0.6 XMR a block for good, so the supply never stops growing. The miner also collects the fees of the block's other transactions.</p>
 {% else %}
   <p class="walk-row"><a class="walk" href="/tx/{{ hash }}/{% if fcmp_pp %}fcmp{% else %}ring{% endif %}">How this spend stays private &rarr;</a></p>
   {% if let Some(picture) = tree %}
