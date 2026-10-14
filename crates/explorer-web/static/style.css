@@ -523,7 +523,8 @@ dl.kv.spaced { margin-top: 0.8rem; }
   .tf-glow.tf-g3 { stroke-width: 11; }
 }
 .tf { fill: none; stroke-linecap: round; vector-effect: non-scaling-stroke; }
-.tf-strand.tf-s, .tf-fibre.tf-s, .tf-glow.tf-s, .tf-comb.tf-s, .tf-rule.tf-s, .tf-rule.tf-o, .tf-tooth { stroke: var(--accent); }
+.tf-strand.tf-s, .tf-fibre.tf-s, .tf-glow.tf-s, .tf-comb.tf-s, .tf-rule.tf-s { stroke: var(--accent); }
+.tf-rule.tf-o, .tf-tooth { stroke: var(--fg-muted); }
 .tf-strand.tf-h, .tf-fibre.tf-h, .tf-glow.tf-h, .tf-comb.tf-h, .tf-rule.tf-h, .tf-drop { stroke: var(--tree-helios); }
 .tf-strand { stroke-width: 0.4; opacity: var(--tree-strand); }
 .tf-strand.tf-mid { stroke-width: 0.6; opacity: calc(var(--tree-strand) * 1.45); }
@@ -546,7 +547,7 @@ dl.kv.spaced { margin-top: 0.8rem; }
 .tf-rule.tf-w5 { stroke-width: 4.6; }
 .tree-field .tf-dot { fill: var(--accent); }
 .tree-field .tf-ringnode { fill: var(--bg-raised); stroke: var(--tree-helios); stroke-width: 1.3; }
-.tree-field .tf-leafdot { fill: var(--accent); opacity: 0.88; }
+.tree-field .tf-leafdot { fill: var(--fg-muted); opacity: 0.88; }
 .tree-field .tf-halo { opacity: 0.14; }
 .tree-field .tf-halo.tf-s { fill: var(--accent); }
 .tree-field .tf-halo.tf-h { fill: var(--tree-helios); }
