@@ -204,9 +204,17 @@ struct TxPage {
 struct CoinbaseTotals {
     /// Every output of the coinbase together: the new coins and the fees.
     reward: String,
+    /// How the reward splits. `None` when the block's transactions could not
+    /// all be read.
+    split: Option<RewardSplit>,
+}
+
+struct RewardSplit {
+    /// The new coins: the reward less the fees.
+    base: String,
     /// The fees of the block's other transactions, and how many paid them.
-    /// `None` when the block's transactions could not all be read.
-    fees: Option<(String, usize)>,
+    fees: String,
+    paid: usize,
 }
 
 impl TxPage {
@@ -1850,9 +1858,13 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
     let coinbase_totals = if f.coinbase && !entry.in_pool {
         Some(CoinbaseTotals {
             reward: xmr(f.xmr_outputs),
-            fees: block_fees(&state, entry)
-                .await
-                .map(|(total, n)| (xmr(total), n)),
+            split: block_fees(&state, entry).await.and_then(|(fees, paid)| {
+                Some(RewardSplit {
+                    base: xmr(f.xmr_outputs.checked_sub(fees)?),
+                    fees: xmr(fees),
+                    paid,
+                })
+            }),
         })
     } else {
         None
@@ -4547,34 +4559,49 @@ mod tests {
         page.coinbase = true;
         page.coinbase_totals = Some(CoinbaseTotals {
             reward: "0.600034780725".to_owned(),
-            fees: Some(("0.000034780725".to_owned(), 3)),
+            split: Some(RewardSplit {
+                base: "0.6".to_owned(),
+                fees: "0.000034780725".to_owned(),
+                paid: 3,
+            }),
         });
         let html = page.render().expect("renders");
-        assert!(html.contains("<dt>Block reward</dt><dd>0.600034780725 XMR</dd>"));
-        assert!(html.contains(
-            "<dt>Fees collected</dt><dd>0.000034780725 XMR <span class=\"tag\">from 3 transactions</span></dd>"
-        ));
+        let rows = [
+            "<dt>Total block reward</dt><dd>0.600034780725 XMR</dd>",
+            "<dt>Base block reward</dt><dd>0.6 XMR</dd>",
+            "<dt>Miner fees collected</dt><dd>0.000034780725 XMR <span class=\"tag\">from 3 transactions</span></dd>",
+        ];
+        let at: Vec<usize> = rows
+            .iter()
+            .map(|r| html.find(r).unwrap_or_else(|| panic!("missing {r}")))
+            .collect();
+        assert!(at.is_sorted(), "the rows are out of order");
 
         page.coinbase_totals = Some(CoinbaseTotals {
             reward: "0.6".to_owned(),
-            fees: Some(("0".to_owned(), 0)),
+            split: Some(RewardSplit {
+                base: "0.6".to_owned(),
+                fees: "0".to_owned(),
+                paid: 0,
+            }),
         });
         let html = page.render().expect("renders");
-        assert!(html.contains("<dt>Fees collected</dt><dd>0 XMR</dd>"));
+        assert!(html.contains("<dt>Miner fees collected</dt><dd>0 XMR</dd>"));
 
         page.coinbase_totals = Some(CoinbaseTotals {
             reward: "0.6".to_owned(),
-            fees: None,
+            split: None,
         });
         let html = page.render().expect("renders");
-        assert!(html.contains("<dt>Block reward</dt>"));
-        assert!(!html.contains("Fees collected"));
+        assert!(html.contains("<dt>Total block reward</dt>"));
+        assert!(!html.contains("Base block reward"));
+        assert!(!html.contains("fees collected"));
 
         assert!(
             !tx_page()
                 .render()
                 .expect("renders")
-                .contains("Block reward")
+                .contains("Total block reward")
         );
     }
 

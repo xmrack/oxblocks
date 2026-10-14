@@ -28,8 +28,11 @@
   {% endif %}
   <dt>Fee</dt><dd>{{ fee }} XMR</dd>
   {% if let Some(c) = coinbase_totals %}
-  <dt>Block reward</dt><dd>{{ c.reward }} XMR</dd>
-  {% if let Some((fees, paid)) = c.fees %}<dt>Fees collected</dt><dd>{{ fees }} XMR{% if *paid > 0 %} <span class="tag">from {{ paid }} transaction{% if *paid != 1 %}s{% endif %}</span>{% endif %}</dd>{% endif %}
+  <dt>Total block reward</dt><dd>{{ c.reward }} XMR</dd>
+  {% if let Some(s) = c.split %}
+  <dt>Base block reward</dt><dd>{{ s.base }} XMR</dd>
+  <dt>Miner fees collected</dt><dd>{{ s.fees }} XMR{% if s.paid > 0 %} <span class="tag">from {{ s.paid }} transaction{% if s.paid != 1 %}s{% endif %}</span>{% endif %}</dd>
+  {% endif %}
   {% endif %}
   <dt>Size</dt><dd>{{ size }} bytes{% if pruned %} <span class="tag">prefix only</span>{% endif %}</dd>
   <dt>Version</dt><dd>{{ version_no }}{% if fcmp_pp %} &mdash; FCMP++ (type {{ rct_type }}){% else if rct_type > 0 %} &mdash; RingCT type {{ rct_type }}{% endif %}
