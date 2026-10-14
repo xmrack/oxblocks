@@ -194,6 +194,16 @@ struct TxPage {
     extra: String,
     extra_fields: Vec<ExtraField>,
     extra_undecoded: bool,
+    /// A mined coinbase's whole reward, and what of it the block's fees paid.
+    coinbase_totals: Option<CoinbaseTotals>,
+}
+
+struct CoinbaseTotals {
+    /// Every output of the coinbase together: the new coins and the fees.
+    reward: String,
+    /// The fees of the block's other transactions, and how many paid them.
+    /// `None` when the block's transactions could not all be read.
+    fees: Option<(String, usize)>,
 }
 
 impl TxPage {
@@ -1676,6 +1686,39 @@ async fn fetch_tx(
 /// carrying the root it was checked against with that root. Independent, so
 /// asked for together. See `RpcChainSource::proof_root` for why the root block
 /// is fetched rather than computed.
+/// The fees the block that mined the coinbase `entry` collected, and how many
+/// transactions paid them. `None` when the block at its height no longer has
+/// it as its coinbase, or when any of the block's transactions is missing or
+/// unreadable: a sum without one of them would understate the fees.
+async fn block_fees(state: &AppState, entry: &TxEntry) -> Option<(u64, usize)> {
+    let block = state
+        .chain
+        .block(BlockId::Height(entry.block_height))
+        .await
+        .ok()?;
+    if !block
+        .block_header
+        .miner_tx_hash
+        .eq_ignore_ascii_case(&entry.tx_hash)
+    {
+        return None;
+    }
+    let (fetched, _held) = state.chain.block_transactions(&block).await.ok()?;
+    if !fetched.missed.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut paid = 0;
+    for e in &fetched.txs {
+        let f = state.rows.of_block_tx(e)?;
+        if !f.coinbase {
+            total = total.checked_add(f.fee)?;
+            paid += 1;
+        }
+    }
+    Some((total, paid))
+}
+
 async fn tree_facts(
     state: &AppState,
     tx: &TxJson,
@@ -1792,6 +1835,17 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
         })
         .collect();
 
+    let coinbase_totals = if f.coinbase && !entry.in_pool {
+        Some(CoinbaseTotals {
+            reward: xmr(f.xmr_outputs),
+            fees: block_fees(&state, entry)
+                .await
+                .map(|(total, n)| (xmr(total), n)),
+        })
+    } else {
+        None
+    };
+
     let parsed = &f.extra;
     let mut extra_fields = Vec::new();
     // Carrot keeps the tags but changes what they hold: the key under 0x01
@@ -1868,6 +1922,7 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
             outputs,
             has_view_tags,
             has_unified_ids,
+            coinbase_totals,
             extra: f.extra_hex(),
             extra_fields,
             extra_undecoded: !parsed.is_complete(),
@@ -4436,7 +4491,48 @@ mod tests {
             extra: "01aa".to_owned(),
             extra_fields: Vec::new(),
             extra_undecoded: false,
+            coinbase_totals: None,
         }
+    }
+
+    /// A mined coinbase states its whole reward and the fees in it, and a
+    /// block whose transactions could not all be read shows no fee total
+    /// rather than a short one.
+    #[test]
+    fn a_coinbase_page_states_the_reward_and_the_fees() {
+        let mut page = tx_page();
+        page.coinbase = true;
+        page.coinbase_totals = Some(CoinbaseTotals {
+            reward: "0.600034780725".to_owned(),
+            fees: Some(("0.000034780725".to_owned(), 3)),
+        });
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Block reward</dt><dd>0.600034780725 XMR</dd>"));
+        assert!(html.contains(
+            "<dt>Fees collected</dt><dd>0.000034780725 XMR <span class=\"tag\">from 3 transactions</span></dd>"
+        ));
+
+        page.coinbase_totals = Some(CoinbaseTotals {
+            reward: "0.6".to_owned(),
+            fees: Some(("0".to_owned(), 0)),
+        });
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Fees collected</dt><dd>0 XMR</dd>"));
+
+        page.coinbase_totals = Some(CoinbaseTotals {
+            reward: "0.6".to_owned(),
+            fees: None,
+        });
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Block reward</dt>"));
+        assert!(!html.contains("Fees collected"));
+
+        assert!(
+            !tx_page()
+                .render()
+                .expect("renders")
+                .contains("Block reward")
+        );
     }
 
     /// The same page for an FCMP++ spend with Carrot outputs, as it would be

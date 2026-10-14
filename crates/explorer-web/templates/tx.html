@@ -27,6 +27,10 @@
   <dt>Timestamp</dt><dd>{{ timestamp }} &mdash; {{ timestamp_utc }} UTC <span class="tag">{{ age }} ago</span></dd>
   {% endif %}
   <dt>Fee</dt><dd>{{ fee }} XMR</dd>
+  {% if let Some(c) = coinbase_totals %}
+  <dt>Block reward</dt><dd>{{ c.reward }} XMR</dd>
+  {% if let Some((fees, paid)) = c.fees %}<dt>Fees collected</dt><dd>{{ fees }} XMR{% if *paid > 0 %} <span class="tag">from {{ paid }} transaction{% if *paid != 1 %}s{% endif %}</span>{% endif %}</dd>{% endif %}
+  {% endif %}
   <dt>Size</dt><dd>{{ size }} bytes{% if pruned %} <span class="tag">prefix only</span>{% endif %}</dd>
   <dt>Version</dt><dd>{{ version_no }}{% if fcmp_pp %} &mdash; FCMP++ (type {{ rct_type }}){% else if rct_type > 0 %} &mdash; RingCT type {{ rct_type }}{% endif %}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
