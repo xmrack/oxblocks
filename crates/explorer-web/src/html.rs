@@ -39,6 +39,9 @@ pub struct ChainStatus {
     pub pool: u64,
     pub target: u64,
     pub syncing: bool,
+    /// The daemon's release, as `v0.18.3.3`. `None` when the daemon does not
+    /// say, as a restricted one does not.
+    pub daemon: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,7 +1329,16 @@ async fn status_of(state: &AppState) -> Option<ChainStatus> {
         pool: info.tx_pool_size,
         target: info.target_height,
         syncing: info.target_height > info.height,
+        daemon: daemon_release(&info.version),
     })
+}
+
+/// monerod's version string as its release tag: `0.18.3.3-release` reads
+/// `v0.18.3.3`, and a pre-release keeps its tag, `v0.19.0.0-beta.3.1`.
+fn daemon_release(version: &str) -> Option<String> {
+    let v = version.trim();
+    let v = v.strip_suffix("-release").unwrap_or(v);
+    (!v.is_empty()).then(|| format!("v{v}"))
 }
 
 fn xmr(atomic: u64) -> String {
@@ -2644,7 +2656,38 @@ mod tests {
             pool: 7,
             target: 0,
             syncing: false,
+            daemon: Some("v0.18.3.3".to_owned()),
         })
+    }
+
+    /// The header names the daemon by its release tag, the version in bold,
+    /// and leaves it out when a restricted daemon keeps it back.
+    #[test]
+    fn the_header_names_the_daemon_release() {
+        assert_eq!(
+            daemon_release("0.18.3.3-release").as_deref(),
+            Some("v0.18.3.3")
+        );
+        assert_eq!(
+            daemon_release("0.19.0.0-beta.3.1-release").as_deref(),
+            Some("v0.19.0.0-beta.3.1")
+        );
+        assert_eq!(daemon_release(""), None);
+
+        let mut page = ErrorPage {
+            version: VERSION,
+            query: None,
+            chain: status(),
+            title: "Page not found".to_owned(),
+            detail: String::new(),
+        };
+        let html = page.render().expect("renders");
+        assert!(html.contains("<span>monerod <b>v0.18.3.3</b></span>"));
+
+        if let Some(c) = page.chain.as_mut() {
+            c.daemon = None;
+        }
+        assert!(!page.render().expect("renders").contains("monerod"));
     }
 
     /// The defence the whole HTML layer rests on. Escaping is the default,

@@ -1275,6 +1275,7 @@ mod tests {
             pool: 1,
             target: 120,
             syncing: false,
+            daemon: None,
         };
         let p = ring_page(
             Some(chain),

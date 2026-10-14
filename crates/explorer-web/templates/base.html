@@ -32,6 +32,7 @@
     <span>{{ c.nettype }}</span>
     <span>Difficulty <b>{{ c.difficulty }}</b></span>
     <span>Mempool <b>{{ c.pool }}</b></span>
+    {% if let Some(v) = c.daemon %}<span>monerod <b>{{ v }}</b></span>{% endif %}
     {% if c.syncing %}<span>syncing &mdash; <b>{{ c.target }}</b> target</span>{% endif %}
   </div>
 </div>
