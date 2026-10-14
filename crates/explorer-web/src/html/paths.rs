@@ -44,8 +44,6 @@ struct PathsPage {
     /// The first block whose tree holds the outputs. They share the
     /// transaction's lock, so they join together.
     joins: Option<u64>,
-    leaves: String,
-    n_layers: usize,
     root_block: Option<(u64, String)>,
     root_check: &'static str,
     outputs_total: usize,
@@ -100,8 +98,6 @@ struct Tab {
 
 struct StatusRow {
     label: String,
-    href: String,
-    unified_id: u64,
     /// Where the output sits among the leaves, grouped, when it is in the tree.
     leaf: Option<String>,
     /// The first block whose tree holds it, when it is not in this one.
@@ -308,8 +304,6 @@ fn page(
         .zip(&standings)
         .map(|(o, &standing)| StatusRow {
             label: format!("Output {}", o.index + 1),
-            href: link(Some(o.index + 1), 0),
-            unified_id: o.unified_id,
             leaf: o.placed.as_ref().map(|p| grouped(p.path.leaf_idx)),
             joins: (standing == Standing::Waiting).then_some(o.last_locked_block),
             check: match standing {
@@ -366,8 +360,6 @@ fn page(
         from: if showing.is_some() { 0 } else { from },
         mined_in: paths.mined_in,
         joins,
-        leaves: grouped(paths.n_leaf_tuples),
-        n_layers: depth,
         root_block: paths.root_block.clone(),
         root_check: paths.root_check().as_str(),
         outputs_total: total,
@@ -716,7 +708,7 @@ mod tests {
 
         let html = p.render().unwrap();
         // A path that passes carries no tag.
-        assert!(html.contains("<td>leaf 752</td>"), "{html}");
+        assert!(html.contains(" at leaf 752</span>"), "{html}");
         assert!(!html.contains("leads to the root") && !html.contains("tag ok"));
         // An output's tag sits beside its leaf, not after the hashes.
         assert!(html.contains("<td class=\"num\">752</td>"));
@@ -795,7 +787,6 @@ mod tests {
         assert!(html.contains("Not in the tree as of block 801"));
         assert!(html.contains("These outputs join\nthe curve tree as of block 810."));
         assert!(html.contains("Show their paths as of block 810"));
-        assert!(html.contains("joins as of block 810"));
         assert!(html.contains("mined in block</dt><dd><a href=\"/block/801\">801</a>"));
         assert!(html.contains("Added to the tree in block</dt><dd><a href=\"/block/810\">810</a>"));
 

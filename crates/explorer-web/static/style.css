@@ -800,7 +800,16 @@ form.as-of button {
 .grid-legend i.kept { opacity: 0.42; }
 .grid-legend i.other { background: var(--bg-raised); border: 1px solid var(--accent); }
 
-table.path-status { margin-bottom: 0.6rem; }
+/* Each output's place, under the legend it is read against. */
+.grid-outputs { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.3rem 1.2rem; margin: 0.45rem 0 0; font-size: 0.84rem; font-variant-numeric: tabular-nums; }
+/* The figure and what a wallet keeps for it, side by side when there is room:
+   the table reads the figure's columns layer by layer. */
+@media (min-width: 960px) {
+  .paths-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.6rem; align-items: start; }
+  .paths-pair .curve-tree { margin: 0; }
+  .paths-pair h2.kept-h { margin-top: 0.2rem; }
+  .paths-pair table.kept { width: 100%; margin-inline: 0; }
+}
 /* The paths page's prose runs the width of the page. */
 .lede.full, .paths-page .keeps { max-width: none; }
 .facts.wait {
@@ -834,8 +843,8 @@ details.path-data[open] > summary { border-radius: var(--radius) var(--radius) 0
 details.path-data > :not(summary) { margin-inline: 1.1rem; }
 details.path-data[open] { padding-bottom: 0.9rem; }
 /* Small tables, sized to what they hold rather than stretched across. */
-table.path-status, table.kept, table.leaves { width: auto; min-width: min(100%, 36rem); }
-table.path-status, table.kept, table.leaves { margin-inline: auto; }
+table.kept, table.leaves { width: auto; min-width: min(100%, 36rem); }
+table.kept, table.leaves { margin-inline: auto; }
 /* A leaf's key over its commitment, each wrapping in two on a narrow
    screen rather than to a sliver. */
 table.leaves td.pair { min-width: 33ch; }
