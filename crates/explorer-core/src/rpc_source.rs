@@ -412,7 +412,7 @@ impl RpcChainSource {
     /// A source whose caches of what the daemon sends hold `mib` in all.
     ///
     /// What the daemon sends is sized by the daemon, so those caches are held
-    /// to a byte budget as well as a count of entries. At [`BASE_CACHE_MIB`]
+    /// to a byte budget as well as a count of entries. At 304 MiB
     /// they hold 32 MiB of blocks by hash, 48 by height, 64 of transactions,
     /// 16 of ring members, 128 of blocks' transactions and 16 of recent
     /// transactions; any other budget scales each share and its count alike.
