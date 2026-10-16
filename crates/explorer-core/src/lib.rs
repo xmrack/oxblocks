@@ -23,8 +23,8 @@ pub use chain::{BlockId, BlockIdError, ChainError, ResolvedInput, RingMember};
 pub use fmt::{age, decimal, timestamp_utc};
 pub use hash::{Hash32, HashParseError};
 pub use rpc_source::{
-    BlockTree, BlockWithTxs, DEFAULT_MAX_INFLIGHT_RPC, FetchedTxs, Held, RpcChainSource,
-    unexpanded_inputs,
+    BlockTree, BlockWithTxs, DEFAULT_CACHE_MIB, DEFAULT_MAX_INFLIGHT_RPC, FetchedTxs, Held,
+    RpcChainSource, unexpanded_inputs,
 };
 pub use tx::TxFacts;
 pub use tx_extra::{ParsedTxExtra, PaymentId8, TxExtraField};

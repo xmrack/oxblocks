@@ -55,6 +55,7 @@ Each option also reads an environment variable. The command line wins.
 | `--max-inflight-rpc` | `OXBLOCKS_MAX_INFLIGHT_RPC` | `16` | RPC calls open at the same time. Keep it under monerod's `--rpc-max-connections-per-private-ip` (25), or `-per-public-ip` (3) for a daemon reached over a public address. |
 | `--max-body-bytes` | `OXBLOCKS_MAX_BODY` | `8192` | Largest accepted request body. |
 | `--max-response-mib` | `OXBLOCKS_MAX_RESPONSE_MIB` | `256` | Largest answer accepted from monerod, in MiB. Lower it for a node you do not run. |
+| `--cache-mib` | `OXBLOCKS_CACHE_MIB` | `2048` | What the caches of blocks and transactions hold in all, in MiB. Leave about 1 GiB of memory past it. |
 | `--postfix-min` | `OXBLOCKS_POSTFIX_MIN` | `2` | Shortest postfix the private lookup accepts. |
 | `--postfix-max` | `OXBLOCKS_POSTFIX_MAX` | `12` | Longest postfix the private lookup accepts. |
 | `--max-block-range` | `OXBLOCKS_MAX_BLOCK_RANGE` | `100` | Most blocks `/api/blocks` serves at once. |
@@ -69,7 +70,7 @@ Run `oxblocks --help` for the full text of each option.
 docker build -t oxblocks .
 docker run --rm -p 127.0.0.1:8081:8081 \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
-  --memory 1g --pids-limit 128 \
+  --memory 3g --pids-limit 128 \
   oxblocks --bind 0.0.0.0:8081 --daemon-url http://DAEMON-HOST:18081
 ```
 
@@ -92,7 +93,7 @@ To reach a daemon on the Docker host:
   ```bash
   docker run --rm --network host \
     --read-only --cap-drop ALL --security-opt no-new-privileges \
-    --memory 1g --pids-limit 128 \
+    --memory 3g --pids-limit 128 \
     oxblocks --bind 127.0.0.1:8081 --daemon-url http://127.0.0.1:18081
   ```
 

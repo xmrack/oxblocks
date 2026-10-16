@@ -340,7 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fail at startup rather than on the first request, and say plainly which
     // pages a restricted daemon would remove.
     let state = Arc::new(AppState {
-        chain: explorer_core::RpcChainSource::new(node)
+        chain: explorer_core::RpcChainSource::with_cache_mib(node, config.cache_mib)
             .with_max_inflight_rpc(config.max_inflight_rpc),
         limits,
         paths: tree_paths::PathCache::default(),

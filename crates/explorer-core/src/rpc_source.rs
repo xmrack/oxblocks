@@ -203,8 +203,18 @@ pub const FRESH_INFO_GAP: Duration = Duration::from_secs(1);
 
 /// The most daemon calls one [`RpcChainSource::tree_sizes`] makes. The
 /// sender of a transaction picks its reference block, so a page of them can
-/// name as many heights as it has rows.
-pub const MAX_TREE_SIZE_CALLS: usize = 16;
+/// name as many heights as it has rows: a block of 56 128-input spends named
+/// 50. Each call is a small one, and its answer is kept once the height is
+/// buried, so a block's page asks once for every row it is likely to have.
+pub const MAX_TREE_SIZE_CALLS: usize = 256;
+
+/// What the caches holding the daemon's strings may hold in all, in MiB,
+/// unless `--cache-mib` says otherwise.
+pub const DEFAULT_CACHE_MIB: u64 = 2048;
+
+/// The budget the caches below were sized at, in MiB. A different budget
+/// scales each of them, and the count of entries each keeps, alike.
+const BASE_CACHE_MIB: u64 = 304;
 
 /// Wait for `kib` of `budget`, which holds `total`, or all of it if that is
 /// less. Busy after [`RANGE_WAIT`].
@@ -393,22 +403,41 @@ fn out_bytes(o: &OutKey) -> usize {
 }
 
 impl RpcChainSource {
+    /// A source whose caches hold [`DEFAULT_CACHE_MIB`] in all.
     #[must_use]
     pub fn new(client: Client) -> Self {
+        Self::with_cache_mib(client, DEFAULT_CACHE_MIB)
+    }
+
+    /// A source whose caches of what the daemon sends hold `mib` in all.
+    ///
+    /// What the daemon sends is sized by the daemon, so those caches are held
+    /// to a byte budget as well as a count of entries. At [`BASE_CACHE_MIB`]
+    /// they hold 32 MiB of blocks by hash, 48 by height, 64 of transactions,
+    /// 16 of ring members, 128 of blocks' transactions and 16 of recent
+    /// transactions; any other budget scales each share and its count alike.
+    #[must_use]
+    pub fn with_cache_mib(client: Client, mib: u64) -> Self {
+        let mib = mib.max(1);
+        let bytes = |base_mib: u64| {
+            usize::try_from(base_mib.saturating_mul(mib).saturating_mul(1 << 20) / BASE_CACHE_MIB)
+                .unwrap_or(usize::MAX)
+        };
+        let count = |base: u64| {
+            usize::try_from(
+                (base.saturating_mul(mib) / BASE_CACHE_MIB)
+                    .max(base / 4)
+                    .max(1),
+            )
+            .unwrap_or(usize::MAX)
+        };
         Self {
             client,
-            // Sized for a working set of a few thousand objects: enough that
-            // paging through recent history is warm, small enough that the
-            // process footprint stays predictable.
-            //
-            // What the daemon sends is sized by the daemon, so the caches
-            // holding its strings are also held to a byte budget: about 310
-            // MiB in all, inside the 1 GiB `deploy/oxblocks.service` allows.
-            blocks_by_hash: Cache::expiring(512, Duration::from_secs(120))
-                .within_bytes(32 << 20, block_bytes),
-            blocks_by_height: Cache::permanent(2048).within_bytes(48 << 20, block_bytes),
-            txs: Cache::permanent(8192).within_bytes(64 << 20, tx_bytes),
-            outs: Cache::permanent(65_536).within_bytes(16 << 20, out_bytes),
+            blocks_by_hash: Cache::expiring(count(512), Duration::from_secs(120))
+                .within_bytes(bytes(32), block_bytes),
+            blocks_by_height: Cache::permanent(count(2048)).within_bytes(bytes(48), block_bytes),
+            txs: Cache::permanent(count(8192)).within_bytes(bytes(64), tx_bytes),
+            outs: Cache::permanent(count(65_536)).within_bytes(bytes(16), out_bytes),
             // Long enough to collapse the several calls a single page makes,
             // short enough that the height on screen is never visibly stale.
             info: Cache::expiring(1, Duration::from_secs(5)),
@@ -425,11 +454,11 @@ impl RpcChainSource {
             // is dropped. A sixteenth of the budget would keep none of those,
             // and every view of such a block would fetch it from the daemon
             // again, so the cache keeps a few whole blocks instead.
-            block_txs: Cache::permanent(512)
-                .within_bytes(128 << 20, block_txs_bytes)
+            block_txs: Cache::permanent(count(512))
+                .within_bytes(bytes(128), block_txs_bytes)
                 .keeping_up_to(48 << 20),
-            recent_txs: Cache::expiring(2048, Duration::from_secs(600))
-                .within_bytes(16 << 20, tx_bytes),
+            recent_txs: Cache::expiring(count(2048), Duration::from_secs(600))
+                .within_bytes(bytes(16), tx_bytes),
             flights: Flights::default(),
             rpc_permits: Arc::new(Semaphore::new(DEFAULT_MAX_INFLIGHT_RPC)),
             range_kib: Arc::new(Semaphore::new(RANGE_KIB as usize)),
@@ -1821,6 +1850,29 @@ mod tests {
 
     fn source() -> RpcChainSource {
         RpcChainSource::new(Client::new("http://127.0.0.1:1").expect("valid url"))
+    }
+
+    /// The cache budget scales every cache's count of entries with its
+    /// bytes: the base sizes at the base budget, and 2 GiB by default.
+    #[test]
+    fn the_cache_budget_scales_the_caches() {
+        let client = || Client::new("http://127.0.0.1:1").expect("valid url");
+        let capacity = |s: &RpcChainSource, name: &str| {
+            s.cache_stats()
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, st)| st.capacity)
+                .unwrap()
+        };
+        let base = RpcChainSource::with_cache_mib(client(), BASE_CACHE_MIB);
+        assert_eq!(capacity(&base, "txs"), 8192);
+        assert_eq!(capacity(&base, "block_txs"), 512);
+        let default = source();
+        assert_eq!(capacity(&default, "txs"), 8192 * 2048 / 304);
+        assert_eq!(capacity(&default, "block_txs"), 512 * 2048 / 304);
+        // A small budget still keeps a quarter of the base counts.
+        let small = RpcChainSource::with_cache_mib(client(), 64);
+        assert_eq!(capacity(&small, "txs"), 2048);
     }
 
     fn hash(byte: u8) -> Hash32 {

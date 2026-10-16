@@ -156,6 +156,22 @@ pub struct Config {
     )]
     pub max_response_mib: u64,
 
+    /// What the caches of the daemon's blocks and transactions may hold in
+    /// all, in MiB.
+    ///
+    /// Losing the cache costs speed, not correctness: a page it misses asks
+    /// the daemon again. During a flood of large transactions a bigger cache
+    /// keeps more recent blocks whole, so each is fetched from the daemon
+    /// once. The process needs room past this for what is in flight; see the
+    /// memory notes in `deploy/oxblocks.service`.
+    #[arg(
+        long,
+        env = "OXBLOCKS_CACHE_MIB",
+        default_value_t = explorer_core::DEFAULT_CACHE_MIB,
+        value_parser = clap::value_parser!(u64).range(64..=65_536)
+    )]
+    pub cache_mib: u64,
+
     /// Shortest transaction-hash postfix `/api/transaction/private` accepts.
     ///
     /// A shorter postfix hides the caller in a larger set and makes the daemon
@@ -360,6 +376,15 @@ mod tests {
         assert_eq!(c.max_inflight_rpc, explorer_core::DEFAULT_MAX_INFLIGHT_RPC);
         let c = Config::parse_from(["oxblocks", "--max-inflight-rpc", "4"]);
         assert_eq!(c.max_inflight_rpc, 4);
+    }
+
+    #[test]
+    fn the_cache_defaults_to_two_gib_and_is_configurable() {
+        let c = Config::parse_from(["oxblocks"]);
+        assert_eq!(c.cache_mib, 2048);
+        let c = Config::parse_from(["oxblocks", "--cache-mib", "512"]);
+        assert_eq!(c.cache_mib, 512);
+        assert!(Config::try_parse_from(["oxblocks", "--cache-mib", "10"]).is_err());
     }
 
     /// `auto` is the only default that respects a reader's own setting; the
