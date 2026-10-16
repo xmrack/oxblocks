@@ -1,0 +1,39 @@
+# Weekly upgrade pull requests. Each goes through the same CI as any other
+# change: the msrv job catches an upgrade that needs a newer Rust than 1.88,
+# cargo-deny a new advisory or licence, and check-deps.sh a crate entering or
+# leaving the tree, which then needs deps-baseline.txt updated by hand.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    # Upgrades short of a new major version together in one pull request, and
+    # each major one on its own, since it is the likeliest to need code changes.
+    groups:
+      cargo:
+        update-types: [minor, patch]
+
+  # The workflow's actions are pinned by commit; Dependabot moves the pin and
+  # the version comment beside it together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # The build image is the declared minimum Rust, kept in step with
+      # rust-version in Cargo.toml. Only its digest moves on its own.
+      - dependency-name: rust
+        update-types: [version-update:semver-major, version-update:semver-minor]
+    groups:
+      docker:
+        patterns: ["*"]
