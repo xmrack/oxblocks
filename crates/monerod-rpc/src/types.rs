@@ -695,9 +695,47 @@ pub struct TxEntry {
     pub relayed: bool,
     #[serde(default)]
     pub received_timestamp: u64,
+
+    /// The hex fields' lengths, once [`TxEntry::drop_hex`] has emptied them.
+    #[serde(skip)]
+    pub dropped_hex: Option<HexLengths>,
+}
+
+/// How long each hex field of a [`TxEntry`] was, in characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HexLengths {
+    pub as_hex: usize,
+    pub pruned: usize,
+    pub prunable: usize,
 }
 
 impl TxEntry {
+    /// Empty the hex fields, keeping only how long they were.
+    ///
+    /// Nothing reads the blobs themselves, only their lengths: the size and
+    /// [`TxEntry::prunable_missing`]. The prunable half is most of a large
+    /// transaction, and its proof is in `as_json` again, so a 128-input
+    /// FCMP++ spend holds half as much without them. Once dropped,
+    /// [`TxEntry::raw_hex`] is `None` and the rest answers as before.
+    pub fn drop_hex(&mut self) {
+        if self.dropped_hex.is_none() {
+            self.dropped_hex = Some(self.hex_lengths());
+            self.as_hex = String::new();
+            self.pruned_as_hex = String::new();
+            self.prunable_as_hex = String::new();
+        }
+    }
+
+    /// The hex fields' lengths, whether or not they were dropped.
+    #[must_use]
+    pub fn hex_lengths(&self) -> HexLengths {
+        self.dropped_hex.unwrap_or(HexLengths {
+            as_hex: self.as_hex.len(),
+            pruned: self.pruned_as_hex.len(),
+            prunable: self.prunable_as_hex.len(),
+        })
+    }
+
     /// The unified ids, one per output, or `None` when there is not exactly
     /// one per output. They are matched to outputs by position, so a list of
     /// any other length cannot say which output an id belongs to.
@@ -717,12 +755,16 @@ impl TxEntry {
 
     /// Whatever raw hex monerod gave us, reassembled.
     ///
-    /// Returns `None` when neither form was populated. Note this is *not*
+    /// Returns `None` when neither form was populated, or when
+    /// [`TxEntry::drop_hex`] dropped them. Note this is *not*
     /// necessarily the complete blob: when the daemon has pruned the
     /// transaction, only the pruned prefix exists. Ask
     /// [`TxEntry::prunable_missing`] before presenting it as the full blob.
     #[must_use]
     pub fn raw_hex(&self) -> Option<String> {
+        if self.dropped_hex.is_some() {
+            return None;
+        }
         if !self.as_hex.is_empty() {
             return Some(self.as_hex.clone());
         }
@@ -735,13 +777,14 @@ impl TxEntry {
     /// The length of [`Self::raw_hex`], without assembling it.
     #[must_use]
     pub fn raw_hex_len(&self) -> Option<usize> {
-        if !self.as_hex.is_empty() {
-            return Some(self.as_hex.len());
+        let n = self.hex_lengths();
+        if n.as_hex > 0 {
+            return Some(n.as_hex);
         }
-        if self.pruned_as_hex.is_empty() {
+        if n.pruned == 0 {
             return None;
         }
-        Some(self.pruned_as_hex.len() + self.prunable_as_hex.len())
+        Some(n.pruned + n.prunable)
     }
 
     /// Whether *this node* no longer holds the transaction's prunable half.
@@ -758,10 +801,11 @@ impl TxEntry {
     #[must_use]
     pub fn prunable_missing(&self, decoded: &TxJson) -> bool {
         // Non-split form: everything is in as_hex, so nothing was withheld.
-        if !self.as_hex.is_empty() {
+        let n = self.hex_lengths();
+        if n.as_hex > 0 {
             return false;
         }
-        if !self.prunable_as_hex.is_empty() {
+        if n.prunable > 0 {
             return false;
         }
         if decoded.is_coinbase() {
@@ -3129,9 +3173,17 @@ mod tests {
             unified_ids: vec![],
             relayed: false,
             received_timestamp: 0,
+            dropped_hex: None,
         };
         assert!(entry.prunable_missing(&tx));
         assert_eq!(entry.raw_hex().as_deref(), Some("0200"));
+        let mut slim = entry.clone();
+        slim.drop_hex();
+        assert!(
+            slim.prunable_missing(&tx),
+            "still pruned once the hex is gone"
+        );
+        assert_eq!(slim.raw_hex_len(), Some(4));
     }
 
     #[test]
@@ -3162,9 +3214,19 @@ mod tests {
             unified_ids: vec![],
             relayed: false,
             received_timestamp: 0,
+            dropped_hex: None,
         };
         assert!(!entry.prunable_missing(&tx));
         assert_eq!(entry.raw_hex().as_deref(), Some("0200deadbeef"));
+        let mut slim = entry.clone();
+        slim.drop_hex();
+        assert!(
+            !slim.prunable_missing(&tx),
+            "still whole once the hex is gone"
+        );
+        assert_eq!(slim.raw_hex_len(), Some(12));
+        assert_eq!(slim.raw_hex(), None);
+        assert!(slim.as_hex.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -3409,7 +3471,38 @@ mod tests {
             unified_ids: vec![],
             relayed: false,
             received_timestamp: 0,
+            dropped_hex: None,
         }
+    }
+
+    /// A split entry that holds its prunable half answers the same once its
+    /// hex is dropped, and dropping twice keeps the first lengths.
+    #[test]
+    fn dropping_the_hex_keeps_the_size_and_the_pruning_answer() {
+        let raw = r#"{"version":2,"unlock_time":0,
+            "vin":[{"key":{"amount":0,"key_offsets":[1,2],"k_image":"aa"}}],
+            "vout":[{"amount":0,"target":{"key":"bb"}}],
+            "extra":[1],
+            "rct_signatures":{"type":5,"txnFee":1,"ecdhInfo":[{"amount":"0011223344556677"}],
+                "outPk":["cc"]},
+            "rctsig_prunable":{"nbp":1,"bp":[],"CLSAGs":[],"pseudoOuts":[]}}"#;
+        let tx: TxJson = serde_json::from_str(raw).unwrap();
+        let mut entry = split_entry(raw);
+        entry.prunable_as_hex = "ab".repeat(1000);
+        assert!(!entry.prunable_missing(&tx));
+        entry.drop_hex();
+        entry.drop_hex();
+        assert!(entry.pruned_as_hex.is_empty() && entry.prunable_as_hex.is_empty());
+        assert!(!entry.prunable_missing(&tx));
+        assert_eq!(entry.raw_hex_len(), Some(2004));
+        assert_eq!(
+            entry.hex_lengths(),
+            HexLengths {
+                as_hex: 0,
+                pruned: 4,
+                prunable: 2000
+            }
+        );
     }
 
     /// "One input, and it is a gen" -- both halves. Consensus permits no such

@@ -402,7 +402,7 @@ impl RpcChainSource {
             // process footprint stays predictable.
             //
             // What the daemon sends is sized by the daemon, so the caches
-            // holding its strings are also held to a byte budget: about 230
+            // holding its strings are also held to a byte budget: about 310
             // MiB in all, inside the 1 GiB `deploy/oxblocks.service` allows.
             blocks_by_hash: Cache::expiring(512, Duration::from_secs(120))
                 .within_bytes(32 << 20, block_bytes),
@@ -420,7 +420,14 @@ impl RpcChainSource {
             recent_tree_sizes: Cache::expiring(1024, Duration::from_secs(600)),
             tip_probes: Cache::expiring(4, Duration::from_secs(600)),
             v2_height: Cache::permanent(1),
-            block_txs: Cache::permanent(512).within_bytes(48 << 20, block_txs_bytes),
+            // A block's transactions are one entry, and a full block of
+            // 128-input FCMP++ spends is about 18 MiB of them once their hex
+            // is dropped. A sixteenth of the budget would keep none of those,
+            // and every view of such a block would fetch it from the daemon
+            // again, so the cache keeps a few whole blocks instead.
+            block_txs: Cache::permanent(512)
+                .within_bytes(128 << 20, block_txs_bytes)
+                .keeping_up_to(48 << 20),
             recent_txs: Cache::expiring(2048, Duration::from_secs(600))
                 .within_bytes(16 << 20, tx_bytes),
             flights: Flights::default(),
@@ -929,7 +936,9 @@ impl RpcChainSource {
         .await
         {
             let response = response?;
-            for entry in response.txs {
+            for mut entry in response.txs {
+                // Only the blobs' lengths are read, so only they are kept.
+                entry.drop_hex();
                 let Ok(h) = entry.tx_hash.parse::<Hash32>() else {
                     continue;
                 };

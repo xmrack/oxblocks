@@ -103,6 +103,8 @@ pub struct Cache<K, V> {
 struct Budget<V> {
     bytes: usize,
     weigh: fn(&V) -> usize,
+    /// The heaviest value kept.
+    largest: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +163,25 @@ impl<K: Eq + Hash + Clone, V> Cache<K, V> {
     /// empty the cache to make room for itself.
     #[must_use]
     pub fn within_bytes(mut self, bytes: usize, weigh: fn(&V) -> usize) -> Self {
-        self.budget = Some(Budget { bytes, weigh });
+        self.budget = Some(Budget {
+            bytes,
+            weigh,
+            largest: bytes / EVICT_FRACTION,
+        });
+        self
+    }
+
+    /// Keep values weighing up to `bytes`, rather than a sixteenth of the
+    /// budget, and never more than half of it.
+    ///
+    /// For a cache whose every entry is one of a few large ones, such as a
+    /// whole block's transactions: a sixteenth would turn away the very
+    /// entries it exists to keep.
+    #[must_use]
+    pub fn keeping_up_to(mut self, bytes: usize) -> Self {
+        if let Some(b) = &mut self.budget {
+            b.largest = bytes.min(b.bytes / 2);
+        }
         self
     }
 
@@ -249,7 +269,7 @@ impl<K: Eq + Hash + Clone, V> Cache<K, V> {
         let weight = self.budget.as_ref().map_or(0, |b| (b.weigh)(&value));
         let value = Arc::new(value);
         if let Some(b) = &self.budget
-            && weight > b.bytes / EVICT_FRACTION
+            && weight > b.largest
         {
             return value;
         }
@@ -395,6 +415,34 @@ mod tests {
         cache.insert(99, vec![0; 10]);
         let (held, summed) = weights(&cache);
         assert_eq!(held, summed);
+    }
+
+    /// A cache of a few large entries keeps them, up to the size it was told
+    /// and never past half its budget, and makes room by evicting the oldest.
+    #[test]
+    fn a_cache_of_large_entries_keeps_them() {
+        let cache: Cache<u32, Vec<u8>> = Cache::permanent(16)
+            .within_bytes(1600, Vec::len)
+            .keeping_up_to(600);
+        cache.insert(1, vec![0; 500]);
+        cache.insert(2, vec![0; 500]);
+        assert!(cache.get(&1).is_some() && cache.get(&2).is_some());
+        cache.insert(3, vec![0; 500]);
+        cache.insert(4, vec![0; 500]);
+        assert!(cache.get(&4).is_some());
+        assert!(cache.get(&1).is_none(), "the oldest made room");
+        assert!(cache.stats().len <= 3);
+
+        cache.insert(5, vec![0; 601]);
+        assert!(cache.get(&5).is_none(), "past what it was told");
+
+        let capped: Cache<u32, Vec<u8>> = Cache::permanent(16)
+            .within_bytes(1000, Vec::len)
+            .keeping_up_to(5000);
+        capped.insert(1, vec![0; 501]);
+        assert!(capped.get(&1).is_none(), "never past half the budget");
+        capped.insert(2, vec![0; 500]);
+        assert!(capped.get(&2).is_some());
     }
 
     #[test]
