@@ -3,6 +3,7 @@
 mod api;
 mod config;
 mod html;
+mod tree_paths;
 
 use std::sync::Arc;
 
@@ -63,6 +64,10 @@ fn router(config: &Config, state: Arc<AppState>) -> Router {
         .route("/api/version", get(handlers::version))
         .route("/api/block/{id}", get(handlers::block))
         .route("/api/transaction/{hash}", get(handlers::transaction))
+        .route(
+            "/api/transaction/{hash}/paths",
+            get(handlers::transaction_paths),
+        )
         .route("/api/rawblock/{id}", get(handlers::raw_block))
         .route("/api/rawtransaction/{hash}", get(handlers::raw_transaction))
         .route("/api/feeestimate", get(handlers::fee_estimate))
@@ -86,12 +91,15 @@ fn router(config: &Config, state: Arc<AppState>) -> Router {
         .route("/page/{page}", get(html::page_at))
         .route("/block/{id}", get(html::block))
         .route("/tx/{hash}", get(html::transaction))
+        .route("/tx/{hash}/fcmp", get(html::fcmp_proof))
+        .route("/tx/{hash}/ring", get(html::ring_proof))
+        .route("/tx/{hash}/paths", get(html::tree_paths))
         .route("/mempool", get(html::mempool))
         .route("/altblocks", get(html::alt_blocks))
         .route("/search", get(html::search))
         .route("/static/style.css", get(html::stylesheet))
         .route("/health", get(health))
-        .fallback(html::not_found)
+        .fallback(not_found)
         .with_state(state)
         .route(
             "/robots.txt",
@@ -101,11 +109,17 @@ fn router(config: &Config, state: Arc<AppState>) -> Router {
             get(|| async { "User-agent: *\nDisallow: /\n" }),
         );
 
+    // One limit for the whole server. `Router::layer` wraps each route in the
+    // layer on its own, so a limit the layer built would be one per route;
+    // the semaphore is made here, once, and every route's copy shares it.
+    let slots = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent));
+
     let mut app = app.layer(
         ServiceBuilder::new()
             // Outermost of the middleware: a panic in a handler becomes a
             // 500 for that one request instead of killing the connection
             // task. This does not excuse panics -- it bounds them.
+            .layer(axum::middleware::from_fn(enveloped))
             .layer(CatchPanicLayer::new())
             .layer(
                 TraceLayer::new_for_http()
@@ -140,14 +154,14 @@ fn router(config: &Config, state: Arc<AppState>) -> Router {
                     .br(true)
                     .no_zstd(),
             )
-            .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
             // 504 rather than 408: when this fires it is almost always the
             // daemon being slow, not the client being slow.
             .layer(TimeoutLayer::with_status_code(
                 StatusCode::GATEWAY_TIMEOUT,
                 config.request_timeout(),
             ))
-            .concurrency_limit(config.max_concurrent),
+            .layer(axum::middleware::from_fn_with_state(slots, within_limit))
+            .layer(RequestBodyLimitLayer::new(config.max_body_bytes)),
     );
 
     // Applied outermost, so that a response this explorer did not render still
@@ -159,6 +173,65 @@ fn router(config: &Config, state: Arc<AppState>) -> Router {
     }
 
     app
+}
+
+/// Whether `path` is the JSON API's.
+fn is_api(path: &str) -> bool {
+    path.starts_with("/api/")
+}
+
+/// A path no route serves: the API's refusal under `/api/`, the page
+/// elsewhere.
+async fn not_found(
+    state: axum::extract::State<Arc<AppState>>,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    if is_api(uri.path()) {
+        api::envelope::ApiError::not_found("no such endpoint").into_response()
+    } else {
+        html::not_found(state).await.into_response()
+    }
+}
+
+/// An API answer the layers below wrote rather than a handler -- a timeout, a
+/// body over the limit, a panic, a method no route answers -- put in the
+/// envelope like any other.
+async fn enveloped(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let api = is_api(request.uri().path());
+    let response = next.run(request).await;
+    if !api || api::envelope::is_enveloped(&response) {
+        return response;
+    }
+    api::envelope::ApiError::of_status(response.status()).into_response()
+}
+
+/// The routes that never reach the daemon, served outside `--max-concurrent`
+/// so that a slow daemon filling every slot cannot fail them too.
+const OUTSIDE_THE_LIMIT: [&str; 3] = ["/health", "/static/style.css", "/robots.txt"];
+
+/// Run the request once a slot of `--max-concurrent` is free.
+///
+/// The slot is waited for inside the request's future, under the request
+/// timeout, so a request queued behind a full server is shed by the timeout
+/// like one waiting on anything else.
+async fn within_limit(
+    axum::extract::State(slots): axum::extract::State<Arc<tokio::sync::Semaphore>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    if OUTSIDE_THE_LIMIT.contains(&request.uri().path()) {
+        return next.run(request).await;
+    }
+    let Ok(_slot) = slots.acquire_owned().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    next.run(request).await
 }
 
 /// Liveness, plus cache occupancy.
@@ -174,6 +247,11 @@ async fn health(
         .chain
         .cache_stats()
         .into_iter()
+        .chain([
+            ("tree_paths", state.paths.stats()),
+            ("recent_tree_paths", state.paths.recent_stats()),
+            ("table_rows", state.rows.stats()),
+        ])
         .map(|(name, s)| {
             (
                 name.to_owned(),
@@ -248,19 +326,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::try_new(&config.log)?)
         .init();
 
-    let node = monerod_rpc::Client::builder(&config.daemon_url)
+    let mut node = monerod_rpc::Client::builder(&config.daemon_url)
         .timeout(config.rpc_timeout())
-        .user_agent(concat!("oxblocks/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+        .max_response_bytes(config.max_response_bytes())
+        .user_agent(concat!("oxblocks/", env!("CARGO_PKG_VERSION")));
+    if let Some(sha256) = config.daemon_cert_sha256 {
+        node = node.pinned_certificate(sha256);
+    }
+    let node = node.build()?;
 
     tracing::info!(daemon = %node.base_url(), "connecting to monerod");
 
     // Fail at startup rather than on the first request, and say plainly which
     // pages a restricted daemon would remove.
     let state = Arc::new(AppState {
-        chain: explorer_core::RpcChainSource::new(node)
+        chain: explorer_core::RpcChainSource::with_cache_mib(node, config.cache_mib)
             .with_max_inflight_rpc(config.max_inflight_rpc),
         limits,
+        paths: tree_paths::PathCache::default(),
+        recent: Default::default(),
+        rows: Default::default(),
     });
     match state.chain.info().await {
         Ok(info) => {
@@ -273,14 +358,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             if info.restricted {
                 tracing::warn!(
-                    "this daemon is restricted: /get_transaction_pool, \
-                     get_alternate_chains and get_alt_blocks_hashes are blocked, \
-                     so the mempool and alt-block pages will be unavailable"
+                    "this daemon is restricted: get_alternate_chains and \
+                     get_alt_blocks_hashes are blocked, so the alt-block pages \
+                     will be unavailable, and the mempool lists only what it relays"
                 );
             }
         }
         Err(e) => tracing::warn!("could not reach monerod at startup: {e}"),
     }
+
+    // The curve-tree generators take a second or two to decode, so do it now
+    // rather than in the first request to check a path.
+    tokio::task::spawn_blocking(|| {
+        let started = std::time::Instant::now();
+        explorer_core::curve_tree::load_generators();
+        tracing::info!("curve-tree generators loaded in {:?}", started.elapsed());
+    });
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(addr = %config.bind, "oxblocks listening");
@@ -317,7 +410,75 @@ mod tests {
                 monerod_rpc::Client::new("http://127.0.0.1:1").expect("valid url"),
             ),
             limits,
+            paths: crate::tree_paths::PathCache::default(),
+            recent: Default::default(),
+            rows: Default::default(),
         })
+    }
+
+    /// The limit is the server's, not each route's; a request waiting for a
+    /// slot is shed by the timeout; and the routes that never reach the
+    /// daemon are answered while a slow one holds every slot.
+    #[tokio::test]
+    async fn a_slow_daemon_fills_the_limit_but_not_health() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // A daemon that never answers, counting who reaches it.
+        let daemon = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", daemon.local_addr().unwrap());
+        let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&reached);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((c, _)) = daemon.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(c);
+            }
+        });
+        let reached = move || reached.load(std::sync::atomic::Ordering::SeqCst);
+        let state = Arc::new(AppState {
+            chain: explorer_core::RpcChainSource::new(monerod_rpc::Client::new(&url).unwrap()),
+            limits: crate::config::Limits::default(),
+            paths: crate::tree_paths::PathCache::default(),
+            recent: Default::default(),
+            rows: Default::default(),
+        });
+        let config = Config::parse_from([
+            "oxblocks",
+            "--max-concurrent",
+            "1",
+            "--request-timeout-secs",
+            "1",
+        ]);
+        let app = router(&config, state);
+        let ask = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        let slow = tokio::spawn(ask("/"));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        assert_eq!(ask("/health").await, StatusCode::OK);
+        assert_eq!(ask("/static/style.css").await, StatusCode::OK);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+
+        // Another route waits for the one slot, not reaching the daemon
+        // while the slow request holds it.
+        let before = reached();
+        assert!(before > 0);
+        let waiting = tokio::spawn(ask("/api/version"));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(reached(), before);
+        assert_eq!(slow.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(waiting.await.unwrap(), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]
@@ -528,6 +689,36 @@ mod tests {
         }
     }
 
+    /// A request axum's own extractors cannot read is refused in the API's
+    /// envelope too, not in axum's plain text.
+    #[tokio::test]
+    async fn a_request_axum_cannot_read_is_refused_in_the_envelope() {
+        for uri in [
+            "/api/transactions?page=1&page=2",
+            "/api/mempool?limit=1&limit=2",
+            "/api/feeestimate?grace_blocks=1&grace_blocks=2",
+            "/api/transaction/private/%FF%FE",
+            "/api/block/%FF",
+            "/api/blocks/%FF/1",
+        ] {
+            let (status, body) = get(uri).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{uri} answered {status} with {body}"
+            );
+            let body: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|_| panic!("{uri} did not answer JSON: {body}"));
+            assert_eq!(body["status"], "fail", "{uri}");
+            assert!(
+                body["data"]["title"]
+                    .as_str()
+                    .is_some_and(|t| !t.is_empty()),
+                "{uri}"
+            );
+        }
+    }
+
     /// The refusal above is about the argument, not about the daemon being
     /// unreachable: a well formed argument gets past the parse and fails
     /// later, with a different code.
@@ -666,5 +857,73 @@ mod tests {
             .expect("router responds");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Under `/api/`, an answer no endpoint wrote is in the envelope too: a
+    /// path naming no endpoint, a method none answers, a body over the
+    /// limit. Elsewhere the page or the bare status stands.
+    #[tokio::test]
+    async fn every_api_answer_is_enveloped() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let config = Config::parse_from(["oxblocks"]);
+        let ask = |method: &str, uri: &str, body: Vec<u8>| {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(axum::http::header::CONTENT_LENGTH, body.len())
+                .body(Body::from(body))
+                .unwrap();
+            router(&config, test_state()).oneshot(request)
+        };
+        let read = |r: axum::response::Response| async move {
+            let status = r.status();
+            let cors = r.headers().contains_key("access-control-allow-origin");
+            let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+            (status, cors, String::from_utf8_lossy(&body).into_owned())
+        };
+
+        let (status, cors, body) = read(ask("GET", "/api/nothing", vec![]).await.unwrap()).await;
+        assert_eq!((status, cors), (StatusCode::NOT_FOUND, true));
+        assert_eq!(
+            body,
+            r#"{"data":{"title":"no such endpoint"},"status":"fail"}"#
+        );
+        let (status, _, body) = read(ask("GET", "/api/block/", vec![]).await.unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains(r#""status":"fail""#), "{body}");
+
+        let (status, cors, body) = read(ask("POST", "/api/version", vec![]).await.unwrap()).await;
+        assert_eq!((status, cors), (StatusCode::METHOD_NOT_ALLOWED, true));
+        assert_eq!(
+            body,
+            r#"{"data":{"title":"Method Not Allowed"},"status":"fail"}"#
+        );
+
+        let over = vec![b'x'; config.max_body_bytes + 1];
+        let (status, cors, body) = read(ask("GET", "/api/version", over).await.unwrap()).await;
+        assert_eq!((status, cors), (StatusCode::PAYLOAD_TOO_LARGE, true));
+        assert!(body.contains(r#""status":"fail""#), "{body}");
+
+        let (status, cors, body) = read(ask("GET", "/nothing", vec![]).await.unwrap()).await;
+        assert_eq!((status, cors), (StatusCode::NOT_FOUND, false));
+        assert!(body.contains("<html"), "{body}");
+        let (status, cors, _) = read(ask("POST", "/mempool", vec![]).await.unwrap()).await;
+        assert_eq!((status, cors), (StatusCode::METHOD_NOT_ALLOWED, false));
+    }
+
+    /// A deadline passed is a 504 in the envelope under `/api/`, an `error`.
+    #[test]
+    fn an_answer_no_endpoint_wrote_takes_the_envelope_its_status_calls_for() {
+        let value = |s| api::envelope::ApiError::of_status(s);
+        let timeout = value(StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(timeout.outcome, api::envelope::Outcome::Error);
+        assert_eq!(timeout.message, "Gateway Timeout");
+        assert_eq!(
+            value(StatusCode::PAYLOAD_TOO_LARGE).outcome,
+            api::envelope::Outcome::Fail
+        );
     }
 }

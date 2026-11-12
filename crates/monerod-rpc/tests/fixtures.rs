@@ -23,11 +23,11 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use monerod_rpc::types::{
-    BlockHeader, ChainInfo, EcdhForm, EcdhInfo, FeeEstimate, GetAlternateChains, GetBlock,
-    GetBlockCount, GetBlockHeader, GetBlockHeadersRange, GetHeight, GetInfo, GetOutsResponse,
-    GetTransactionPool, GetTransactionsResponse, IsKeyImageSpentResponse, NestedJsonError, OutKey,
-    OutKeyRequest, PseudoOutsLocation, RctSigBase, RctType, SpentStatus, TxEntry, TxIn, TxJson,
-    TxOutTarget, parse_wide, reassemble_u128, split_ring_signatures,
+    BlockHeader, BlockJson, ChainInfo, EcdhForm, EcdhInfo, FeeEstimate, GetAlternateChains,
+    GetBlock, GetBlockCount, GetBlockHeader, GetBlockHeadersRange, GetHeight, GetInfo,
+    GetOutsResponse, GetTransactionPool, GetTransactionsResponse, IsKeyImageSpentResponse,
+    NestedJsonError, OutKey, OutKeyRequest, PseudoOutsLocation, RctSigBase, RctType, SpentStatus,
+    TxEntry, TxIn, TxJson, TxOutTarget, parse_wide, reassemble_u128, split_ring_signatures,
 };
 
 /// `"signatures": [ ]` — present and empty, which is what a v1 coinbase emits
@@ -135,30 +135,61 @@ const REPLAYED: &[&str] = &[
     "mainnet/get_transactions_rct6_complete.json",
     "mainnet/get_transactions_rct6_bulletproofplus.json",
     "mainnet/tx_ringct_as_json_parsed.json",
+    "fcmp/get_info.json",
+    "fcmp/get_block_fcmp.json",
+    "fcmp/get_block_coinbase_only.json",
+    "fcmp/get_last_block_header.json",
+    "fcmp/get_fee_estimate.json",
+    "fcmp/get_transaction_pool.json",
+    "fcmp/get_transactions_fcmp.json",
+    "fcmp/get_transactions_fcmp_pruned.json",
+    "fcmp/get_transactions_coinbase.json",
+    "fcmp/get_transactions_pool.json",
+    "fcmp/paths/get_block_root_tip.json",
+    "fcmp/paths/get_block_root_later.json",
+    "fcmp/paths/get_transactions.json",
 ];
 
 fn replay_by_name(rel: &str) {
     match rel {
-        "testnet/get_info.json" | "testnet/get_info_master.json" => {
+        "testnet/get_info.json" | "testnet/get_info_master.json" | "fcmp/get_info.json" => {
             drop(replay::<GetInfo>(&result_of(rel), rel));
         }
         "testnet/get_block_134721.json"
         | "testnet/get_block_coinbase_only.json"
-        | "mainnet/get_block_ringct.json" => drop(replay::<GetBlock>(&result_of(rel), rel)),
+        | "mainnet/get_block_ringct.json"
+        | "fcmp/get_block_fcmp.json"
+        | "fcmp/get_block_coinbase_only.json"
+        | "fcmp/paths/get_block_root_tip.json"
+        | "fcmp/paths/get_block_root_later.json" => {
+            let block: GetBlock = replay(&result_of(rel), rel);
+            // The block's own JSON is a second wire format, and the one that
+            // carries the curve tree.
+            let nested: Value = serde_json::from_str(&block.json)
+                .unwrap_or_else(|e| panic!("{rel} json is not JSON: {e}"));
+            drop(replay::<BlockJson>(&nested, &format!("{rel}:json")));
+        }
         "testnet/get_block_headers_range.json" => {
             drop(replay::<GetBlockHeadersRange>(&result_of(rel), rel));
         }
-        "testnet/get_last_block_header.json" => {
+        "testnet/get_last_block_header.json" | "fcmp/get_last_block_header.json" => {
             drop(replay::<GetBlockHeader>(&result_of(rel), rel));
         }
         "testnet/get_block_count.json" => drop(replay::<GetBlockCount>(&result_of(rel), rel)),
-        "testnet/get_fee_estimate.json" => drop(replay::<FeeEstimate>(&result_of(rel), rel)),
+        "testnet/get_fee_estimate.json" | "fcmp/get_fee_estimate.json" => {
+            drop(replay::<FeeEstimate>(&result_of(rel), rel));
+        }
         "testnet/get_alternate_chains.json" => {
             drop(replay::<GetAlternateChains>(&result_of(rel), rel));
         }
         "testnet/get_height.json" => drop(replay::<GetHeight>(&raw(rel), rel)),
-        "testnet/get_transaction_pool.json" => {
-            drop(replay::<GetTransactionPool>(&raw(rel), rel));
+        "testnet/get_transaction_pool.json" | "fcmp/get_transaction_pool.json" => {
+            let pool: GetTransactionPool = replay(&raw(rel), rel);
+            for t in &pool.transactions {
+                let nested: Value = serde_json::from_str(&t.tx_json)
+                    .unwrap_or_else(|e| panic!("{rel} tx_json is not JSON: {e}"));
+                drop(replay::<TxJson>(&nested, &format!("{rel}:{}", t.id_hash)));
+            }
         }
         "testnet/get_transactions_ring.json"
         | "testnet/get_transactions_coinbase.json"
@@ -171,7 +202,12 @@ fn replay_by_name(rel: &str) {
         | "mainnet/get_transactions_rct5_clsag.json"
         | "mainnet/get_transactions_coinbase_v2.json"
         | "mainnet/get_transactions_rct6_complete.json"
-        | "mainnet/get_transactions_rct6_bulletproofplus.json" => {
+        | "mainnet/get_transactions_rct6_bulletproofplus.json"
+        | "fcmp/get_transactions_fcmp.json"
+        | "fcmp/get_transactions_fcmp_pruned.json"
+        | "fcmp/get_transactions_coinbase.json"
+        | "fcmp/get_transactions_pool.json"
+        | "fcmp/paths/get_transactions.json" => {
             let resp: GetTransactionsResponse = replay(&raw(rel), rel);
             // The nested documents are a second wire format; replay them too.
             for entry in &resp.txs {
@@ -210,7 +246,7 @@ fn every_known_fixture_round_trips_without_losing_a_field() {
 #[test]
 fn every_fixture_on_disk_is_at_least_valid_json() {
     let mut on_disk = std::collections::BTreeSet::new();
-    for net in ["testnet", "mainnet"] {
+    for net in ["testnet", "mainnet", "fcmp", "fcmp/paths"] {
         let dir = fixtures_root().join(net);
         let entries = std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
@@ -682,11 +718,13 @@ fn the_corpus_covers_every_rct_type_reachable_from_these_nodes() {
     // Every scheme Monero has ever used on mainnet, each behind a real capture.
     // Type 6 (BulletproofPlus) was out of reach when this corpus was first
     // built -- HF15 is height 2,688,888 and the node was at 2,583,912 -- and is
-    // now covered by mainnet tx 281d0f52...9981 at height 3,120,801.
+    // now covered by mainnet tx 281d0f52...9981 at height 3,120,801. Type 7
+    // (FCMP++) comes from a regtest daemon built from the stressnet branch;
+    // see `fixtures/fcmp`.
     assert_eq!(
         seen,
-        vec![0, 1, 2, 3, 4, 5, 6],
-        "every RingCT type from Null to BulletproofPlus has a real capture behind it"
+        vec![0, 1, 2, 3, 4, 5, 6, 7],
+        "every RingCT type from Null to FCMP++ has a real capture behind it"
     );
 }
 
@@ -2232,4 +2270,346 @@ fn a_pruned_bulletproof_plus_transaction_loses_only_its_prunable_half() {
 
     // Type 6 keeps pseudo-outs in the prunable half, so pruning takes them.
     assert!(tx.pseudo_outs().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// FCMP++ and Carrot, from a daemon built from the stressnet branch
+// ---------------------------------------------------------------------------
+
+/// Regtest runs the newest fork from block 1, so every spend in these captures
+/// is an FCMP++ spend and every output a Carrot output.
+#[test]
+fn an_fcmp_pp_spend_has_no_ring_and_names_the_tree_it_proved_against() {
+    let txs = decoded_txs("fcmp/get_transactions_fcmp.json");
+    assert_eq!(txs.len(), 2);
+    for (entry, tx) in &txs {
+        assert_eq!(tx.rct_type(), Some(RctType::FcmpPlusPlus));
+        assert!(tx.is_fcmp_pp());
+        assert!(!tx.looks_pruned());
+        assert!(!entry.prunable_missing(tx));
+
+        for input in &tx.vin {
+            let k = input
+                .as_key()
+                .expect("an FCMP++ input is still a key input");
+            assert!(k.key_offsets.is_empty(), "present and empty, not a ring");
+        }
+
+        // The reference block is below the block the transaction landed in,
+        // and the layer count matches what the block reports for its tree.
+        let reference = tx.reference_block().expect("a complete tx names its tree");
+        assert!(reference < entry.block_height);
+        assert!(tx.n_tree_layers().expect("and its layer count") >= 1);
+
+        // One pseudo-output per input, in the prunable half as for types 3-6.
+        assert_eq!(tx.pseudo_outs().len(), tx.vin.len());
+    }
+
+    // The proof's length is fixed by the input count at a given layer count:
+    // the same count gives the same length, and more inputs a longer proof.
+    // Which counts the wallet chose varies from one capture to the next.
+    let lens: Vec<(usize, usize)> = txs
+        .iter()
+        .map(|(_, tx)| {
+            let p = tx.rctsig_prunable.as_ref().unwrap();
+            assert_eq!(tx.n_tree_layers(), txs[0].1.n_tree_layers());
+            (tx.vin.len(), p.fcmp_pp_len().expect("an even-length blob"))
+        })
+        .collect();
+    for (a_in, a_len) in &lens {
+        assert!(*a_len > 0);
+        for (b_in, b_len) in &lens {
+            assert_eq!(a_in.cmp(b_in), a_len.cmp(b_len), "{lens:?}");
+        }
+    }
+}
+
+/// The prunable key set is the per-type fingerprint. Type 7 keeps `nbp`,
+/// `bpp` and `pseudoOuts` from type 6 and replaces `CLSAGs` with the proof and
+/// the two tree fields.
+#[test]
+fn type_7_trades_clsags_for_the_proof_and_its_tree() {
+    for doc in nested_raw("fcmp/get_transactions_fcmp.json") {
+        assert_eq!(
+            prunable_keys(&doc),
+            [
+                "bpp",
+                "fcmp_pp",
+                "n_tree_layers",
+                "nbp",
+                "pseudoOuts",
+                "reference_block"
+            ]
+        );
+    }
+}
+
+#[test]
+fn carrot_outputs_carry_a_three_byte_view_tag_and_an_anchor() {
+    let mut txs = decoded_txs("fcmp/get_transactions_fcmp.json");
+    txs.extend(decoded_txs("fcmp/get_transactions_coinbase.json"));
+    for (entry, tx) in &txs {
+        assert!(!tx.vout.is_empty());
+        for out in &tx.vout {
+            let TxOutTarget::CarrotV1(c) = &out.target else {
+                panic!("{} has a non-Carrot output", entry.tx_hash);
+            };
+            assert_eq!(out.target.public_key(), Some(c.key.as_str()));
+            assert_eq!(out.target.view_tag(), Some(c.view_tag.as_str()));
+            assert_eq!(
+                out.target.encrypted_janus_anchor(),
+                Some(c.encrypted_janus_anchor.as_str())
+            );
+        }
+        // One unified id per output, beside the per-amount indices.
+        assert_eq!(entry.unified_ids.len(), tx.vout.len());
+        assert_eq!(entry.output_indices.len(), tx.vout.len());
+    }
+    for (_, tx) in decoded_txs("fcmp/get_transactions_fcmp.json") {
+        for e in ecdh_of(&tx) {
+            assert_eq!(e.form(), Some(EcdhForm::Compact));
+        }
+    }
+}
+
+/// A coinbase after the fork is still type 0 with a public amount; only its
+/// output type changed.
+#[test]
+fn a_post_fork_coinbase_is_public_and_not_fcmp_pp() {
+    let txs = decoded_txs("fcmp/get_transactions_coinbase.json");
+    let (_, tx) = txs.first().unwrap();
+    assert!(tx.is_coinbase());
+    assert_eq!(tx.rct_type(), Some(RctType::Null));
+    assert!(!tx.is_fcmp_pp());
+    assert!(tx.vout.iter().all(|o| o.amount > 0 && o.target.is_carrot()));
+}
+
+/// Pruning takes the proof and the tree fields with it. The transaction is
+/// still recognisably FCMP++ from the half that remains.
+#[test]
+fn a_pruned_fcmp_pp_spend_keeps_its_type_and_loses_its_tree() {
+    let txs = decoded_txs("fcmp/get_transactions_fcmp_pruned.json");
+    let (entry, tx) = txs.first().unwrap();
+    assert!(tx.is_fcmp_pp());
+    assert!(tx.looks_pruned());
+    assert!(entry.prunable_missing(tx));
+    assert_eq!(tx.reference_block(), None);
+    assert_eq!(tx.n_tree_layers(), None);
+    assert!(tx.vin.iter().all(|i| i.as_key().is_some()));
+}
+
+#[test]
+fn an_fcmp_pp_block_commits_to_its_curve_tree() {
+    for rel in [
+        "fcmp/get_block_fcmp.json",
+        "fcmp/get_block_coinbase_only.json",
+    ] {
+        let block: GetBlock = serde_json::from_value(result_of(rel)).unwrap();
+        let body = block.parse_json().unwrap();
+        assert!(body.major_version >= 17, "{rel}");
+        assert!(body.fcmp_pp_n_tree_layers.is_some_and(|n| n >= 1), "{rel}");
+        assert!(body.fcmp_pp_tree_root.is_some(), "{rel}");
+    }
+
+    // The lean parse finds the same two fields as the full one.
+    for rel in [
+        "fcmp/get_block_fcmp.json",
+        "fcmp/get_block_coinbase_only.json",
+    ] {
+        let block: GetBlock = serde_json::from_value(result_of(rel)).unwrap();
+        let full = block.parse_json().unwrap();
+        let lean = block.parse_tree().unwrap();
+        assert_eq!(lean.fcmp_pp_n_tree_layers, full.fcmp_pp_n_tree_layers);
+        assert_eq!(lean.fcmp_pp_tree_root, full.fcmp_pp_tree_root);
+    }
+
+    // Below the fork there are no tree fields at all.
+    let old: GetBlock = serde_json::from_value(result_of("testnet/get_block_134721.json")).unwrap();
+    let body = old.parse_json().unwrap();
+    assert_eq!(body.fcmp_pp_n_tree_layers, None);
+    assert_eq!(body.fcmp_pp_tree_root, None);
+}
+
+/// The mempool's nested documents are FCMP++ too, and still decode.
+#[test]
+fn an_fcmp_pp_pool_entry_decodes() {
+    let pool: GetTransactionPool =
+        serde_json::from_value(raw("fcmp/get_transaction_pool.json")).unwrap();
+    assert!(!pool.transactions.is_empty());
+    for t in &pool.transactions {
+        let tx = t.parse_json().unwrap();
+        assert!(tx.is_fcmp_pp());
+        // monerod reports the reference block as the highest block the pool
+        // entry depends on.
+        assert_eq!(tx.reference_block(), Some(t.max_used_block_height));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /get_path_by_unified_id.bin, in epee's binary format
+// ---------------------------------------------------------------------------
+
+fn binary(rel: &str, wanted: &[&str]) -> monerod_rpc::epee::Root {
+    let path = fixtures_root().join(rel);
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("cannot read fixture {}: {e}", path.display()));
+    monerod_rpc::epee::read_root(&bytes, wanted)
+        .unwrap_or_else(|e| panic!("{rel} did not decode: {e}"))
+}
+
+/// The same tree size, asked two ways as of block 120 of the capture chain.
+/// Regtest's coinbases unlock after 60 blocks, so by then coinbases 0 to 61
+/// are in the tree: 62 outputs.
+#[test]
+fn the_tree_size_is_the_same_whichever_output_probes_it() {
+    use monerod_rpc::epee::Value;
+    use monerod_rpc::types::TreeSizeQuery;
+
+    let wanted = ["status", "n_leaf_tuples", "paths", "credits", "top_hash"];
+    let own = binary("fcmp/get_path_by_unified_id_probe_own_output.bin", &wanted);
+    // Probed with an early coinbase, the answer carries a whole path through
+    // the tree, nested sections and all, kept here because it was asked for.
+    let in_tree = binary("fcmp/get_path_by_unified_id_probe_in_tree.bin", &wanted);
+
+    for root in [&own, &in_tree] {
+        assert_eq!(root.text("status"), Some("OK"));
+        assert_eq!(TreeSizeQuery::answer(root), Some(62));
+        // One path, for the one id asked about: epee writes it as it writes
+        // a lone section.
+        assert!(matches!(root.array("paths"), Some([Value::Section(_)])));
+        assert_eq!(root.unsigned("credits"), Some(0));
+    }
+
+    // What the explorer itself asks for is enough for the answer.
+    let lean = binary(
+        "fcmp/get_path_by_unified_id_probe_in_tree.bin",
+        TreeSizeQuery::WANTED,
+    );
+    assert_eq!(TreeSizeQuery::answer(&lean), Some(62));
+    assert_eq!(lean.get("paths"), None, "nothing unasked for is kept");
+}
+
+/// Paths for the four outputs of one transaction, captured by
+/// `tools/capture-path-fixtures.py` on a chain whose tree holds more than
+/// 38 * 18 leaves, and so has three layers.
+fn paths(rel: &str, as_of_block: u64, ids: &[u64]) -> monerod_rpc::types::TreePaths {
+    use monerod_rpc::types::PathQuery;
+    let query = PathQuery::as_of_block(as_of_block, ids).expect("a query");
+    query
+        .answer(&binary(rel, PathQuery::WANTED))
+        .unwrap_or_else(|e| panic!("{rel}: {e}"))
+}
+
+const PATH_TX_IDS: [u64; 4] = [802, 803, 804, 805];
+
+#[test]
+fn a_transactions_outputs_have_paths_once_they_unlock() {
+    use monerod_rpc::types::LeafKind;
+
+    // Mined, but ten blocks from unlocking: in no tree yet.
+    let locked = paths(
+        "fcmp/paths/get_path_by_unified_id_locked.bin",
+        801,
+        &PATH_TX_IDS,
+    );
+    assert_eq!(locked.n_leaf_tuples, 743);
+    assert_eq!(locked.paths, vec![None; 4]);
+
+    let tip = paths(
+        "fcmp/paths/get_path_by_unified_id_tip.bin",
+        811,
+        &PATH_TX_IDS,
+    );
+    let found: Vec<_> = tip
+        .paths
+        .iter()
+        .map(|p| p.as_ref().expect("in the tree"))
+        .collect();
+    // Unlocked together, the four joined the tree side by side.
+    let first = found[0].leaf_idx;
+    for (k, (path, id)) in found.iter().zip(PATH_TX_IDS).enumerate() {
+        assert_eq!(path.leaf_idx, first + k as u64);
+        let leaf = &path.leaves[(path.leaf_idx % 38) as usize];
+        assert_eq!(leaf.unified_id, id);
+        assert_eq!(leaf.kind, LeafKind::Carrot);
+        assert_eq!(path.layers.len(), 3, "three layers");
+        assert_eq!(path.layers.last().map(Vec::len), Some(1), "the root alone");
+    }
+    assert!(tip.n_leaf_tuples > 38 * 18);
+}
+
+#[test]
+fn a_path_holds_whole_groups_and_ends_at_one_root() {
+    let old = paths("fcmp/paths/get_path_by_unified_id_old.bin", 814, &[10, 60]);
+    let [Some(a), Some(b)] = &old.paths[..] else {
+        panic!("both in the tree")
+    };
+    assert_eq!((a.leaf_idx, b.leaf_idx), (10, 60));
+    // Deep in the tree, both leaf groups are full, and they are different
+    // groups under one parent.
+    assert_eq!((a.leaves.len(), b.leaves.len()), (38, 38));
+    assert_eq!(a.leaves[0].unified_id, 0);
+    assert_eq!(b.leaves[0].unified_id, 38);
+    assert_eq!(a.layers, b.layers);
+    let sizes: Vec<usize> = a.layers.iter().map(Vec::len).collect();
+    // 760 leaves: 20 parents, in groups of 18; 2 above them; then the root.
+    assert_eq!(old.n_leaf_tuples, 760);
+    assert_eq!(sizes, [18, 2, 1]);
+}
+
+/// The capture's spends name block 120, when the tree held 62 outputs, and
+/// monerod reports the layer count those 62 give.
+#[test]
+fn the_layer_count_follows_from_the_tree_size() {
+    use monerod_rpc::types::{TreeSizeQuery, tree_layers};
+
+    let root = binary(
+        "fcmp/get_path_by_unified_id_probe_in_tree.bin",
+        TreeSizeQuery::WANTED,
+    );
+    let leaves = TreeSizeQuery::answer(&root).expect("a tree size");
+    let txs = decoded_txs("fcmp/get_transactions_fcmp.json");
+    assert_eq!(txs.len(), 2);
+    for (_, tx) in &txs {
+        assert_eq!(tx.reference_block(), Some(120));
+        assert_eq!(
+            tx.n_tree_layers().map(usize::from),
+            Some(tree_layers(leaves).len())
+        );
+    }
+}
+
+/// The reader is fed remote input, so every corruption of a real answer must
+/// come back as a value or an error, never a panic or a hang: each
+/// truncation, and each byte replaced by values that hit the type, count and
+/// length codes.
+#[test]
+fn a_corrupted_binary_answer_never_panics_the_reader() {
+    use monerod_rpc::types::PathQuery;
+
+    let path = fixtures_root().join("fcmp/paths/get_path_by_unified_id_old.bin");
+    let original = std::fs::read(&path).expect("the fixture is readable");
+    let query = PathQuery::as_of_block(814, &[10, 60]).expect("a query");
+    let wanted = PathQuery::WANTED;
+
+    for len in 0..original.len() {
+        let cut = original.get(..len).expect("a prefix");
+        assert!(
+            monerod_rpc::epee::read_root(cut, wanted).is_err(),
+            "a body cut to {len} bytes was accepted"
+        );
+    }
+
+    // Changed a byte at a time, it is read and its paths decoded, or refused.
+    let mut body = original.clone();
+    for at in 0..original.len() {
+        let was = *original.get(at).expect("in range");
+        for value in [0x00, 0x01, 0x03, 0x0c, 0x0d, 0x7f, 0x80, 0x8d, 0xfe, 0xff] {
+            *body.get_mut(at).expect("in range") = value;
+            if let Ok(root) = monerod_rpc::epee::read_root(&body, wanted) {
+                drop(query.answer(&root));
+            }
+        }
+        *body.get_mut(at).expect("in range") = was;
+    }
 }

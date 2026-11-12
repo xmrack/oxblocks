@@ -10,7 +10,7 @@
 <table>
   <thead>
     <tr>
-      <th class="num">Height</th>
+      <th class="num">Block</th>
       <th>Age [h:m:s]</th>
       <th class="num">Size</th>
       <th class="num">Txs</th>
@@ -35,7 +35,7 @@
 
 <div class="pager">
   {% if page > 0 %}<a href="/page/{{ page - 1 }}">&larr; Newer</a>{% else %}<span>&larr; Newer</span>{% endif %}
-  <a href="/page/{{ page + 1 }}">Older &rarr;</a>
+  {% if let Some(next) = older %}<a href="/page/{{ next }}">Older &rarr;</a>{% else %}<span>Older &rarr;</span>{% endif %}
   <span class="where">page {{ page }}</span>
 </div>
 {% endif %}

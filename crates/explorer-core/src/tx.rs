@@ -10,6 +10,20 @@ use monerod_rpc::types::{PoolTxInfo, TxEntry, TxIn, TxJson};
 
 use crate::tx_extra::{self, ParsedTxExtra, PaymentId};
 
+/// What an FCMP++ transaction says about the tree it proved membership in.
+///
+/// Its fields sit in the prunable half, so a pruned node that no longer holds
+/// it knows the transaction is FCMP++ and nothing about the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FcmpFacts {
+    /// The height whose curve tree the inputs were proven against.
+    pub reference_block: Option<u64>,
+    pub n_tree_layers: Option<u8>,
+    /// The proof's length in bytes. It is fixed by the input count and the
+    /// layer count, so it grows as the tree does.
+    pub proof_size: Option<u64>,
+}
+
 /// Facts derived from a transaction, shared by every presentation of it.
 #[derive(Debug, Clone)]
 pub struct TxFacts {
@@ -20,8 +34,16 @@ pub struct TxFacts {
     /// and every v2 coinbase.
     pub rct_type: u8,
     /// The ring size of the first key input, which the JSON API calls
-    /// `mixin`. Not ring size minus one, and 0 for a coinbase.
+    /// `mixin`. Not ring size minus one, and 0 for a coinbase -- and 0 for an
+    /// FCMP++ transaction, whose inputs have no ring. Read [`TxFacts::fcmp_pp`]
+    /// before treating 0 as "no inputs".
     pub ring_size: usize,
+    /// Present when the transaction spends with FCMP++ (RingCT type 7).
+    pub fcmp_pp: Option<FcmpFacts>,
+    /// Whether any output is a Carrot output. Carrot arrives with FCMP++, but
+    /// a coinbase has Carrot outputs and no FCMP++ spend, so the two are
+    /// separate facts.
+    pub carrot: bool,
     pub fee: u64,
     /// Serialized length in bytes, as far as this node can tell. On a pruned
     /// daemon a transaction outside the kept stripe yields only its prefix.
@@ -40,7 +62,7 @@ impl TxFacts {
     /// returned it.
     #[must_use]
     pub fn from_entry(entry: &TxEntry, tx: &TxJson) -> Self {
-        let size = entry.raw_hex().map_or(0, |h| (h.len() / 2) as u64);
+        let size = entry.raw_hex_len().map_or(0, |n| (n / 2) as u64);
         Self::derive(tx, size, None)
     }
 
@@ -93,12 +115,25 @@ impl TxFacts {
 
         let extra = tx_extra::parse(&tx.extra);
 
+        let fcmp_pp = tx.is_fcmp_pp().then(|| FcmpFacts {
+            reference_block: tx.reference_block(),
+            n_tree_layers: tx.n_tree_layers(),
+            proof_size: tx
+                .rctsig_prunable
+                .as_ref()
+                .and_then(monerod_rpc::types::RctSigPrunable::fcmp_pp_len)
+                .map(|n| n as u64),
+        });
+        let carrot = tx.vout.iter().any(|o| o.target.is_carrot());
+
         Self {
             coinbase,
             version: tx.version,
             unlock_time: tx.unlock_time,
             rct_type: tx.rct_type().map_or(0, |t| t.to_raw()),
             ring_size,
+            fcmp_pp,
+            carrot,
             fee,
             size,
             xmr_inputs,
@@ -235,6 +270,48 @@ mod tests {
         let facts = TxFacts::derive(&t, 1533, Some(490_560_000));
         assert_eq!(facts.fee, 490_560_000);
         assert_eq!(facts.size, 1533);
+    }
+
+    /// An FCMP++ spend has no ring, so its ring size is 0 -- which is also
+    /// what a coinbase reads. `fcmp_pp` is what tells the two apart.
+    #[test]
+    fn an_fcmp_pp_spend_has_no_ring_but_is_not_a_coinbase() {
+        let mut t = tx(2, vec![key_input(0, 0), key_input(0, 0)], &[0, 0], Some(1));
+        t.rct_signatures.as_mut().unwrap().rct_type = 7;
+        t.rctsig_prunable = Some(monerod_rpc::types::RctSigPrunable {
+            reference_block: Some(3_012_345),
+            n_tree_layers: Some(6),
+            fcmp_pp: Some("ab".repeat(4256)),
+            ..Default::default()
+        });
+        for o in &mut t.vout {
+            o.target = TxOutTarget::CarrotV1(monerod_rpc::types::CarrotV1 {
+                key: "aa".repeat(32),
+                view_tag: "a1b2c3".to_owned(),
+                encrypted_janus_anchor: "00".repeat(16),
+            });
+        }
+        let facts = TxFacts::derive(&t, 3000, None);
+        assert!(!facts.coinbase);
+        assert!(facts.carrot);
+        assert_eq!(
+            facts.fcmp_pp,
+            Some(FcmpFacts {
+                reference_block: Some(3_012_345),
+                n_tree_layers: Some(6),
+                proof_size: Some(4256),
+            })
+        );
+    }
+
+    /// A ring-era transaction is not FCMP++ even with an empty ring, and a
+    /// legacy output is not Carrot.
+    #[test]
+    fn a_ring_spend_carries_no_fcmp_pp_facts() {
+        let t = tx(2, vec![key_input(0, 16)], &[0], Some(1));
+        let facts = TxFacts::derive(&t, 1500, None);
+        assert_eq!(facts.fcmp_pp, None);
+        assert!(!facts.carrot);
     }
 
     /// Remote sums must not wrap into a small, believable number.

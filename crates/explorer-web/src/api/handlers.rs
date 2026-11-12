@@ -2,13 +2,16 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::State;
+use axum::http::StatusCode;
 use explorer_core::fmt::{decimal, timestamp_utc};
-use explorer_core::{BlockId, BlockIdError, ChainError, Hash32, RpcChainSource, unexpanded_inputs};
-use monerod_rpc::types::{BlockHeader, GetTxidsLooseRequest, TxEntry};
+use explorer_core::{
+    BlockId, BlockIdError, BlockTree, ChainError, Hash32, RpcChainSource, unexpanded_inputs,
+};
+use monerod_rpc::types::{GetTxidsLooseRequest, TxEntry, TxJson, wallet_grace_blocks};
 use serde::Serialize;
 
-use super::envelope::{ApiError, ApiOk};
+use super::envelope::{ApiError, ApiOk, ApiPath, ApiQuery};
 use super::shapes::{BlockDetail, TxDetail, TxSummary, normalise_hash};
 use crate::config::Limits;
 
@@ -16,6 +19,81 @@ pub struct AppState {
     pub chain: RpcChainSource,
     /// The bounds on the k-anonymous endpoints, from the command line.
     pub limits: Limits,
+    /// Checked paths through the curve tree. See [`crate::tree_paths::PathCache`].
+    pub paths: crate::tree_paths::PathCache,
+    /// The last `/api/transactions/recent` answer. See [`RecentAnswer`].
+    pub recent: RecentAnswer,
+    /// What the pages' tables show of each transaction.
+    pub rows: crate::html::RowCache,
+}
+
+/// The last `/api/transactions/recent` answer, written out, with the tip and
+/// the pool it was built from.
+///
+/// Every caller asks for the same window, so the answer is the same for all
+/// of them until a block arrives or the pool changes: the tip's hash names
+/// the window and the chain below it, and the pool is named by what the
+/// answer reads of it, each transaction's hash and arrival in order. Built by
+/// one caller at a time, and a caller that waited for another's build takes
+/// that answer, whatever arrived meanwhile, so a wave of callers costs one
+/// build however long it takes.
+#[derive(Default)]
+pub struct RecentAnswer {
+    kept: std::sync::Mutex<Option<KeptRecent>>,
+    turn: tokio::sync::Mutex<()>,
+}
+
+struct KeptRecent {
+    tip: String,
+    pool: Vec<(String, u64)>,
+    built: u64,
+    body: axum::body::Bytes,
+}
+
+/// What a recent answer reads of `pool`, in order.
+fn pool_key(pool: &explorer_core::rpc_source::Mempool) -> Vec<(String, u64)> {
+    pool.transactions
+        .iter()
+        .map(|t| (t.id_hash.clone(), t.receive_time))
+        .collect()
+}
+
+impl RecentAnswer {
+    fn get(&self, tip: &str, pool: &[(String, u64)]) -> Option<axum::body::Bytes> {
+        let kept = self.kept.lock().ok()?;
+        kept.as_ref()
+            .filter(|k| k.tip == tip && k.pool == pool)
+            .map(|k| k.body.clone())
+    }
+
+    /// How many answers have been built, to tell one built since.
+    fn built(&self) -> u64 {
+        self.kept
+            .lock()
+            .ok()
+            .and_then(|k| k.as_ref().map(|k| k.built))
+            .unwrap_or(0)
+    }
+
+    /// The answer built after the `since`th, if there is one.
+    fn since(&self, since: u64) -> Option<axum::body::Bytes> {
+        let kept = self.kept.lock().ok()?;
+        kept.as_ref()
+            .filter(|k| k.built > since)
+            .map(|k| k.body.clone())
+    }
+
+    fn keep(&self, tip: String, pool: Vec<(String, u64)>, body: axum::body::Bytes) {
+        if let Ok(mut kept) = self.kept.lock() {
+            let built = kept.as_ref().map_or(0, |k| k.built).saturating_add(1);
+            *kept = Some(KeptRecent {
+                tip,
+                pool,
+                built,
+                body,
+            });
+        }
+    }
 }
 
 pub type Shared = State<Arc<AppState>>;
@@ -40,15 +118,20 @@ pub fn echo(arg: &str) -> String {
 
 /// Map a chain failure onto an answer.
 ///
-/// Not found is the caller's, anything else is ours or the daemon's.
+/// Not found and a range too large are the caller's; a full budget is ours,
+/// for now; anything else is ours or the daemon's.
 fn on_chain_error(e: &ChainError, what: &str) -> ApiError {
-    if e.is_not_found() {
-        ApiError::not_found(what.to_owned())
-    } else {
-        // The operator gets the detail; the client does not. See
-        // ChainError::public_message.
-        tracing::warn!("{what}: {e}");
-        ApiError::daemon(e.public_message())
+    match e {
+        _ if e.is_not_found() => ApiError::not_found(what.to_owned()),
+        ChainError::RangeTooLarge { .. } => ApiError::bad_request(e.public_message()),
+        ChainError::Busy(_) => ApiError::busy(e.public_message()),
+        ChainError::NeedsUnrestricted(_) => ApiError::unsupported(e.public_message()),
+        _ => {
+            // The operator gets the detail; the client does not. See
+            // ChainError::public_message.
+            tracing::warn!("{what}: {e}");
+            ApiError::daemon(e.public_message())
+        }
     }
 }
 
@@ -95,31 +178,43 @@ pub async fn version(State(state): Shared) -> Result<ApiOk<VersionData>, ApiErro
 // /api/transaction/<hash>
 // ---------------------------------------------------------------------------
 
-pub async fn transaction(
-    State(state): Shared,
-    Path(raw): Path<String>,
-) -> Result<ApiOk<TxDetail>, ApiError> {
+/// The transaction `raw` names, as the daemon holds it.
+async fn fetch_tx(state: &AppState, raw: &str) -> Result<(Hash32, TxEntry), ApiError> {
     let hash: Hash32 = raw
         .parse()
-        .map_err(|_| ApiError::bad_request(format!("Cant parse tx hash: {}", echo(&raw))))?;
-
+        .map_err(|_| ApiError::bad_request(format!("Cant parse tx hash: {}", echo(raw))))?;
     let fetched = state
         .chain
         .transactions(std::slice::from_ref(&hash))
         .await
         .map_err(|e| on_chain_error(&e, &format!("Cant get tx: {hash}")))?;
+    let entry = fetched
+        .txs
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::not_found(format!("Cant find tx: {hash}")))?;
+    Ok((hash, entry))
+}
 
-    let Some(entry) = fetched.txs.first() else {
-        return Err(ApiError::not_found(format!("Cant find tx: {hash}")));
-    };
+/// The transaction's own JSON, decoded. What did not decode is logged for the
+/// operator; the caller is told only that it did not.
+fn decode_tx(hash: &Hash32, entry: &TxEntry) -> Result<TxJson, ApiError> {
+    entry.parse_json().map_err(|e| {
+        tracing::warn!("tx {hash} did not decode: {e}");
+        ApiError::daemon(format!("Cant parse tx {hash}"))
+    })
+}
 
-    let tx = entry
-        .parse_json()
-        .map_err(|e| ApiError::daemon(format!("Cant parse tx {hash}: {e}")))?;
+pub async fn transaction(
+    State(state): Shared,
+    ApiPath(raw): ApiPath<String>,
+) -> Result<ApiOk<TxDetail>, ApiError> {
+    let (hash, entry) = fetch_tx(&state, &raw).await?;
+    let entry = &entry;
+    let tx = decode_tx(&hash, entry)?;
 
-    // One /get_outs per input. Never batched across the transaction: monerod
-    // fails the whole request if any single index is out of range, which would
-    // let one bad input blank every ring on the page.
+    // One /get_outs for the transaction, and one per input where monerod
+    // refuses that, so one bad input cannot blank every ring on the page.
     let rings = state.chain.resolve_rings(&tx).await;
 
     // A confirmed transaction already carries its confirmation count, so the
@@ -136,7 +231,177 @@ pub async fn transaction(
         entry.block_height.saturating_add(entry.confirmations)
     };
 
-    Ok(ApiOk(TxDetail::build(entry, &tx, &rings, current_height)))
+    let mut detail = TxDetail::build(entry, &tx, &rings, current_height);
+    // Only this handler pays for the tree size, for /api/transaction and for
+    // /api/search on a transaction: it is one daemon call, and the list
+    // endpoints would pay it once per transaction listed.
+    detail.anonymity_set = state.chain.anonymity_set(&tx, entry, current_height).await;
+    Ok(ApiOk(detail))
+}
+
+// ---------------------------------------------------------------------------
+// /api/transaction/<hash>/paths
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct PathsData {
+    as_of_block: u64,
+    n_layers: usize,
+    n_leaf_tuples: u64,
+    outputs: Vec<OutputPathData>,
+    root: Option<String>,
+    /// The block carrying the root of the tree as of `as_of_block`, and that
+    /// root, where the block carries one.
+    root_block: Option<u64>,
+    /// `matches` when every path's hashes hold and end at `root`, `fails`
+    /// when one does not, `unchecked` when there is no root or no path.
+    root_check: &'static str,
+    tx_hash: String,
+}
+
+#[derive(Serialize)]
+pub struct OutputPathData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check: Option<&'static str>,
+    /// The leaves' group first, the root last.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<GroupData>,
+    index: usize,
+    /// The last block the output is locked at; the tree holds it as of that
+    /// block on.
+    last_locked_block: u64,
+    /// Absent for an output not in the tree as of `as_of_block`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leaf_idx: Option<u64>,
+    unified_id: u64,
+}
+
+#[derive(Serialize)]
+pub struct GroupData {
+    curve: explorer_core::curve_tree::Curve,
+    layer: usize,
+    layer_size: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    leaves: Vec<LeafData>,
+    /// Compressed points; absent for the leaves, which are in `leaves`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    members: Vec<String>,
+    /// The output's ancestor's place in the group, or the output's own for
+    /// the leaves.
+    offset: u64,
+    start: u64,
+}
+
+#[derive(Serialize)]
+pub struct LeafData {
+    commitment: String,
+    kind: &'static str,
+    output_key: String,
+    unified_id: u64,
+}
+
+/// Paths through the curve tree of a transaction's outputs, as of `block` or
+/// the tip: output `output` alone, counted from 1, or up to
+/// [`crate::tree_paths::MAX_OUTPUTS`] of them from `from`, counted from 0.
+pub async fn transaction_paths(
+    State(state): Shared,
+    ApiPath(raw): ApiPath<String>,
+    ApiQuery(q): ApiQuery<crate::tree_paths::PathsParams>,
+) -> Result<ApiOk<PathsData>, ApiError> {
+    use crate::tree_paths::{PathsError, gather};
+    use explorer_core::curve_tree::Curve;
+    use monerod_rpc::types::LeafKind;
+
+    let q = q.read().map_err(ApiError::bad_request)?;
+
+    let (hash, entry) = fetch_tx(&state, &raw).await?;
+    let entry = &entry;
+    let tx = decode_tx(&hash, entry)?;
+
+    let paths = match q.outputs(tx.vout.len()) {
+        Ok(which) => gather(&state, entry, &tx, q.block, which).await,
+        Err(e) => Err(e),
+    }
+    .map_err(|e| match e {
+        PathsError::InPool => {
+            ApiError::not_found(format!("Tx {hash} is in the pool, so not in the tree"))
+        }
+        PathsError::NoIds => ApiError::unsupported("The daemon has no curve tree".to_owned()),
+        PathsError::Ahead { asked, tip } => {
+            ApiError::not_found(format!("Block {asked} is past the tip, {tip}"))
+        }
+        PathsError::NoSuchOutput { asked, total } => {
+            ApiError::not_found(format!("Tx {hash} has {total} outputs, not output {asked}"))
+        }
+        PathsError::NoSuchOutputs { from, total } => {
+            ApiError::not_found(format!("Tx {hash} has {total} outputs, none from {from}"))
+        }
+        PathsError::Chain(e) => on_chain_error(&e, &format!("Cant get paths of tx: {hash}")),
+    })?;
+
+    let outputs = paths
+        .outputs
+        .iter()
+        .map(|o| {
+            let placed = o.placed.as_ref();
+            OutputPathData {
+                index: o.index,
+                unified_id: o.unified_id,
+                last_locked_block: o.last_locked_block,
+                leaf_idx: placed.map(|p| p.path.leaf_idx),
+                check: placed.map(|p| p.check.as_str()),
+                groups: placed
+                    .map(|p| {
+                        p.groups
+                            .iter()
+                            .map(|g| GroupData {
+                                layer: g.layer,
+                                curve: Curve::of_layer(g.layer),
+                                layer_size: g.layer_size,
+                                start: g.start,
+                                offset: g.offset(),
+                                members: p
+                                    .members(g.layer)
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .map(explorer_core::hex::encode)
+                                    .collect(),
+                                leaves: if g.layer == 0 {
+                                    p.path
+                                        .leaves
+                                        .iter()
+                                        .map(|l| LeafData {
+                                            unified_id: l.unified_id,
+                                            kind: match l.kind {
+                                                LeafKind::Legacy => "legacy",
+                                                LeafKind::Carrot => "carrot",
+                                                LeafKind::Other(_) => "unknown",
+                                            },
+                                            output_key: explorer_core::hex::encode(l.output_key),
+                                            commitment: explorer_core::hex::encode(l.commitment),
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                },
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+
+    Ok(ApiOk(PathsData {
+        tx_hash: hash.to_string(),
+        as_of_block: paths.as_of_block,
+        n_leaf_tuples: paths.n_leaf_tuples,
+        n_layers: monerod_rpc::types::tree_layers(paths.n_leaf_tuples).len(),
+        root_block: paths.root_block.as_ref().map(|(b, _)| *b),
+        root: paths.root_block.as_ref().map(|(_, r)| r.clone()),
+        root_check: paths.root_check().as_str(),
+        outputs,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +434,7 @@ fn block_not_found(id: BlockId) -> String {
 
 pub async fn block(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<BlockDetail>, ApiError> {
     let id = parse_block_id(&raw)?;
     Ok(ApiOk(build_block_detail(&state, id).await?))
@@ -186,55 +451,21 @@ async fn build_block_detail(state: &AppState, id: BlockId) -> Result<BlockDetail
         .await
         .map_err(|e| on_chain_error(&e, &block_not_found(id)))?;
 
-    // The miner transaction plus every other transaction in the block, in the
-    // order the block lists them, coinbase first.
-    let mut hashes: Vec<Hash32> = Vec::with_capacity(got.tx_hashes.len() + 1);
-    hashes.extend(got.miner_tx_hash.parse::<Hash32>());
-    hashes.extend(
-        got.tx_hashes
-            .iter()
-            .filter_map(|h| h.parse::<Hash32>().ok()),
-    );
-
-    let fetched = state
+    let (fetched, _held) = state
         .chain
-        .transactions(&hashes)
+        .block_transactions(&got)
         .await
         .map_err(|e| on_chain_error(&e, &block_not_found(id)))?;
 
-    Ok(block_detail(&got.block_header, &fetched.txs))
-}
-
-/// One block's API representation, from its header and its transactions.
-///
-/// Shared by `/api/block` and `/api/blocks/<start>/<end>`, because the element
-/// type of the range response is exactly the single-block response. Takes the
-/// header rather than a whole `get_block`, because a range is answered from
-/// `get_block_headers_range` and never fetches the block body at all unless
-/// the block holds something.
-fn block_detail(header: &BlockHeader, entries: &[TxEntry]) -> BlockDetail {
-    let mut txs = Vec::with_capacity(entries.len());
-    for entry in entries {
-        match entry.parse_json() {
-            Ok(tx) => txs.push(TxSummary::build(entry, &tx)),
-            // One undecodable transaction must not lose the whole block page.
-            Err(e) => tracing::warn!(tx = %entry.tx_hash, "skipping: {e}"),
-        }
-    }
-
-    BlockDetail {
-        block_height: header.height,
-        // The tip, derived from this block's own depth rather than a second
-        // round trip: `depth` is 0 for the tip, and `current_height` is the
-        // chain *height* (tip + 1). Block 2,000,000 at depth 1,765,612
-        // reports current_height 3,765,613.
-        current_height: header.height.saturating_add(header.depth).saturating_add(1),
-        hash: normalise_hash(&header.hash),
-        size: header.block_size,
-        timestamp: header.timestamp,
-        timestamp_utc: timestamp_utc(header.timestamp),
-        txs,
-    }
+    // A cached block carries the depth it had when fetched; the answer counts
+    // from the tip as it is now. See `RpcChainSource::depth_now`.
+    let depth = state.chain.depth_now(&got.block_header).await;
+    Ok(BlockDetail::build(
+        &got.block_header,
+        depth,
+        &fetched.txs,
+        BlockTree::of(&got).as_ref(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +480,7 @@ fn block_detail(header: &BlockHeader, entries: &[TxEntry]) -> BlockDetail {
 /// response here sorts its keys, so the string cannot be forwarded verbatim.
 pub async fn raw_block(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<serde_json::Value>, ApiError> {
     let id = parse_block_id(&raw)?;
 
@@ -266,21 +497,9 @@ pub async fn raw_block(
 
 pub async fn raw_transaction(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<serde_json::Value>, ApiError> {
-    let hash: Hash32 = raw
-        .parse()
-        .map_err(|_| ApiError::bad_request(format!("Cant parse tx hash: {}", echo(&raw))))?;
-
-    let fetched = state
-        .chain
-        .transactions(std::slice::from_ref(&hash))
-        .await
-        .map_err(|e| on_chain_error(&e, &format!("Cant get tx: {hash}")))?;
-
-    let Some(entry) = fetched.txs.first() else {
-        return Err(ApiError::not_found(format!("Cant find tx: {hash}")));
-    };
+    let (_, entry) = fetch_tx(&state, &raw).await?;
 
     let value: serde_json::Value = serde_json::from_str(&entry.as_json)
         .map_err(|_| ApiError::daemon("Faild parsing raw tx data into json".to_owned()))?;
@@ -307,17 +526,20 @@ pub struct GraceQuery {
 
 pub async fn fee_estimate(
     State(state): Shared,
-    axum::extract::Query(q): axum::extract::Query<GraceQuery>,
+    ApiQuery(q): ApiQuery<GraceQuery>,
 ) -> Result<ApiOk<FeeData>, ApiError> {
-    // The parameter is honoured only when it is all digits. Anything else
-    // takes the default, because this one is a query hint rather than the
-    // subject of the request.
-    let grace_blocks = q
-        .grace_blocks
-        .as_deref()
-        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(10);
+    // Absent, it is the window wallets use. A value that is not a number of
+    // at most MAX_GRACE_BLOCKS is refused, as every argument here is.
+    let most = monerod_rpc::types::MAX_GRACE_BLOCKS;
+    let grace_blocks = match q.grace_blocks.as_deref() {
+        None => wallet_grace_blocks(tip_hard_fork(&state).await),
+        Some(text) => decimal(text).filter(|&g| g <= most).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "grace_blocks is not a number of at most {most}: {}",
+                echo(text)
+            ))
+        })?,
+    };
 
     let estimate = state
         .chain
@@ -330,6 +552,16 @@ pub async fn fee_estimate(
         fee_per_kb: estimate.fee,
         grace_blocks,
     }))
+}
+
+/// The tip's hard-fork version, or 0 if the daemon cannot say. The tip
+/// block's `major_version` is the active version.
+async fn tip_hard_fork(state: &AppState) -> u8 {
+    state
+        .chain
+        .last_block_header()
+        .await
+        .map_or(0, |h| h.block_header.major_version)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +646,7 @@ pub struct TransactionsData {
 
 pub async fn transactions(
     State(state): Shared,
-    axum::extract::Query(q): axum::extract::Query<PageQuery>,
+    ApiQuery(q): ApiQuery<PageQuery>,
 ) -> Result<ApiOk<TransactionsData>, ApiError> {
     let (page, limit) = q.parse(25, MAX_TRANSACTIONS_LIMIT)?;
 
@@ -436,6 +668,10 @@ pub async fn transactions(
     let start_signed = (height.wrapping_sub(span)) as i64;
     #[allow(clippy::cast_sign_loss, reason = "max(0) has already removed the sign")]
     let start = start_signed.max(0) as u64;
+    // The page is `limit` blocks up from its clamped start, which is how
+    // xmrblocks pages: the last page, whose start clamps to 0, repeats blocks
+    // the page before it listed, and pages past it list those same blocks.
+    // Kept, because clients page this endpoint by that arithmetic.
     let end = start.saturating_add(limit).min(height).saturating_sub(1);
 
     let mut blocks = Vec::new();
@@ -443,15 +679,26 @@ pub async fn transactions(
         // One fan-out for the whole page rather than two calls per block. The
         // partially-built array still travels with the error. It is empty
         // here, since a batch either arrives or does not.
-        let fetched = state.chain.blocks_in_range(start, end).await.map_err(|e| {
-            let partial = serde_json::json!({ "blocks": [] });
-            if e.is_not_found() {
-                ApiError::not_found(format!("Cant get block: {start}"))
-            } else {
-                ApiError::daemon(format!("Cant get transactions in block: {start}"))
-            }
-            .with_partial(partial)
-        })?;
+        let fetched = state
+            .chain
+            .blocks_in_range(start, end, false)
+            .await
+            .map_err(|e| {
+                let partial = serde_json::json!({ "blocks": [] });
+                match e {
+                    _ if e.is_not_found() => {
+                        ApiError::not_found(format!("Cant get block: {start}"))
+                    }
+                    ChainError::RangeTooLarge { .. } | ChainError::Busy(_) => {
+                        on_chain_error(&e, "")
+                    }
+                    _ => {
+                        tracing::warn!("blocks {start} to {end}: {e}");
+                        ApiError::daemon(format!("Cant get transactions in block: {start}"))
+                    }
+                }
+                .with_partial(partial)
+            })?;
 
         // Newest first, which is the order a page of recent blocks is read in.
         for block in fetched.iter().rev() {
@@ -505,20 +752,15 @@ pub struct MempoolData {
 
 pub async fn mempool(
     State(state): Shared,
-    axum::extract::Query(q): axum::extract::Query<PageQuery>,
+    ApiQuery(q): ApiQuery<PageQuery>,
 ) -> Result<ApiOk<MempoolData>, ApiError> {
     // Capped by default rather than only when asked, for the reason on
     // MAX_MEMPOOL_LIMIT.
     let (page, limit) = q.parse(MAX_MEMPOOL_LIMIT, MAX_MEMPOOL_LIMIT)?;
 
-    let pool = state.chain.mempool().await.map_err(|e| match e {
-        ChainError::NeedsUnrestricted(what) => ApiError::unsupported(format!(
-            "{what} needs an unrestricted daemon; this one blocks /get_transaction_pool"
-        )),
-        other => {
-            tracing::warn!("mempool: {other}");
-            ApiError::daemon(other.public_message())
-        }
+    let pool = state.chain.mempool().await.map_err(|e| {
+        tracing::warn!("mempool: {e}");
+        ApiError::daemon(e.public_message())
     })?;
 
     let txs_no = pool.transactions.len() as u64;
@@ -580,23 +822,31 @@ pub async fn mempool(
 /// never can be without one. Saying so is more useful than a bare failure.
 pub async fn search(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<serde_json::Value>, ApiError> {
     let shown = echo(&raw);
 
     match BlockId::parse(&raw) {
         Ok(BlockId::Height(height)) => {
-            let block = block(State(state), Path(height.to_string())).await?;
+            let block = block(State(state), ApiPath(height.to_string())).await?;
             return Ok(ApiOk(titled(block.0, "block")));
         }
         // A block hash and a transaction hash are the same shape, so the only
         // way to tell them apart is to try one and then the other.
+        //
+        // Only a not-found answer moves on to the next try. A daemon that
+        // failed any other way has not said the hash is not a block, so its
+        // error is the answer, rather than a 404 that says nothing matched.
         Ok(BlockId::Hash(_)) => {
-            if let Ok(found) = block(State(Arc::clone(&state)), Path(raw.clone())).await {
-                return Ok(ApiOk(titled(found.0, "block")));
+            match block(State(Arc::clone(&state)), ApiPath(raw.clone())).await {
+                Ok(found) => return Ok(ApiOk(titled(found.0, "block"))),
+                Err(e) if e.status != StatusCode::NOT_FOUND => return Err(e),
+                Err(_) => {}
             }
-            if let Ok(found) = transaction(State(state), Path(raw.clone())).await {
-                return Ok(ApiOk(titled(found.0, "tx")));
+            match transaction(State(state), ApiPath(raw.clone())).await {
+                Ok(found) => return Ok(ApiOk(titled(found.0, "tx"))),
+                Err(e) if e.status != StatusCode::NOT_FOUND => return Err(e),
+                Err(_) => {}
             }
             return Err(ApiError::not_found(format!(
                 "Cant find blk or tx using search string: {shown}"
@@ -672,16 +922,9 @@ pub async fn network_info(State(state): Shared) -> Result<ApiOk<NetworkInfoData>
         .await
         .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
 
-    let fee = state.chain.fee_estimate(10).await.ok();
-
-    // The tip block's major_version *is* the active hard-fork version, so this
-    // needs no separate hard_fork_info call.
-    let hf = state
-        .chain
-        .last_block_header()
-        .await
-        .ok()
-        .map(|h| h.block_header.major_version);
+    let hf = tip_hard_fork(&state).await;
+    let grace_blocks = wallet_grace_blocks(hf);
+    let fee = state.chain.fee_estimate(grace_blocks).await.ok();
 
     // Despite the name, this field carries **bytes**. The name is part of the
     // JSON API, so dividing by 1024 to honour it would hand every existing
@@ -703,13 +946,13 @@ pub async fn network_info(State(state): Shared) -> Result<ApiOk<NetworkInfoData>
         block_size_median: info.block_size_median,
         cumulative_difficulty: info.cumulative_difficulty().to_string(),
         current: true,
-        current_hf_version: hf.unwrap_or(0),
+        current_hf_version: hf,
         difficulty: info.difficulty().to_string(),
         // The real estimate, with the grace window beside it. Both are
         // reported, because a field that is always zero tells a client
         // nothing.
         fee_estimate: fee.as_ref().map_or(0, |f| f.fee),
-        fee_estimate_grace_blocks: 10,
+        fee_estimate_grace_blocks: grace_blocks,
         fee_per_kb: fee.as_ref().map_or(0, |f| f.fee),
         grey_peerlist_size: info.grey_peerlist_size,
         // Network hash rate is difficulty spread over the target block time.
@@ -756,14 +999,6 @@ pub async fn network_info(State(state): Shared) -> Result<ApiOk<NetworkInfoData>
 /// served is around 40 transactions.
 pub const MIN_ANONYMITY_SET: u64 = 20;
 
-/// The most matches this explorer will expand before refusing.
-///
-/// Checked twice, against two different numbers. [`check_postfix`] refuses a
-/// postfix whose *expected* set is already larger than this, before the daemon
-/// is asked anything; the handler refuses again on the count that actually came
-/// back, because how many transactions share a postfix is Poisson around the
-/// expectation rather than equal to it.
-///
 /// Refuses the k-anonymous lookup on a daemon that has no `get_txids_loose`.
 fn no_txids_loose() -> ApiError {
     ApiError::unsupported(
@@ -772,6 +1007,14 @@ fn no_txids_loose() -> ApiError {
     )
 }
 
+/// The most matches this explorer will expand before refusing.
+///
+/// Checked twice, against two different numbers. [`check_postfix`] refuses a
+/// postfix whose *expected* set is already larger than this, before the daemon
+/// is asked anything; the handler refuses again on the count that actually came
+/// back, because how many transactions share a postfix is Poisson around the
+/// expectation rather than equal to it.
+///
 /// The first check is the one that matters for load. `get_txids_loose` walks
 /// the whole transaction index, so a two-character postfix on mainnet is a
 /// full-index scan answering with something like a quarter of a million hashes
@@ -894,11 +1137,26 @@ fn whole_byte_suffix(postfix: &str) -> &str {
 pub struct PrivateTxData {
     missed_txs: Vec<String>,
     txs: Vec<TxDetail>,
+    /// How many transactions `txs` holds.
+    txs_no: u64,
 }
+
+/// What a private lookup of `matches` transactions holds of the range
+/// budget: [`PRIVATE_KIB_PER_MATCH`] each, and never more than the widest
+/// range of blocks.
+fn private_hold_kib(matches: usize) -> u64 {
+    (matches as u64)
+        .saturating_mul(PRIVATE_KIB_PER_MATCH)
+        .min(explorer_core::rpc_source::MAX_RANGE_KIB)
+}
+
+/// A fetched transaction's share of the range budget, in KiB: twice what an
+/// FCMP++ spend with two inputs takes, its hex and its decoded JSON.
+const PRIVATE_KIB_PER_MATCH: u64 = 64;
 
 pub async fn transaction_private(
     State(state): Shared,
-    Path(raw): Path<String>,
+    ApiPath(raw): ApiPath<String>,
 ) -> Result<ApiOk<PrivateTxData>, ApiError> {
     // Hex is case insensitive and transaction hashes are rendered lowercase,
     // so the case is folded before matching. Nothing else about the argument
@@ -970,6 +1228,13 @@ pub async fn transaction_private(
         )));
     }
 
+    // The matches are fetched whole, so they wait for their share of the
+    // budget ranges of blocks share.
+    let _held = state
+        .chain
+        .hold_kib(private_hold_kib(matching.len()))
+        .await
+        .map_err(|e| on_chain_error(&e, "Cant get matching transactions"))?;
     let fetched = state
         .chain
         .transactions(&matching)
@@ -992,6 +1257,7 @@ pub async fn transaction_private(
 
     Ok(ApiOk(PrivateTxData {
         missed_txs: fetched.missed,
+        txs_no: txs.len() as u64,
         txs,
     }))
 }
@@ -1012,19 +1278,21 @@ pub async fn transaction_private(
 /// the endpoint is to hide *which* block was wanted, and a hundred candidates
 /// does that — while bounding the cost at one header range, one `get_block`
 /// per block that holds transactions, and one `get_transactions`. On a chain
-/// where every block is full that is 102 calls; on a quiet one it is two.
+/// where every block holds transactions that is 102 calls, plus one more
+/// `get_transactions` per 500 transactions past the first 500 (the batch
+/// size, `MAX_TXS_PER_CALL`): about 121 for a hundred mainnet blocks of ten
+/// thousand transactions, and more on a full stressnet. On a quiet chain
+/// before the FCMP++ fork it is two. From the fork on every block's body is
+/// fetched, because the response carries each block's curve tree, which is in
+/// the body; bodies come from cache by hash, or by height once buried, so a
+/// range served before costs little more than its header call and its
+/// transactions.
 ///
-/// **What it does not bound is bytes.** A hundred blocks is roughly ten
-/// thousand mainnet transactions, and every one of them is fetched whole
-/// before any of them is summarised. Measured against a mainnet daemon: one
-/// such request takes about 10 seconds and holds about 40 MiB, and four at
-/// once held 172 MiB. That number multiplies by `--max-concurrent`, whose
-/// default of 128 would want some five gigabytes — far past the 512 MiB the
-/// shipped systemd unit allows. An operator serving mainnet should size those
-/// two against each other; see `deploy/oxblocks.service`.
+/// The bytes ranges hold together are bounded by `RANGE_KIB` in
+/// explorer-core; see `deploy/oxblocks.service`.
 pub async fn blocks_range(
     State(state): Shared,
-    Path((start_raw, end_raw)): Path<(String, String)>,
+    ApiPath((start_raw, end_raw)): ApiPath<(String, String)>,
 ) -> Result<ApiOk<Vec<BlockDetail>>, ApiError> {
     let start = decimal(&start_raw).ok_or_else(|| {
         ApiError::bad_request(format!("Cant parse block number: {}", echo(&start_raw)))
@@ -1050,13 +1318,23 @@ pub async fn blocks_range(
         )));
     }
 
-    let info = state
+    let mut info = state
         .chain
         .info()
         .await
         .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
 
-    if end > info.height {
+    // `height` counts blocks, so the tip is `height - 1`. The cached info can
+    // trail a block that was just mined, so check a fresh one before refusing
+    // the block after the tip.
+    if end == info.height {
+        info = state
+            .chain
+            .fresh_info()
+            .await
+            .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
+    }
+    if end >= info.height {
         return Err(ApiError::not_found(format!(
             "Requested end height is higher than blockchain: {end}, {}",
             info.height
@@ -1065,14 +1343,15 @@ pub async fn blocks_range(
 
     let blocks = state
         .chain
-        .blocks_in_range(start, end)
+        .blocks_in_range(start, end, true)
         .await
         .map_err(|e| on_chain_error(&e, &format!("Cant get blocks: {start} to {end}")))?;
 
     Ok(ApiOk(
         blocks
             .iter()
-            .map(|b| block_detail(&b.header, &b.txs))
+            // A range's headers are fetched fresh, so their depth is current.
+            .map(|b| BlockDetail::build(&b.header, b.header.depth, &b.txs, b.tree.as_ref()))
             .collect(),
     ))
 }
@@ -1096,21 +1375,6 @@ fn push_unexpanded(txs: &mut Vec<TxDetail>, entries: &[TxEntry], current_height:
 // /api/transactions/recent
 // ---------------------------------------------------------------------------
 
-/// How many blocks back `/api/transactions/recent` reaches.
-///
-/// The endpoint exists so that a caller who wants a *recent* transaction can
-/// take a window rather than name one. If everyone asks for the same window,
-/// asking reveals nothing.
-///
-/// **The window is bounded; the pool beside it is not.** Every unconfirmed
-/// transaction is listed, because counting them in `mempool_txs_no` and then
-/// withholding them was a real bug here. monerod offers no paging on
-/// `/get_transaction_pool` either, so the whole pool is fetched for the
-/// `/mempool` page and for `/api/mempool` regardless — capping the listing
-/// would shrink the response without shrinking the fetch. During a mempool
-/// flood this is the most expensive endpoint here; see
-/// `deploy/oxblocks.service`, which sizes `MemoryMax` against
-/// `--max-concurrent` for exactly this family of requests.
 /// The block range `/api/transactions/recent` covers, given the tip.
 ///
 /// Inclusive at both ends and counted back from the newest *mined* block, so a
@@ -1129,42 +1393,88 @@ pub struct RecentData {
     txs: Vec<TxDetail>,
 }
 
-pub async fn transactions_recent(State(state): Shared) -> Result<ApiOk<RecentData>, ApiError> {
-    let info = state
-        .chain
-        .info()
-        .await
-        .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
+/// The mempool, and the last `--recent-blocks` blocks.
+///
+/// The endpoint exists so that a caller who wants a *recent* transaction can
+/// take a window rather than name one. If everyone asks for the same window,
+/// asking reveals nothing.
+///
+/// **The window is bounded; the pool beside it is not.** Every unconfirmed
+/// transaction is listed, because counting them in `mempool_txs_no` and then
+/// withholding them was a real bug here. During a mempool flood this is the
+/// most expensive endpoint here; see
+/// `deploy/oxblocks.service`, which sizes `MemoryMax` against
+/// `--max-concurrent` for exactly this family of requests.
+pub async fn transactions_recent(
+    State(state): Shared,
+) -> Result<axum::response::Response, ApiError> {
+    let tip_and_pool = async || {
+        let info = state
+            .chain
+            .info()
+            .await
+            .map_err(|e| on_chain_error(&e, "Cant get daemon info"))?;
+        let pool = state
+            .chain
+            .mempool()
+            .await
+            .map_err(|e| on_chain_error(&e, "Cant get the mempool"))?;
+        Ok::<_, ApiError>((info, pool))
+    };
+
+    let (info, pool) = tip_and_pool().await?;
+    if let Some(answer) = state.recent.get(&info.top_block_hash, &pool_key(&pool)) {
+        return Ok(super::envelope::ok_response(answer));
+    }
+    let before = state.recent.built();
+    let _turn = state.recent.turn.lock().await;
+    if let Some(answer) = state.recent.since(before) {
+        return Ok(super::envelope::ok_response(answer));
+    }
+    let (info, pool) = tip_and_pool().await?;
+    let key = pool_key(&pool);
+    if let Some(answer) = state.recent.get(&info.top_block_hash, &key) {
+        return Ok(super::envelope::ok_response(answer));
+    }
 
     let (from_height, to_height) = recent_window(info.height, state.limits.recent_blocks);
+    // Blocks too large to fetch together cost the window its oldest, rather
+    // than the answer: a caller cannot ask for a narrower one.
+    let window = state
+        .chain
+        .newest_in_range(from_height, to_height, false)
+        .await
+        .map_err(|e| on_chain_error(&e, "Cant get recent blocks"))?;
+    let from_height = window.first().map_or(from_height, |b| b.header.height);
 
-    // The pool first: those are more recent than any mined transaction, and a
-    // caller reaching for this endpoint is reaching for a recent one. Counting
-    // them in `mempool_txs_no` while leaving them out of `txs` would name a
-    // set and then withhold it.
-    let pool = state.chain.mempool().await.ok();
+    // The pool is listed first: those are more recent than any mined
+    // transaction, and a caller reaching for this endpoint is reaching for a
+    // recent one. Counting them in `mempool_txs_no` while leaving them out of
+    // `txs` would name a set and then withhold it.
     let mut txs = Vec::new();
     let mut mempool_txs_no = 0;
-    for entry in pool.iter().flat_map(|p| p.transactions.iter()) {
+    for entry in &pool.transactions {
         let Ok(tx) = entry.parse_json() else { continue };
         let inputs = unexpanded_inputs(&tx);
         txs.push(TxDetail::build_pool(entry, &tx, &inputs, info.height));
         mempool_txs_no += 1;
     }
 
-    if let Ok(window) = state.chain.blocks_in_range(from_height, to_height).await {
-        for block in &window {
-            push_unexpanded(&mut txs, &block.txs, info.height);
-        }
+    for block in &window {
+        push_unexpanded(&mut txs, &block.txs, info.height);
     }
 
-    Ok(ApiOk(RecentData {
+    let body = super::envelope::ok_body(&RecentData {
         current_height: info.height,
         from_height,
         mempool_txs_no,
         to_height,
         txs,
-    }))
+    })?;
+    state
+        .recent
+        .keep(info.top_block_hash.clone(), key, body.clone());
+    Ok(super::envelope::ok_response(body))
 }
 
 #[cfg(test)]
@@ -1179,7 +1489,6 @@ mod tests {
     )]
 
     use super::*;
-    use axum::http::StatusCode;
 
     // Both bugs below were found by comparing live output on a real chain,
     // not by reading the code.
@@ -1408,6 +1717,380 @@ mod tests {
                 check_postfix(&"a".repeat(len), 0, Limits::default()),
                 Err(PostfixRefusal::TooLongToBeAnonymous { .. })
             ));
+        }
+    }
+
+    /// A daemon at hard fork `hf`, for the fee estimate and network info.
+    fn fee_daemon(hf: u8) -> explorer_core::fake_daemon::FakeDaemon {
+        explorer_core::fake_daemon::FakeDaemon::start(move |what, _| {
+            let result = match what {
+                "get_last_block_header" => serde_json::json!({"block_header": {
+                    "major_version": hf, "minor_version": hf, "timestamp": 0, "prev_hash": "",
+                    "nonce": 0, "orphan_status": false, "height": 9, "depth": 0, "hash": "",
+                    "difficulty": 1, "difficulty_top64": 0, "wide_difficulty": "0x1",
+                    "cumulative_difficulty": 1, "cumulative_difficulty_top64": 0,
+                    "wide_cumulative_difficulty": "0x1", "reward": 1, "block_size": 1,
+                    "num_txes": 0, "pow_hash": "", "miner_tx_hash": "",
+                }, "status": "OK"}),
+                "get_fee_estimate" => serde_json::json!({"fee": 20_000, "status": "OK"}),
+                "get_info" => serde_json::json!({
+                    "height": 10, "target_height": 0, "difficulty": 1, "difficulty_top64": 0,
+                    "target": 120, "tx_count": 0, "tx_pool_size": 0, "alt_blocks_count": 0,
+                    "outgoing_connections_count": 0, "incoming_connections_count": 0,
+                    "white_peerlist_size": 0, "grey_peerlist_size": 0, "testnet": false,
+                    "stagenet": false, "nettype": "regtest", "top_block_hash": "",
+                    "cumulative_difficulty": 1, "cumulative_difficulty_top64": 0,
+                    "block_size_limit": 0, "block_size_median": 0, "start_time": 0,
+                    "version": "test", "restricted": false, "status": "OK",
+                }),
+                _ => serde_json::json!({"status": "Failed"}),
+            };
+            serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": result})
+        })
+    }
+
+    /// A daemon whose chain is block 0 alone, a coinbase, `size` bytes, with
+    /// the tip hash `tip` holds, and an empty pool, or one it fails to send.
+    fn recent_daemon(
+        tip: Arc<std::sync::atomic::AtomicU64>,
+        pool: bool,
+        size: u64,
+    ) -> explorer_core::fake_daemon::FakeDaemon {
+        let coinbase = "aa".repeat(32);
+        explorer_core::fake_daemon::FakeDaemon::start(move |what, _| {
+            let tip = tip.load(std::sync::atomic::Ordering::SeqCst);
+            let header = serde_json::json!({
+                "major_version": 16, "minor_version": 16, "timestamp": 0, "prev_hash": "",
+                "nonce": 0, "orphan_status": false, "height": 0, "depth": 0,
+                "hash": format!("{tip:064x}"), "difficulty": 1, "difficulty_top64": 0,
+                "wide_difficulty": "0x1", "cumulative_difficulty": 1,
+                "cumulative_difficulty_top64": 0, "wide_cumulative_difficulty": "0x1",
+                "reward": 1, "block_size": size, "num_txes": 0, "pow_hash": "",
+                "miner_tx_hash": coinbase,
+            });
+            let ok = |r: serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": r});
+            match what {
+                "get_info" => ok(serde_json::json!({
+                    "height": 1, "target_height": 0, "difficulty": 1, "difficulty_top64": 0,
+                    "target": 120, "tx_count": 1, "tx_pool_size": 0, "alt_blocks_count": 0,
+                    "outgoing_connections_count": 0, "incoming_connections_count": 0,
+                    "white_peerlist_size": 0, "grey_peerlist_size": 0, "testnet": false,
+                    "stagenet": false, "nettype": "regtest", "top_block_hash": format!("{tip:064x}"),
+                    "cumulative_difficulty": 1, "cumulative_difficulty_top64": 0,
+                    "block_size_limit": 0, "block_size_median": 0, "start_time": 0,
+                    "version": "test", "restricted": false, "status": "OK",
+                })),
+                "get_block_headers_range" => {
+                    ok(serde_json::json!({"headers": [header], "status": "OK"}))
+                }
+                "get_transactions" => serde_json::json!({"txs": [{
+                    "tx_hash": coinbase, "as_hex": "",
+                    "as_json": r#"{"version":2,"unlock_time":60,"vin":[{"gen":{"height":0}}],"vout":[],"extra":[],"rct_signatures":{"type":0}}"#,
+                    "block_height": 0, "block_timestamp": 0, "confirmations": 1, "in_pool": false,
+                    "double_spend_seen": false, "output_indices": [],
+                }], "status": "OK"}),
+                "get_transaction_pool_hashes" if pool => {
+                    serde_json::json!({"tx_hashes": [], "status": "OK"})
+                }
+                _ => serde_json::json!({"status": "Failed"}),
+            }
+        })
+    }
+
+    async fn body_of(response: axum::response::Response) -> axum::body::Bytes {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    /// Every caller gets the one answer, built once while the tip and the
+    /// pool stay the same, and built again once the tip moves.
+    #[tokio::test]
+    async fn the_recent_answer_is_built_once_per_tip_and_pool() {
+        let tip = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let daemon = recent_daemon(Arc::clone(&tip), true, 1);
+        let state = state_on(&daemon);
+        let together = tokio::join!(
+            transactions_recent(state.clone()),
+            transactions_recent(state.clone()),
+            transactions_recent(state.clone()),
+            transactions_recent(state.clone()),
+        );
+        assert!(
+            together.0.is_ok() && together.1.is_ok() && together.2.is_ok() && together.3.is_ok()
+        );
+        assert_eq!(
+            daemon.count("get_block_headers_range"),
+            1,
+            "built once for all four"
+        );
+        let first = body_of(transactions_recent(state.clone()).await.unwrap()).await;
+        assert!(String::from_utf8_lossy(&first).contains(&"aa".repeat(32)));
+        let calls = state.chain.rpc_calls();
+        for _ in 0..3 {
+            let again = body_of(transactions_recent(state.clone()).await.unwrap()).await;
+            assert_eq!(again, first);
+        }
+        assert_eq!(
+            state.chain.rpc_calls(),
+            calls,
+            "no daemon call for the same answer"
+        );
+
+        tip.store(2, std::sync::atomic::Ordering::SeqCst);
+        state.chain.fresh_info().await.unwrap();
+        let moved = body_of(transactions_recent(state.clone()).await.unwrap()).await;
+        assert!(
+            state.chain.rpc_calls() > calls + 1,
+            "built again under the new tip"
+        );
+        assert_eq!(
+            moved, first,
+            "the same chain under a new tip hash reads the same"
+        );
+    }
+
+    /// A range too large is the caller's to narrow, a full budget is ours
+    /// for a moment, and a daemon without the call is this deployment's.
+    #[test]
+    fn chain_failures_are_answered_by_whose_they_are() {
+        let status = |e: ChainError| on_chain_error(&e, "x").status;
+        let large = ChainError::RangeTooLarge {
+            start: 1,
+            end: 2,
+            kib: 3,
+        };
+        assert_eq!(status(large), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status(ChainError::Busy("ranges")),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(ChainError::NeedsUnrestricted("the mempool")),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(ChainError::Unavailable("down".to_owned())),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status(ChainError::BlockNotFound(BlockId::Height(9))),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            on_chain_error(&ChainError::Busy("ranges"), "x").outcome,
+            super::super::envelope::Outcome::Error
+        );
+    }
+
+    /// A pool that cannot be had fails the answer rather than reading as
+    /// empty.
+    #[tokio::test]
+    async fn the_recent_answer_needs_the_pool() {
+        let tip = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let daemon = recent_daemon(tip, false, 1);
+        let err = transactions_recent(state_on(&daemon)).await.err().unwrap();
+        assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(daemon.count("get_block_headers_range"), 0);
+    }
+
+    /// A window too large to fetch together is served from its newest block.
+    #[tokio::test]
+    async fn a_recent_window_too_large_is_served_from_its_newest() {
+        let tip = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let huge = (explorer_core::rpc_source::MAX_RANGE_KIB + 1) << 10;
+        let daemon = recent_daemon(tip, true, huge);
+        let answer = transactions_recent(state_on(&daemon)).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_of(answer).await).unwrap();
+        assert_eq!(body["data"]["from_height"], 0);
+        assert_eq!(body["data"]["txs"].as_array().unwrap().len(), 1);
+    }
+
+    /// A caller that waited while another built takes that answer rather
+    /// than build again.
+    #[tokio::test]
+    async fn a_caller_that_waited_takes_the_answer_built_meanwhile() {
+        let tip = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let daemon = recent_daemon(tip, true, 1);
+        let state = state_on(&daemon);
+        let turn = state.recent.turn.lock().await;
+        let waiting = tokio::spawn(transactions_recent(state.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        state.recent.keep(
+            "another tip".to_owned(),
+            Vec::new(),
+            axum::body::Bytes::from_static(b"built meanwhile"),
+        );
+        drop(turn);
+        let answer = body_of(waiting.await.unwrap().unwrap()).await;
+        assert_eq!(&answer[..], b"built meanwhile");
+        assert_eq!(daemon.count("get_block_headers_range"), 0);
+    }
+
+    /// What a recent answer reads of the pool: each hash and arrival, in
+    /// order.
+    #[test]
+    fn a_pool_is_named_by_its_hashes_and_arrivals() {
+        let tx = |h: &str, t: u64| {
+            serde_json::json!({
+                "id_hash": h, "blob_size": 1, "fee": 1, "max_used_block_id_hash": "",
+                "max_used_block_height": 0, "kept_by_block": false, "last_failed_height": 0,
+                "last_failed_id_hash": "", "receive_time": t, "relayed": true,
+                "last_relayed_time": 0, "do_not_relay": false, "double_spend_seen": false,
+                "tx_blob": "",
+            })
+        };
+        let pool = explorer_core::rpc_source::Mempool {
+            transactions: [tx("a", 5), tx("b", 7)]
+                .into_iter()
+                .map(|t| Arc::new(serde_json::from_value(t).unwrap()))
+                .collect(),
+        };
+        assert_eq!(pool_key(&pool), [("a".to_owned(), 5), ("b".to_owned(), 7)]);
+    }
+
+    /// A kept answer is for its own tip and for a pool holding the same
+    /// transactions, arrived at the same times, in the same order; and one
+    /// built since a caller arrived is that caller's.
+    #[test]
+    fn a_kept_recent_answer_is_for_its_own_tip_and_pool() {
+        let tx = |h: &str, t: u64| (h.to_owned(), t);
+        let recent = RecentAnswer::default();
+        assert_eq!(recent.built(), 0);
+        recent.keep(
+            "t".to_owned(),
+            vec![tx("a", 1), tx("b", 2)],
+            axum::body::Bytes::from_static(b"x"),
+        );
+        assert!(recent.get("t", &[tx("a", 1), tx("b", 2)]).is_some());
+        assert!(recent.get("t", &[tx("b", 2), tx("a", 1)]).is_none());
+        assert!(recent.get("t", &[tx("a", 1), tx("b", 3)]).is_none());
+        assert!(recent.get("t", &[tx("a", 1)]).is_none());
+        assert!(recent.get("u", &[tx("a", 1), tx("b", 2)]).is_none());
+
+        let before = recent.built();
+        assert!(recent.since(before).is_none());
+        recent.keep("u".to_owned(), vec![], axum::body::Bytes::from_static(b"y"));
+        assert_eq!(recent.since(before).as_deref(), Some(&b"y"[..]));
+        assert!(recent.since(recent.built()).is_none());
+    }
+
+    /// A private lookup holds the range budget in proportion to what it
+    /// fetches, so a few lookups at once cannot stall every range.
+    #[test]
+    fn a_private_lookup_holds_what_its_matches_take() {
+        assert_eq!(private_hold_kib(64), 64 * PRIVATE_KIB_PER_MATCH);
+        assert!(private_hold_kib(64) * 5 < explorer_core::rpc_source::MAX_RANGE_KIB);
+        assert_eq!(
+            private_hold_kib(MAX_PRIVATE_TX_MATCHES as usize),
+            explorer_core::rpc_source::MAX_RANGE_KIB
+        );
+    }
+
+    /// The paths answer is written straight from its structs, so they have to
+    /// be in byte order, as `ok_body` checks.
+    #[test]
+    fn the_paths_answer_is_in_byte_order() {
+        let leaf = LeafData {
+            commitment: "c".to_owned(),
+            kind: "carrot",
+            output_key: "k".to_owned(),
+            unified_id: 7,
+        };
+        let group = |leaves: Vec<LeafData>, members: Vec<String>| GroupData {
+            curve: explorer_core::curve_tree::Curve::Selene,
+            layer: 0,
+            layer_size: 38,
+            leaves,
+            members,
+            offset: 1,
+            start: 0,
+        };
+        let data = PathsData {
+            as_of_block: 10,
+            n_layers: 2,
+            n_leaf_tuples: 38,
+            outputs: vec![OutputPathData {
+                check: Some("holds"),
+                groups: vec![
+                    group(vec![leaf], Vec::new()),
+                    group(Vec::new(), vec!["m".to_owned()]),
+                ],
+                index: 0,
+                last_locked_block: 9,
+                leaf_idx: Some(1),
+                unified_id: 7,
+            }],
+            root: Some("r".to_owned()),
+            root_block: Some(2),
+            root_check: "matches",
+            tx_hash: "t".to_owned(),
+        };
+        assert!(super::super::envelope::ok_body(&data).is_ok());
+    }
+
+    fn state_on(daemon: &explorer_core::fake_daemon::FakeDaemon) -> Shared {
+        State(Arc::new(AppState {
+            chain: daemon.source(),
+            limits: Limits::default(),
+            paths: crate::tree_paths::PathCache::default(),
+            recent: Default::default(),
+            rows: Default::default(),
+        }))
+    }
+
+    /// The grace window the daemon was asked for, in order.
+    fn graces(daemon: &explorer_core::fake_daemon::FakeDaemon) -> Vec<u64> {
+        daemon
+            .bodies("get_fee_estimate")
+            .iter()
+            .map(|b| b["params"]["grace_blocks"].as_u64().unwrap())
+            .collect()
+    }
+
+    /// monerod loops once per grace block holding its chain lock, so a
+    /// window past MAX_GRACE_BLOCKS never reaches it, and one not asked for
+    /// is the window wallets use, which the 2026 fee scaling widened.
+    #[tokio::test]
+    async fn the_fee_estimate_asks_the_daemon_for_the_window_wallets_use() {
+        let asking = |g: &str| {
+            ApiQuery(GraceQuery {
+                grace_blocks: Some(g.to_owned()),
+            })
+        };
+        let daemon = fee_daemon(17);
+        for g in ["18446744073709551615", "1001", "", "x", "-1", "+7"] {
+            let err = fee_estimate(state_on(&daemon), asking(g))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{g:?}");
+        }
+        let ApiOk(fee) = fee_estimate(state_on(&daemon), asking("1000"))
+            .await
+            .unwrap();
+        assert_eq!((fee.fee, fee.grace_blocks), (20_000, 1000));
+        let ApiOk(fee) = fee_estimate(state_on(&daemon), asking("7")).await.unwrap();
+        assert_eq!(fee.grace_blocks, 7);
+        let q = ApiQuery(GraceQuery { grace_blocks: None });
+        let ApiOk(fee) = fee_estimate(state_on(&daemon), q).await.unwrap();
+        assert_eq!(fee.grace_blocks, 1000);
+        assert_eq!(graces(&daemon), [1000, 7, 1000]);
+
+        let before = fee_daemon(16);
+        let q = ApiQuery(GraceQuery { grace_blocks: None });
+        let ApiOk(fee) = fee_estimate(state_on(&before), q).await.unwrap();
+        assert_eq!(fee.grace_blocks, 10);
+        assert_eq!(graces(&before), [10]);
+
+        for (hf, grace) in [(16, 10), (17, 1000)] {
+            let daemon = fee_daemon(hf);
+            let ApiOk(info) = network_info(state_on(&daemon)).await.unwrap();
+            let info = serde_json::to_value(&info).unwrap();
+            assert_eq!(info["fee_estimate_grace_blocks"], grace);
+            assert_eq!(info["fee_estimate"], 20_000);
+            assert_eq!(info["current_hf_version"], hf);
+            assert_eq!(graces(&daemon), [grace]);
         }
     }
 }

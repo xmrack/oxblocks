@@ -36,6 +36,7 @@ PrivateDevices=yes
 ProtectProc=invisible
 ProcSubset=pid
 ReadWritePaths=
+UMask=0077
 
 # --- privileges -----------------------------------------------------------
 NoNewPrivileges=yes
@@ -44,6 +45,9 @@ AmbientCapabilities=
 RestrictSUIDSGID=yes
 LockPersonality=yes
 RemoveIPC=yes
+PrivateIPC=yes
+# Sees no other user: every uid but its own and root's maps to nobody.
+PrivateUsers=yes
 
 # --- kernel ---------------------------------------------------------------
 ProtectKernelTunables=yes
@@ -70,28 +74,40 @@ IPAddressDeny=any
 IPAddressAllow=localhost
 # If the daemon or the reverse proxy is not on loopback, widen the two lines
 # above to exactly those addresses -- not to `any`.
+# Listens on the port in --bind and no other. Change both together.
+SocketBindDeny=any
+SocketBindAllow=tcp:8081
 
 # --- limits ---------------------------------------------------------------
 # The caches are bounded, so a figure that keeps rising with an idle explorer
 # means a leak: fail loudly rather than take the host down.
 #
-# Size this against --max-concurrent, because the two are not independent. The
-# fan-out endpoints -- /api/blocks, /api/transactions, /api/transactions/recent
-# -- fetch every transaction in their window before summarising any of it.
-# Measured against a mainnet daemon: one /api/blocks request spanning the full
-# 100 blocks holds about 40 MiB while it runs, and four at once held 172 MiB.
-# At the default --max-concurrent 128 that is several gigabytes, so 512 MiB
-# here means such a burst is killed rather than served.
-#
-# On mainnet, either raise this to roughly 40 MiB per concurrent request you
-# intend to serve, or lower --max-concurrent to match the ceiling you set. On a
-# quiet chain the same request costs a fraction of that and the default is
-# ample. Rate limiting at the reverse proxy is the other half of this.
+# The fan-out endpoints -- /api/blocks, /api/transactions,
+# /api/transactions/recent -- fetch every transaction in their window before
+# summarising any of it. Measured against a mainnet daemon: one /api/blocks
+# request spanning the full 100 blocks holds about 40 MiB while it runs. All
+# such ranges together hold at most 48 MiB of chain data (RANGE_KIB in
+# explorer-core), which is roughly 160 MiB held as hex and JSON. One range
+# may hold half of that at most, and a wider one is refused; a range that
+# would take more than is left waits up to 5 seconds for others to finish,
+# and is then answered as busy. Single blocks' pages hold another 32 MiB of
+# chain data at most (BLOCK_KIB), roughly 110 MiB. With the caches' 2 GiB
+# (--cache-mib) that leaves about half a GiB of the 3 GiB here for what is
+# outside those budgets:
+# the mempool, fetched whole, up to --max-response-mib as it arrives and
+# several times that decoded; the last /api/transactions/recent answer, kept
+# written out until a block arrives or the pool changes; and a rendered
+# response waiting for a slow client to read it, since both limits are given
+# back when the response is handed over. Rate limiting and buffering at the
+# reverse proxy are the other half of this.
 #
 # --max-inflight-rpc is the separate ceiling on calls reaching monerod. Lower it
 # if the daemon is shared with a wallet or another consumer; it bounds load on
-# the node, not memory here.
-MemoryMax=512M
+# the node, not memory here. Keep it under monerod's
+# --rpc-max-connections-per-private-ip (25), or -per-public-ip (3) for a
+# daemon reached over a public address, past which monerod drops connections.
+# Lower --cache-mib with this, keeping about 1 GiB between them.
+MemoryMax=3G
 TasksMax=128
 LimitNOFILE=4096
 

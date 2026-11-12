@@ -2,13 +2,18 @@
 """Record the example responses shown on the /api documentation page.
 
 The page shows real recorded answers rather than invented ones, so the hashes
-and amounts a reader sees are the ones the chain holds. Re-run this against a
-synced explorer when a response shape changes:
+and amounts a reader sees are the ones the chain holds. Re-run this against an
+explorer when a response shape changes:
 
-    tools/capture-api-examples.py --base http://127.0.0.1:8090
+    tools/capture-api-examples.py --base http://127.0.0.1:8090 \
+        --recent-base http://127.0.0.1:8092
 
-Two endpoints cannot be recorded straight from a v0.18 daemon and are noted
-where they are built.
+The recordings come from explorers reading a regtest chain run by
+monerod's FCMP++ branch (see tools/capture-fcmp-fixtures.py), so they show
+FCMP++ transactions. The chain needs at least 405 blocks, two adjacent ones
+carrying one to four transactions each, and one transaction in the pool.
+
+Two endpoints cannot be recorded straight and are noted where they are built.
 """
 
 import argparse
@@ -80,19 +85,25 @@ def main():
     write("search_tx", fetch(args.base, f"/api/search/{tx_hash}"))
 
     # /api/transaction/private needs a daemon with get_txids_loose, which no
-    # released monerod has. The endpoint answers the transactions whose hash
-    # ends with the postfix and leaves their rings unresolved, so the recorded
-    # answer is the real transaction above with the field the endpoint does
-    # not fill set to null.
+    # released monerod has, and a chain big enough for its postfix bounds. The
+    # endpoint answers the transactions whose hash ends with the postfix and
+    # leaves their rings unresolved, so the recorded answer is the real
+    # transaction above with the field the endpoint does not fill set to null.
+    # An FCMP++ input has no ring to leave unresolved and keeps its []. The
+    # tree size is filled only by /api/transaction and a search that lands on
+    # it, so it is null here too.
     private = json.loads(json.dumps(transaction["data"]))
-    for i in private.get("inputs") or []:
-        i["mixins"] = None
-    write("transaction_private", {"data": {"missed_txs": [], "txs": [private]},
+    private["anonymity_set"] = None
+    if private.get("rct_type") != 7:
+        for i in private.get("inputs") or []:
+            i["mixins"] = None
+    write("transaction_private", {"data": {"missed_txs": [], "txs": [private],
+                                           "txs_no": 1},
                                   "status": "success"})
 
     # /api/transactions/recent takes no parameters and bounds only its block
-    # window, so it answers the whole pool beside it: 194 KB when this was
-    # written, which documents nothing the first two entries do not. Record a
+    # window, so it answers the whole pool beside it, which can run to hundreds
+    # of kilobytes and documents nothing the first two entries do not. Record a
     # one-block window and keep one transaction from the pool and one from the
     # block, with the pool count corrected to match what is left. Every value
     # below is still the chain's own.

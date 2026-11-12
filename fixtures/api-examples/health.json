@@ -3,20 +3,20 @@
     "blocks_by_hash": {
       "capacity": 512,
       "hits": 0,
-      "len": 77,
-      "misses": 0
+      "len": 390,
+      "misses": 1
     },
     "blocks_by_height": {
       "capacity": 2048,
-      "hits": 1,
-      "len": 77,
-      "misses": 77
+      "hits": 680,
+      "len": 340,
+      "misses": 498
     },
     "info": {
       "capacity": 1,
-      "hits": 3,
+      "hits": 9,
       "len": 1,
-      "misses": 1
+      "misses": 3
     },
     "outs": {
       "capacity": 65536,
@@ -24,14 +24,20 @@
       "len": 0,
       "misses": 0
     },
+    "tree_sizes": {
+      "capacity": 4096,
+      "hits": 0,
+      "len": 0,
+      "misses": 2
+    },
     "txs": {
       "capacity": 8192,
-      "hits": 5,
-      "len": 2383,
-      "misses": 2383
+      "hits": 682,
+      "len": 341,
+      "misses": 512
     }
   },
-  "rpc_calls": 163,
+  "rpc_calls": 1024,
   "status": "ok",
   "version": "0.1.0"
 }

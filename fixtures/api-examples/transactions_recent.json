@@ -1,73 +1,97 @@
 {
   "data": {
-    "current_height": 3768159,
-    "from_height": 3768158,
+    "current_height": 432,
+    "from_height": 431,
     "mempool_txs_no": 1,
-    "to_height": 3768158,
+    "to_height": 431,
     "txs": [
       {
+        "anonymity_set": null,
         "block_height": 0,
         "coinbase": false,
         "confirmations": 0,
-        "current_height": 3768159,
-        "extra": "01d3d0925db532a12b5d16eef8627f9aaf224aeaa5fdd7dc3f47d92616eb49c38e020901141684dabcbc8734",
+        "current_height": 432,
+        "extra": "01bb115658924c3a767e1bb074fee6161a9c247783600627436d1c1b6bffa73c66020901e5d40bd4e17b2e5a",
+        "fcmp_pp_proof_size": 6528,
+        "in_pool": true,
         "inputs": [
           {
             "amount": 0,
-            "key_image": "b98e6dc5993f3c7237be16b7816dc0a169e66ef479225442ddea501a3f489051",
-            "mixins": null
-          }
-        ],
-        "mixin": 16,
-        "outputs": [
-          {
-            "amount": 0,
-            "public_key": "27216398b30d71c27f7ae251b844047c3246233bb2e1a8d48b25c78b7d68963f"
+            "key_image": "b26020270b8355284ee9976939acfa58b6f42fc6995daa57a0f1c9f0603404df",
+            "mixins": []
           },
           {
             "amount": 0,
-            "public_key": "78db177c1a7604f2bdc83d1a76c9ad4b9d1d87f3fb39c94c97fbdaa7bfed6528"
+            "key_image": "629ab573aada7d8ad3cf391b219183791d0e2f10574539d5fcb8064dccb2e22c",
+            "mixins": []
+          }
+        ],
+        "mixin": 0,
+        "n_tree_layers": 2,
+        "outputs": [
+          {
+            "amount": 0,
+            "encrypted_janus_anchor": "27ab21d4c159cf4769fecfcc668f4c6e",
+            "public_key": "81591e96201dac06525ac8eb14b3531952e137cbbbcf699c7477be8e54523b45",
+            "unified_id": null,
+            "view_tag": "e31de5"
+          },
+          {
+            "amount": 0,
+            "encrypted_janus_anchor": "2aa4d91ddf8ffcf9d8dab509f9a4303e",
+            "public_key": "827b16b320f124e4fc322cd0fcc8a2f40e18f019261a8283c4d34625b534f431",
+            "unified_id": null,
+            "view_tag": "1226d8"
           }
         ],
         "payment_id": "",
-        "payment_id8": "141684dabcbc8734",
-        "rct_type": 6,
-        "timestamp": 1790092581,
-        "timestamp_utc": "2026-09-22 15:56:21",
-        "tx_fee": 30660000,
-        "tx_hash": "6eb969e26200f074001924129a1a00bf9894cc6e9877a89791c990b2a7dc7da7",
-        "tx_size": 1533,
+        "payment_id8": "e5d40bd4e17b2e5a",
+        "rct_type": 7,
+        "reference_block": 431,
+        "timestamp": 1790217891,
+        "timestamp_utc": "2026-09-24 02:44:51",
+        "tx_fee": 10911600000,
+        "tx_hash": "427967f4d11492c746a078e415acb501631699352a31426dec2a6392457f281e",
+        "tx_size": 7549,
         "tx_version": 2,
         "unlock_time": 0,
         "xmr_inputs": 0,
         "xmr_outputs": 0
       },
       {
-        "block_height": 3768158,
+        "anonymity_set": null,
+        "block_height": 431,
         "coinbase": true,
         "confirmations": 1,
-        "current_height": 3768159,
-        "extra": "03210098a8c4459dd1fe42d91a5b9bd8cd1e653794483e526efe30ad9fce08ef573d1001e50be6a17644f514a53c1879391aa2ff1b3a9803257bb17e21fe8f88749f489c0220000005f74f6b3454000000000000000000000000000000000000000000000000",
+        "current_height": 432,
+        "extra": "01e8150904f72bde0ccaa4f4fab9b355310dc01943fe261d5f102743e7f766fa1a020100",
+        "fcmp_pp_proof_size": null,
+        "in_pool": false,
         "inputs": null,
         "mixin": 0,
+        "n_tree_layers": null,
         "outputs": [
           {
-            "amount": 633159400000,
-            "public_key": "e1c187cb39ecdb60691698b87d312eefbc6d7a8ee1061d85df889093bb34ed4e"
+            "amount": 35155493553256,
+            "encrypted_janus_anchor": "baa8544dd592c35ea7be50d2e80e8f6b",
+            "public_key": "3e6cdc3033a74873edf530bd459e16e673d8c4a117fa8e6e6dbbfc36afd3ab43",
+            "unified_id": 437,
+            "view_tag": "873ab9"
           }
         ],
         "payment_id": "",
         "payment_id8": "",
         "rct_type": 0,
-        "timestamp": 1790092397,
-        "timestamp_utc": "2026-09-22 15:53:17",
+        "reference_block": null,
+        "timestamp": 1790217890,
+        "timestamp_utc": "2026-09-24 02:44:50",
         "tx_fee": 0,
-        "tx_hash": "a3f9cae457ba73236d3f7be71aa98a846969f31ffe2ace1958bc9ada733d55bc",
-        "tx_size": 156,
+        "tx_hash": "27dfafcf7233d077d2412ef9ef6fd8c51a2b4445346ab55ae30c2ceaa946e8bf",
+        "tx_size": 105,
         "tx_version": 2,
-        "unlock_time": 3768218,
+        "unlock_time": 491,
         "xmr_inputs": 0,
-        "xmr_outputs": 633159400000
+        "xmr_outputs": 35155493553256
       }
     ]
   },

@@ -10,6 +10,11 @@ yanked = "deny"
 # An unmaintained crate has no one to report a vulnerability to. This caught
 # `hex`, last released in 2021 and since replaced by explorer-core::hex.
 unmaintained = "all"
+ignore = [
+    # crypto-bigint 0.5 via monero-oxide's dalek-ff-group; the fix is only in
+    # 0.7. The explorer verifies public proofs and holds no secret operands.
+    "RUSTSEC-2026-0387",
+]
 
 [bans]
 # Two versions of the same crate means two copies of its bugs, and it is
@@ -40,9 +45,14 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    # foldhash, hashbrown's default hasher, under monero-oxide's std-shims.
+    "Zlib",
 ]
 confidence-threshold = 0.9
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# monero-oxide's crates come from git, pinned by revision to the one monerod's
+# stressnet v3 branch builds with.
+allow-git = ["https://github.com/monero-oxide/monero-oxide"]

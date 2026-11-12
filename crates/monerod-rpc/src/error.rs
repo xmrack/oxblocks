@@ -16,6 +16,44 @@ pub enum Status {
     Other(String),
 }
 
+/// How much of an unrecognised status is kept, in characters.
+///
+/// The string is remote input on its way into logs and error pages, so it is
+/// bounded, and control characters are replaced so that it stays on one line.
+const MAX_STATUS_CHARS: usize = 64;
+
+/// At most `max` characters of `raw`, each control character replaced by
+/// `?`: text from the daemon, on its way into an error message and a log
+/// line, where a newline or an escape sequence would forge or garble one.
+#[must_use]
+pub(crate) fn printable(raw: &str, max: usize) -> String {
+    raw.chars()
+        .take(max)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// The most characters of a parser's reason kept: it can quote what the
+/// daemon sent, at any length.
+pub(crate) const MAX_DECODE_DETAIL: usize = 256;
+
+/// A parser's reason for refusing what the daemon sent, fit for a log line.
+#[must_use]
+pub(crate) fn decode_detail(e: &serde_json::Error) -> String {
+    printable(&e.to_string(), MAX_DECODE_DETAIL)
+}
+
+impl RpcError {
+    /// [`Self::Decode`], for `context`'s answer refused as `e`.
+    #[must_use]
+    pub(crate) fn decode(context: &'static str, e: &serde_json::Error) -> Self {
+        Self::Decode {
+            context,
+            detail: decode_detail(e),
+        }
+    }
+}
+
 impl Status {
     pub fn parse(raw: &str) -> Self {
         match raw {
@@ -23,7 +61,7 @@ impl Status {
             "BUSY" => Self::Busy,
             "Failed" => Self::Failed,
             "NOT MINING" => Self::NotMining,
-            other => Self::Other(other.to_owned()),
+            other => Self::Other(printable(other, MAX_STATUS_CHARS)),
         }
     }
 
@@ -102,11 +140,28 @@ pub enum RpcError {
         body: String,
     },
 
-    #[error("could not decode monerod's response to {context}: {source}")]
+    /// TLS could not be set up as configured.
+    #[error("TLS could not be set up: {0}")]
+    Tls(String),
+
+    /// The user agent cannot be sent as a header.
+    #[error("the user agent cannot be sent: {0}")]
+    BadUserAgent(String),
+
+    /// The parser's reason, which can quote the daemon's text, is kept to
+    /// one bounded line.
+    #[error("could not decode monerod's response to {context}: {detail}")]
     Decode {
         context: &'static str,
+        detail: String,
+    },
+
+    /// A `.bin` endpoint answered with a body that is not portable storage.
+    #[error("could not decode monerod's binary response to {context}: {source}")]
+    BinaryDecode {
+        context: &'static str,
         #[source]
-        source: serde_json::Error,
+        source: crate::epee::EpeeError,
     },
 
     /// monerod answered, but the payload did not contain what the call promises.
@@ -114,6 +169,15 @@ pub enum RpcError {
     Missing {
         context: &'static str,
         field: &'static str,
+    },
+
+    /// A request could not be written in epee's binary format. Not reachable
+    /// from remote input: the requests are this crate's own.
+    #[error("could not encode the binary request for {context}: {source}")]
+    BinaryEncode {
+        context: &'static str,
+        #[source]
+        source: crate::epee::EpeeError,
     },
 
     #[error("{0} is not a usable monerod URL: {1}")]
@@ -139,6 +203,8 @@ impl RpcError {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
@@ -157,6 +223,17 @@ mod tests {
         let s = Status::parse("SOMETHING_NEW");
         assert!(!s.is_ok());
         assert_eq!(s.to_string(), "SOMETHING_NEW");
+    }
+
+    #[test]
+    fn an_unknown_status_is_kept_short_and_on_one_line() {
+        let long = format!("A\nB\u{1b}[31m{}", "x".repeat(10_000));
+        let Status::Other(kept) = Status::parse(&long) else {
+            panic!("an unknown status is Other");
+        };
+        assert_eq!(kept.chars().count(), MAX_STATUS_CHARS);
+        assert!(kept.starts_with("A?B?[31m"), "{kept:?}");
+        assert!(!kept.chars().any(char::is_control));
     }
 
     /// A daemon that is down or slow is worth retrying; one that answered with
@@ -185,6 +262,26 @@ mod tests {
             .is_transient(),
             "a response that big will be just as big next time"
         );
+    }
+
+    /// A parser's reason quotes the daemon's text: kept to one line and a
+    /// bounded length however much it quotes.
+    #[test]
+    fn a_decode_error_neither_forges_a_line_nor_runs_on() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        enum Kind {
+            A,
+        }
+        let forged = serde_json::from_str::<Kind>("\"x\\nINFO forged \\u001b[31m\"").unwrap_err();
+        let e = RpcError::decode("get_info", &forged).to_string();
+        assert!(e.contains("x?INFO forged ?[31m"), "{e}");
+        assert!(!e.chars().any(char::is_control), "{e}");
+
+        let long = format!("\"{}\"", "y".repeat(100_000));
+        let huge = serde_json::from_str::<u64>(&long).unwrap_err();
+        let e = RpcError::decode("get_info", &huge).to_string();
+        assert!(e.len() < MAX_DECODE_DETAIL + 100, "{}", e.len());
     }
 
     #[test]

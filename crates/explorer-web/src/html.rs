@@ -8,18 +8,28 @@
 //! Content-Security-Policy is `default-src 'none'; style-src 'self'`, so the
 //! browser enforces that independently of what these templates emit.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use explorer_core::fmt::{age, decimal, now, timestamp_utc};
-use explorer_core::{Amount, BlockId, ChainError, Hash32, TxFacts};
-use monerod_rpc::types::TxOutTarget;
+use explorer_core::{Amount, BlockId, BlockTree, ChainError, Hash32, TxFacts};
+use monerod_rpc::types::{PoolTxInfo, TREE_ROOT_LAG, TxEntry, TxJson};
+use std::collections::HashMap;
 
 use crate::api::handlers::{AppState, Shared, echo};
 use crate::config::Theme;
+
+mod alt_graph;
+mod leaf_grid;
+mod map_labels;
+mod paths;
+mod ring_walk;
+mod tree_field;
+pub use paths::tree_paths;
+pub use ring_walk::ring_proof;
 
 /// The chain summary strip shown on every page.
 pub struct ChainStatus {
@@ -29,6 +39,9 @@ pub struct ChainStatus {
     pub pool: u64,
     pub target: u64,
     pub syncing: bool,
+    /// The daemon's release, as `v0.18.3.3`. `None` when the daemon does not
+    /// say, as a restricted one does not.
+    pub daemon: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -43,6 +56,8 @@ struct IndexPage {
     chain: Option<ChainStatus>,
     blocks: Vec<BlockRow>,
     page: u64,
+    /// The next page back, while there are older blocks.
+    older: Option<u64>,
 }
 
 struct BlockRow {
@@ -72,15 +87,29 @@ struct BlockPage {
     age: String,
     size: u64,
     weight: u64,
-    /// Every transaction rendered in the table below, coinbase included.
-    /// Agrees with the index row's `total_tx_count(num_txes)` because every
-    /// valid block carries exactly one coinbase.
+    /// Every transaction in the block, coinbase included: the rows below and
+    /// the unreadable ones. Agrees with the index row's
+    /// `total_tx_count(num_txes)` because every valid block carries exactly
+    /// one coinbase.
     tx_count: usize,
+    /// Transactions the daemon sent that did not decode, so have no row.
+    unreadable: usize,
+    /// An orphan's transactions the daemon does not have.
+    unlisted: usize,
+    /// Not on the main chain: reached by its hash, an alternative block.
+    orphan: bool,
     reward: String,
     difficulty: String,
     nonce: u32,
     major_version: u8,
     minor_version: u8,
+    /// The curve tree this block commits to, from hard fork 17. Both `None`
+    /// below the fork, and when the block's own JSON did not decode.
+    tree_root: Option<String>,
+    tree_layers: Option<u8>,
+    /// The outputs in the tree whose root this block carries, and how many
+    /// more than in the previous block's.
+    tree_growth: Option<(String, String)>,
     fee_sort: ColumnSort,
     size_sort: ColumnSort,
     txs: Vec<BlockTxRow>,
@@ -90,10 +119,22 @@ struct BlockTxRow {
     hash: String,
     coinbase: bool,
     p2pool: bool,
+    /// Its spends: a coinbase's one input creates coins, and is shown as
+    /// none.
+    inputs: usize,
     outputs: usize,
     fee: String,
     fee_atomic: u64,
+    /// The smallest ring among the inputs, and the largest, which differ
+    /// only before v12.
     ring: usize,
+    ring_max: usize,
+    /// An FCMP++ spend, whose ring column names the curve tree rather than a
+    /// 0 that would say it has no anonymity set.
+    full_chain: bool,
+    /// Its reference block, and the tree's size as of it when known.
+    reference: Option<u64>,
+    tree: Option<String>,
     size: u64,
 }
 
@@ -117,24 +158,82 @@ struct TxPage {
     size: u64,
     version_no: u64,
     rct_type: u8,
-    ring_size: usize,
+    /// The smallest and largest ring among the inputs. Until v12 each input
+    /// could have its own.
+    ring_min: usize,
+    ring_max: usize,
+    /// The inputs prove membership in the curve tree, so there is
+    /// no ring to show.
+    fcmp_pp: bool,
+    /// The height whose curve tree the FCMP++ proof was built against, and
+    /// the tree's layer count then. `None` on a ring spend, and on an FCMP++
+    /// spend whose prunable half this node no longer holds.
+    reference_block: Option<u64>,
+    n_tree_layers: Option<u8>,
+    /// The block that carries the root the proof was checked
+    /// against, eight below the reference block (see
+    /// [`monerod_rpc::types::TREE_ROOT_LAG`]), and that root. `None` when that
+    /// block carries no tree, which is so for the first reference blocks after
+    /// the fork, and when it could not be fetched.
+    root_block: Option<(u64, String)>,
+    /// The curve tree's size as of the reference block, digits grouped. `None`
+    /// wherever the API's `anonymity_set` is `null`.
+    anonymity_set: Option<String>,
+    /// That tree, drawn. Present exactly when `anonymity_set` is.
+    tree: Option<[TreeFunnel; 2]>,
+    /// The FCMP++ proof's length in bytes.
+    proof_size: Option<String>,
+    /// Any output is a Carrot output, which carries a three-byte view tag and
+    /// an encrypted Janus anchor.
+    carrot: bool,
     unlock_time: u64,
     payment_id: String,
     payment_id8: String,
     inputs: Vec<InputView>,
     outputs: Vec<OutputView>,
     has_view_tags: bool,
+    /// Every output has a unified id, which a pool transaction does not.
+    has_unified_ids: bool,
     extra: String,
     extra_fields: Vec<ExtraField>,
     extra_undecoded: bool,
+    /// A mined coinbase's whole reward, and what of it the block's fees paid.
+    coinbase_totals: Option<CoinbaseTotals>,
+}
+
+struct CoinbaseTotals {
+    /// Every output of the coinbase together: the new coins and the fees.
+    reward: String,
+    /// How the reward splits. `None` when the block's transactions could not
+    /// all be read.
+    split: Option<RewardSplit>,
+}
+
+struct RewardSplit {
+    /// The new coins: the reward less the fees.
+    base: String,
+    /// The fees of the block's other transactions, and how many paid them.
+    fees: String,
+    paid: usize,
+}
+
+impl TxPage {
+    /// Whether any output's amount is hidden, for the column's note.
+    fn hidden_amounts(&self) -> bool {
+        self.outputs.iter().any(|o| o.amount.is_none())
+    }
 }
 
 struct InputView {
     key_image: String,
     amount: Option<String>,
+    /// The ring's size as the input states it, which holds when the members
+    /// could not be fetched.
+    size: usize,
     unavailable: bool,
     ring: Vec<RingView>,
-    ages: AgeStrip,
+    /// `None` where the height they are counted from is unknown.
+    ages: Option<AgeStrip>,
 }
 
 struct RingView {
@@ -168,6 +267,20 @@ struct AgeTick {
     label: String,
 }
 
+/// A transaction's inputs that spend an output: all of them but a coinbase's
+/// one, which creates coins instead.
+fn spends(tx: &TxJson) -> usize {
+    tx.vin.iter().filter(|v| v.as_key().is_some()).count()
+}
+
+/// The ring size of each input that spends an output, in order.
+fn ring_lens(tx: &TxJson) -> Vec<usize> {
+    tx.vin
+        .iter()
+        .filter_map(|v| v.as_key().map(|k| k.key_offsets.len()))
+        .collect()
+}
+
 /// Whether a coinbase was paid out by p2pool.
 ///
 /// Two marks together, both on the chain and free to read. A coinbase with
@@ -190,10 +303,6 @@ fn is_p2pool(coinbase: bool, outputs: usize, merge_mined: bool) -> bool {
     coinbase && outputs > 1 && merge_mined
 }
 
-/// Blocks per hour and per day at Monero's two-minute target.
-const BLOCKS_PER_HOUR: u64 = 30;
-const BLOCKS_PER_DAY: u64 = 720;
-
 /// The strip's coordinate space, in the pixels it occupies at full size. The
 /// stylesheet lets it shrink with a narrow window but never enlarges it, so
 /// the axis labels stay the size they were drawn at.
@@ -205,16 +314,65 @@ const STEM_WIDTH: u32 = 2;
 /// Baseline for the axis labels: below the band, with room for descenders.
 const TICK_BASELINE: u32 = STRIP_HEIGHT - 5;
 
-/// Axis labels, spaced widely enough on a log scale that two never collide.
+/// Axis labels, in minutes, spaced widely enough on a log scale that two
+/// never collide.
 const AGE_TICKS: [(u64, &str); 7] = [
-    (BLOCKS_PER_HOUR, "1h"),
-    (6 * BLOCKS_PER_HOUR, "6h"),
-    (BLOCKS_PER_DAY, "1d"),
-    (7 * BLOCKS_PER_DAY, "1w"),
-    (30 * BLOCKS_PER_DAY, "1mo"),
-    (365 * BLOCKS_PER_DAY, "1y"),
-    (1825 * BLOCKS_PER_DAY, "5y"),
+    (60, "1h"),
+    (6 * 60, "6h"),
+    (1440, "1d"),
+    (7 * 1440, "1w"),
+    (30 * 1440, "1mo"),
+    (365 * 1440, "1y"),
+    (1825 * 1440, "5y"),
 ];
+
+/// Turns ages in blocks before a block into times. Blocks were a minute
+/// apart until hard fork 2 and two minutes after.
+#[derive(Debug, Clone, Copy)]
+struct Clock {
+    /// The block ages are counted back from.
+    at: u64,
+    /// The height hard fork 2 began at. `None` where the daemon would not
+    /// say, and then ages are given in blocks.
+    v2: Option<u64>,
+}
+
+impl Clock {
+    /// How many of the blocks back from `at` were two minutes apart.
+    fn two_minute_blocks(self, v2: u64) -> u64 {
+        self.at.saturating_sub(v2.saturating_sub(1))
+    }
+
+    /// Minutes from the block `age` blocks back to `at`.
+    fn minutes(self, age: u64) -> Option<u64> {
+        let two = self.two_minute_blocks(self.v2?).min(age);
+        Some(age.saturating_add(two))
+    }
+
+    /// How many blocks back from `at` lie `minutes` before it.
+    fn blocks(self, minutes: u64) -> Option<u64> {
+        let two = self.two_minute_blocks(self.v2?);
+        Some(match minutes.checked_sub(two.saturating_mul(2)) {
+            Some(more) => two.saturating_add(more),
+            None => minutes / 2,
+        })
+    }
+
+    /// An age the way a reader would say it, or in blocks where the times
+    /// are not known.
+    fn age(self, blocks: u64) -> String {
+        self.minutes(blocks).map_or_else(
+            || {
+                format!(
+                    "{} block{}",
+                    grouped(blocks),
+                    if blocks == 1 { "" } else { "s" }
+                )
+            },
+            minutes_label,
+        )
+    }
+}
 
 /// The axis every strip on a transaction shares: the oldest age any of its
 /// inputs reaches. Drawn to its own scale, each input would put the same
@@ -236,8 +394,8 @@ fn axis_span(heights: impl Iterator<Item = u64>, spent_at: u64) -> u64 {
 ///
 /// `oldest` is the axis, in blocks, and is the oldest age reached by any of
 /// the transaction's inputs rather than by this one alone.
-fn age_strip(ring: &[RingView], spent_at: u64, oldest: u64) -> AgeStrip {
-    let ages = ring.iter().map(|m| spent_at.saturating_sub(m.height));
+fn age_strip(ring: &[RingView], clock: Clock, oldest: u64) -> AgeStrip {
+    let ages = ring.iter().map(|m| clock.at.saturating_sub(m.height));
 
     AgeStrip {
         marks: ages
@@ -246,7 +404,7 @@ fn age_strip(ring: &[RingView], spent_at: u64, oldest: u64) -> AgeStrip {
                 AgeMark {
                     halo: centred(x, HALO_WIDTH),
                     stem: centred(x, STEM_WIDTH),
-                    label: age_label(age),
+                    label: clock.age(age),
                 }
             })
             .collect(),
@@ -254,8 +412,9 @@ fn age_strip(ring: &[RingView], spent_at: u64, oldest: u64) -> AgeStrip {
         // invites the reader to look for members that are not there.
         ticks: AGE_TICKS
             .iter()
-            .filter(|&&(age, _)| age <= oldest)
-            .map(|&(age, label)| AgeTick {
+            .filter_map(|&(minutes, label)| Some((clock.blocks(minutes)?, label)))
+            .filter(|&(age, _)| age <= oldest)
+            .map(|(age, label)| AgeTick {
                 x: strip_x(age, oldest),
                 label: label.to_owned(),
             })
@@ -300,9 +459,8 @@ fn strip_x(age: u64, oldest: u64) -> u32 {
     x
 }
 
-/// An age written the way a reader would say it.
-fn age_label(blocks: u64) -> String {
-    let minutes = blocks.saturating_mul(2);
+/// A time written the way a reader would say it.
+fn minutes_label(minutes: u64) -> String {
     match minutes {
         0..60 => format!("{minutes} min"),
         60..1440 => format!("{} h", minutes / 60),
@@ -311,10 +469,328 @@ fn age_label(blocks: u64) -> String {
     }
 }
 
+/// The curve tree an FCMP++ spend proved against, drawn as a funnel: one bar
+/// per layer, the root at the top and the outputs at the bottom. Below the
+/// root, every bar is split into the root's children's subtrees, one column
+/// for each, joined by its own band to the column above.
+struct TreeFunnel {
+    class: &'static str,
+    width: u32,
+    height: u32,
+    rows: Vec<FunnelRow>,
+    /// The bands joining each bar's blocks to the ones below them, as
+    /// polygon points.
+    webs: Vec<String>,
+    /// The root the proof was checked against, abbreviated.
+    root: Option<String>,
+    root_x: u32,
+    root_y: u32,
+    /// Where each row's count sits: at the right beside the bars, or over the
+    /// middle of its bar when the label is above it.
+    count_x: u32,
+    count_anchor: &'static str,
+    leaves: String,
+    layers: usize,
+}
+
+struct FunnelRow {
+    name: String,
+    curve: Option<&'static str>,
+    /// `None` on the root when its hash is shown: there is always one.
+    count: Option<String>,
+    class: &'static str,
+    x: u32,
+    y: u32,
+    label_y: u32,
+    width: u32,
+    /// The bar's part of each of the root's children's subtrees, left to
+    /// right; the root's bar is one block.
+    blocks: Vec<FunnelBlock>,
+}
+
+struct FunnelBlock {
+    x: String,
+    width: String,
+    /// How many of the layer's nodes the block holds.
+    nodes: u64,
+}
+
+impl FunnelRow {
+    /// A block's tooltip: what it holds.
+    fn holds(&self, b: &FunnelBlock) -> String {
+        let (one, many) = match self.class {
+            "leaf" => ("output", "outputs"),
+            _ => ("node", "nodes"),
+        };
+        format!(
+            "{} {}",
+            grouped(b.nodes),
+            if b.nodes == 1 { one } else { many }
+        )
+    }
+}
+
+/// Labels take the left of the strip's width and counts the right.
+const FUNNEL_LEFT: u32 = 150;
+const FUNNEL_RIGHT: u32 = 110;
+const FUNNEL_TOP: u32 = 14;
+const FUNNEL_ROW: u32 = 30;
+const FUNNEL_BAR: u32 = 14;
+const FUNNEL_MIN_BAR: u32 = 10;
+/// The space between two blocks of a bar, at most, and at most this share of
+/// the bar in all.
+const FUNNEL_GAP: f64 = 3.0;
+const FUNNEL_GAP_SHARE: f64 = 0.25;
+
+/// Where a funnel's labels, counts and bars go.
+struct FunnelLayout {
+    class: &'static str,
+    width: u32,
+    left: u32,
+    right: u32,
+    top: u32,
+    row: u32,
+    /// Labels sit on the bar's line, or above it. Above, the count goes over
+    /// the middle of the bar.
+    above: bool,
+}
+
+/// Labels beside the bars.
+const WIDE_FUNNEL: FunnelLayout = FunnelLayout {
+    class: "wide",
+    width: STRIP_WIDTH,
+    left: FUNNEL_LEFT,
+    right: FUNNEL_RIGHT,
+    top: FUNNEL_TOP,
+    row: FUNNEL_ROW,
+    above: false,
+};
+
+/// Labels above the bars, for a phone: the whole tree fits its width.
+const NARROW_FUNNEL: FunnelLayout = FunnelLayout {
+    class: "narrow",
+    width: 320,
+    left: 0,
+    right: 0,
+    top: 30,
+    row: 44,
+    above: true,
+};
+
+/// The tree holding `leaves` outputs, laid out wide and narrow. `None` for an
+/// empty tree.
+fn tree_picture(leaves: u64, root: Option<&str>) -> Option<[TreeFunnel; 2]> {
+    Some([
+        tree_funnel(leaves, root, &WIDE_FUNNEL)?,
+        tree_funnel(leaves, root, &NARROW_FUNNEL)?,
+    ])
+}
+
+/// Lays out the tree holding `leaves` outputs. `None` for an empty tree.
+///
+/// The shape follows from the size alone, so nothing here depends on, or
+/// could hint at, which output an input spent.
+fn tree_funnel(leaves: u64, root: Option<&str>, layout: &FunnelLayout) -> Option<TreeFunnel> {
+    let layers = monerod_rpc::types::tree_layers(leaves);
+    let depth = layers.len();
+    if depth == 0 {
+        return None;
+    }
+    let counts = layers.iter().rev().copied().chain([leaves]);
+    let span = layout.width - layout.left - layout.right;
+    let centre = layout.left + span / 2;
+
+    // Nodes of each row under one child of the root: 1 in the root's
+    // children's own row, and each row below holds its group width times the
+    // row above.
+    let branches = layers.iter().rev().nth(1).copied().unwrap_or(leaves);
+    let mut per_branch = 0u64;
+
+    let rows: Vec<FunnelRow> = counts
+        .zip(0u32..)
+        .map(|(count, i)| {
+            let width = funnel_width(count, leaves, span);
+            let x = centre - width / 2;
+            let y = layout.top + i * layout.row;
+            let layer = depth - i as usize;
+            let curve =
+                (layer > 0).then(|| explorer_core::curve_tree::Curve::of_layer(layer).name());
+            let (name, class) = match i {
+                0 => ("Root".to_owned(), "root"),
+                _ if layer == 0 => ("Outputs".to_owned(), "leaf"),
+                _ => (format!("Layer {layer}"), "node"),
+            };
+            per_branch = match i {
+                0 => 0,
+                1 => 1,
+                _ => per_branch.saturating_mul(explorer_core::curve_tree::group_width(layer)),
+            };
+            let blocks = if i == 0 {
+                vec![FunnelBlock {
+                    x: x.to_string(),
+                    width: width.to_string(),
+                    nodes: count,
+                }]
+            } else {
+                funnel_blocks(count, branches, per_branch, x, width)
+            };
+            FunnelRow {
+                name,
+                curve,
+                count: (i > 0 || root.is_none()).then(|| grouped(count)),
+                class,
+                x,
+                y,
+                label_y: if layout.above { y - 8 } else { y + 12 },
+                width,
+                blocks,
+            }
+        })
+        .collect();
+
+    // The root's band fans out to the whole bar below it; each band below
+    // that joins a branch's block to the same branch's block beneath.
+    let webs = rows
+        .windows(2)
+        .flat_map(|w| match w {
+            [a, b] if a.blocks.len() == 1 => vec![format!(
+                "{},{top} {},{top} {},{} {},{}",
+                a.x,
+                a.x + a.width,
+                b.x + b.width,
+                b.y,
+                b.x,
+                b.y,
+                top = a.y + FUNNEL_BAR,
+            )],
+            [a, b] => a
+                .blocks
+                .iter()
+                .zip(&b.blocks)
+                .map(|(p, q)| {
+                    format!(
+                        "{},{top} {},{top} {},{} {},{}",
+                        p.x,
+                        block_end(p),
+                        block_end(q),
+                        b.y,
+                        q.x,
+                        b.y,
+                        top = a.y + FUNNEL_BAR,
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+
+    Some(TreeFunnel {
+        class: layout.class,
+        width: layout.width,
+        height: rows.last().map_or(0, |r| r.y) + FUNNEL_BAR + 6,
+        root_x: centre,
+        root_y: rows.first().map_or(0, |r| r.label_y.min(r.y - 3)),
+        count_x: if layout.above { centre } else { layout.width },
+        count_anchor: if layout.above { "middle" } else { "end" },
+        rows,
+        webs,
+        root: root.and_then(|r| r.get(..16)).map(|r| format!("{r}…")),
+        leaves: grouped(leaves),
+        layers: depth,
+    })
+}
+
+/// A bar of `count` nodes, `width` wide from `x`, split into `branches`
+/// blocks of `per_branch` nodes each but the last, which holds the rest.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a chart coordinate, not chain arithmetic"
+)]
+fn funnel_blocks(
+    count: u64,
+    branches: u64,
+    per_branch: u64,
+    x: u32,
+    width: u32,
+) -> Vec<FunnelBlock> {
+    let w = f64::from(width);
+    let gap = if branches > 1 {
+        FUNNEL_GAP.min(FUNNEL_GAP_SHARE * w / (branches - 1) as f64)
+    } else {
+        0.0
+    };
+    let room = w - gap * branches.saturating_sub(1) as f64;
+    let mut at = f64::from(x);
+    (0..branches)
+        .map(|j| {
+            let nodes = count
+                .saturating_sub(j.saturating_mul(per_branch))
+                .min(per_branch);
+            let bw = room * nodes as f64 / count.max(1) as f64;
+            let block = FunnelBlock {
+                x: coord(at),
+                width: coord(bw.max(1.0)),
+                nodes,
+            };
+            at += bw + gap;
+            block
+        })
+        .collect()
+}
+
+fn block_end(b: &FunnelBlock) -> String {
+    let (x, w) = (b.x.parse().unwrap_or(0.0), b.width.parse().unwrap_or(0.0));
+    coord(x + w)
+}
+
+/// A drawing coordinate to a tenth of a pixel, written short.
+fn coord(v: f64) -> String {
+    let s = format!("{v:.1}");
+    s.strip_suffix(".0").map_or(s.clone(), str::to_owned)
+}
+
+/// A bar's width: the log of its node count against the log of the outputs',
+/// so the outputs span the full width and the root takes the minimum.
+fn funnel_width(count: u64, leaves: u64, span: u32) -> u32 {
+    if leaves <= 1 {
+        return FUNNEL_MIN_BAR;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a chart coordinate, not chain arithmetic"
+    )]
+    let share = (count as f64).ln() / (leaves as f64).ln();
+    let room = f64::from(span - FUNNEL_MIN_BAR);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to the span before the cast"
+    )]
+    let extra = (room * share).clamp(0.0, room).round() as u32;
+    FUNNEL_MIN_BAR + extra
+}
+
 struct OutputView {
     public_key: String,
     amount: Option<String>,
     view_tag: String,
+    /// The encrypted Janus anchor of a Carrot output, or empty.
+    anchor: String,
+    unified_id: Option<u64>,
+}
+
+/// A count with its thousands separated, for a number a reader has to take in
+/// at a glance. The API publishes the bare integer.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 struct ExtraField {
@@ -331,16 +807,45 @@ struct MempoolPage {
     waiting_sort: ColumnSort,
     fee_sort: ColumnSort,
     size_sort: ColumnSort,
+    /// Every transaction in the pool, of which `txs` are the first.
+    total: usize,
+    /// Whether the pool is longer than the page shows.
+    cut: bool,
     txs: Vec<PoolRow>,
 }
+
+impl MempoolPage {
+    /// Whether any row is an FCMP++ spend, whose column holds a tree's size
+    /// rather than a ring's.
+    fn anon_set(&self) -> bool {
+        self.txs.iter().any(|t| t.full_chain)
+    }
+}
+
+impl BlockPage {
+    /// As [`MempoolPage::anon_set`].
+    fn anon_set(&self) -> bool {
+        self.txs.iter().any(|t| t.full_chain)
+    }
+}
+
+/// The most rows the mempool page shows: as many as `/api/mempool` sends at
+/// once.
+#[allow(clippy::cast_possible_truncation, reason = "500 fits any usize")]
+const MEMPOOL_ROWS: usize = crate::api::handlers::MAX_MEMPOOL_LIMIT as usize;
 
 struct PoolRow {
     hash: String,
     age: String,
-    waiting_secs: u64,
+    /// The outputs it spends.
+    inputs: usize,
+    outputs: usize,
     fee: String,
-    fee_atomic: u64,
     ring: usize,
+    ring_max: usize,
+    full_chain: bool,
+    reference: Option<u64>,
+    tree: Option<String>,
     size: u64,
 }
 
@@ -374,11 +879,13 @@ impl SortKey {
         }
     }
 
-    fn of(self, row: &PoolRow) -> u64 {
+    /// What a pool transaction sorts by, as the daemon states it: the same
+    /// numbers its row shows.
+    fn of(self, t: &PoolTxInfo, asked_at: u64) -> u64 {
         match self {
-            Self::Waiting => row.waiting_secs,
-            Self::Fee => row.fee_atomic,
-            Self::Size => row.size,
+            Self::Waiting => waiting_secs(asked_at, t.receive_time),
+            Self::Fee => t.fee,
+            Self::Size => t.blob_size,
         }
     }
 }
@@ -467,8 +974,139 @@ fn sort_rows<T>(rows: &mut [T], dir: SortDir, value: impl Fn(&T) -> u64) {
     });
 }
 
-fn sort_pool_rows(rows: &mut [PoolRow], key: SortKey, dir: SortDir) {
-    sort_rows(rows, dir, |r| key.of(r));
+/// The mempool page's rows: the pool sorted as asked, and cut to
+/// [`MEMPOOL_ROWS`] before any transaction is decoded, so a pool of
+/// thousands costs the rows shown. A transaction that does not decode has no
+/// row.
+/// What a table row shows of a transaction. Its hash fixes all of it, so
+/// it is worked out once rather than parsed again on every view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowFacts {
+    coinbase: bool,
+    p2pool: bool,
+    inputs: usize,
+    outputs: usize,
+    fee: u64,
+    ring: usize,
+    ring_max: usize,
+    full_chain: bool,
+    reference: Option<u64>,
+    size: u64,
+}
+
+impl RowFacts {
+    fn of(tx: &TxJson, f: &TxFacts) -> Self {
+        let lens = ring_lens(tx);
+        Self {
+            coinbase: f.coinbase,
+            p2pool: is_p2pool(
+                f.coinbase,
+                tx.vout.len(),
+                f.extra.merge_mining_tag().is_some(),
+            ),
+            inputs: spends(tx),
+            outputs: tx.vout.len(),
+            fee: f.fee,
+            ring: lens.iter().copied().min().unwrap_or(0),
+            ring_max: lens.iter().copied().max().unwrap_or(0),
+            full_chain: f.fcmp_pp.is_some(),
+            reference: tx.reference_block(),
+            size: f.size,
+        }
+    }
+}
+
+/// [`RowFacts`] by transaction hash, and whether they are a pool row's: the
+/// pool states a transaction's size and fee itself, a block row measures and
+/// derives them.
+pub struct RowCache(explorer_core::cache::Cache<(String, bool), RowFacts>);
+
+impl Default for RowCache {
+    fn default() -> Self {
+        Self(explorer_core::cache::Cache::permanent(16_384))
+    }
+}
+
+impl RowCache {
+    #[must_use]
+    pub fn stats(&self) -> explorer_core::cache::Stats {
+        self.0.stats()
+    }
+
+    fn of_block_tx(&self, e: &TxEntry) -> Option<RowFacts> {
+        let key = (e.tx_hash.to_lowercase(), false);
+        if let Some(hit) = self.0.get(&key) {
+            return Some(*hit);
+        }
+        let tx = e.parse_json().ok()?;
+        let facts = RowFacts::of(&tx, &TxFacts::from_entry(e, &tx));
+        // A pruned entry measures short; it is shown as it is, not kept.
+        if !e.prunable_missing(&tx) {
+            self.0.insert(key, facts);
+        }
+        Some(facts)
+    }
+
+    fn of_pool_tx(&self, t: &PoolTxInfo) -> Option<RowFacts> {
+        let key = (t.id_hash.to_lowercase(), true);
+        if let Some(hit) = self.0.get(&key) {
+            return Some(*hit);
+        }
+        let tx = t.parse_json().ok()?;
+        let facts = RowFacts::of(&tx, &TxFacts::from_pool(t, &tx));
+        self.0.insert(key, facts);
+        Some(facts)
+    }
+}
+
+fn pool_rows(
+    rows: &RowCache,
+    pool: &[Arc<PoolTxInfo>],
+    active: Option<(SortKey, SortDir)>,
+    asked_at: u64,
+) -> Vec<PoolRow> {
+    let mut listed: Vec<&PoolTxInfo> = pool.iter().map(|t| &**t).collect();
+    if let Some((key, dir)) = active {
+        sort_rows(&mut listed, dir, |t| key.of(t, asked_at));
+    }
+    listed
+        .into_iter()
+        .take(MEMPOOL_ROWS)
+        .filter_map(|t| {
+            let f = rows.of_pool_tx(t)?;
+            Some(PoolRow {
+                hash: t.id_hash.to_lowercase(),
+                age: age(asked_at, t.receive_time),
+                inputs: f.inputs,
+                outputs: f.outputs,
+                fee: xmr_aligned(f.fee),
+                ring: f.ring,
+                ring_max: f.ring_max,
+                full_chain: f.full_chain,
+                reference: f.reference,
+                tree: None,
+                size: f.size,
+            })
+        })
+        .collect()
+}
+
+/// The outputs in the tree as of a row's reference block, from `sizes`.
+fn tree_of(reference: Option<u64>, sizes: &HashMap<u64, u64>) -> Option<String> {
+    sizes
+        .get(&reference?)
+        .filter(|n| **n > 0)
+        .map(|n| grouped(*n))
+}
+
+/// The size of the tree whose root block `height` carries, and how many
+/// outputs it gained over the previous block's: both are as of
+/// `TREE_ROOT_LAG` blocks on.
+fn tree_growth(height: u64, sizes: &HashMap<u64, u64>) -> Option<(String, String)> {
+    let at = height.checked_add(TREE_ROOT_LAG)?;
+    let now = *sizes.get(&at)?;
+    let before = *sizes.get(&(at - 1))?;
+    Some((grouped(now), grouped(now.saturating_sub(before))))
 }
 
 /// Orders a block's rows. A block has no `Waiting` column, so that key is
@@ -488,26 +1126,18 @@ struct AltBlocksPage {
     version: &'static str,
     query: Option<String>,
     chain: Option<ChainStatus>,
-    chains: Vec<AltChainRow>,
-}
-
-struct AltChainRow {
-    /// The chain's **first** block -- where it diverged -- not its tip.
-    /// monerod names this `height`, which reads like a tip and is not one.
-    height: u64,
-    length: u64,
-    tip: u64,
-    block_hash: String,
-    difficulty: String,
-    parent: String,
+    count: usize,
+    graph: alt_graph::AltGraph,
 }
 
 /// The JSON API's own documentation.
 ///
-/// Every limit on this page is interpolated from the constant the handler
-/// actually enforces, and the accepted postfix lengths are computed by asking
-/// the validator. Documentation that restates a number is documentation that
-/// will one day be wrong; documentation that reads it cannot be.
+/// Every limit on this page is interpolated from what the handler actually
+/// enforces -- a constant, or the deployment's configured
+/// [`Limits`](crate::config::Limits) -- and the accepted postfix lengths are
+/// computed by asking the validator. Documentation that restates a number is
+/// documentation that will one day be wrong; documentation that reads it
+/// cannot be.
 #[derive(Template)]
 #[template(path = "api.html")]
 struct ApiPage {
@@ -523,6 +1153,8 @@ struct ApiPage {
     max_transactions_limit: u64,
     max_mempool_limit: u64,
     max_block_range: u64,
+    /// The most chain data one range of blocks may hold, in MiB.
+    max_range_mib: u64,
     min_postfix_len: usize,
     max_postfix_len: usize,
     min_anonymity_set: u64,
@@ -705,7 +1337,16 @@ async fn status_of(state: &AppState) -> Option<ChainStatus> {
         pool: info.tx_pool_size,
         target: info.target_height,
         syncing: info.target_height > info.height,
+        daemon: daemon_release(&info.version),
     })
+}
+
+/// monerod's version string as its release tag: `0.18.3.3-release` reads
+/// `v0.18.3.3`, and a pre-release keeps its tag, `v0.19.0.0-beta.3.1`.
+fn daemon_release(version: &str) -> Option<String> {
+    let v = version.trim();
+    let v = v.strip_suffix("-release").unwrap_or(v);
+    (!v.is_empty()).then(|| format!("v{v}"))
 }
 
 fn xmr(atomic: u64) -> String {
@@ -786,7 +1427,7 @@ async fn render_page(State(state): Shared, page: u64) -> Page {
     const PER_PAGE: u64 = 25;
 
     let chain = status_of(&state).await;
-    let Some(status) = chain.as_ref().map(|c| c.height) else {
+    let Some(height) = chain.as_ref().map(|c| c.height) else {
         return error_page(
             None,
             StatusCode::BAD_GATEWAY,
@@ -795,7 +1436,18 @@ async fn render_page(State(state): Shared, page: u64) -> Page {
         );
     };
 
-    let top = status.saturating_sub(1);
+    let top = height.saturating_sub(1);
+    // Past the genesis block there is nothing to list. Refused here rather
+    // than rendered as a repeat of the oldest page, which also keeps the
+    // pager's next number from overflowing.
+    if page > top / PER_PAGE {
+        return error_page(
+            chain,
+            StatusCode::NOT_FOUND,
+            "No such page",
+            &format!("The chain has {} pages of blocks.", top / PER_PAGE + 1),
+        );
+    }
     let start = top.saturating_sub(page.saturating_mul(PER_PAGE));
     let end = start;
     let begin = start.saturating_sub(PER_PAGE.saturating_sub(1));
@@ -839,6 +1491,7 @@ async fn render_page(State(state): Shared, page: u64) -> Page {
             chain,
             blocks,
             page,
+            older: (begin > 0).then_some(page + 1),
         },
     )
 }
@@ -857,7 +1510,7 @@ pub async fn block(
             chain,
             StatusCode::NOT_FOUND,
             "No such block",
-            &format!("{} is not a block height or a block hash.", echo(&raw)),
+            &format!("{} is not a block number or a block hash.", echo(&raw)),
         );
     };
 
@@ -867,17 +1520,7 @@ pub async fn block(
     };
 
     let header = got.block_header.clone();
-    let mut hashes: Vec<Hash32> = Vec::new();
-    if let Ok(h) = header.miner_tx_hash.parse::<Hash32>() {
-        hashes.push(h);
-    }
-    for h in &got.tx_hashes {
-        if let Ok(h) = h.parse::<Hash32>() {
-            hashes.push(h);
-        }
-    }
-
-    let fetched = match state.chain.transactions(&hashes).await {
+    let (fetched, _held) = match state.chain.block_transactions(&got).await {
         Ok(f) => f,
         // Rendering the header on its own would show a block that holds
         // transactions as though it were empty -- a wrong page rather than a
@@ -888,31 +1531,63 @@ pub async fn block(
         .txs
         .iter()
         .filter_map(|e| {
-            let tx = e.parse_json().ok()?;
-            let f = TxFacts::from_entry(e, &tx);
+            let f = state.rows.of_block_tx(e)?;
             Some(BlockTxRow {
                 hash: e.tx_hash.to_lowercase(),
                 coinbase: f.coinbase,
-                p2pool: is_p2pool(
-                    f.coinbase,
-                    tx.vout.len(),
-                    f.extra.merge_mining_tag().is_some(),
-                ),
-                outputs: tx.vout.len(),
+                p2pool: f.p2pool,
+                inputs: f.inputs,
+                outputs: f.outputs,
                 fee: xmr_aligned(f.fee),
                 fee_atomic: f.fee,
-                ring: f.ring_size,
+                ring: f.ring,
+                ring_max: f.ring_max,
+                full_chain: f.full_chain,
+                reference: f.reference,
+                tree: None,
                 size: f.size,
             })
         })
         .collect::<Vec<_>>();
-    let tx_count = table_tx_count(&txs);
+    let unreadable = fetched.txs.len().saturating_sub(txs.len());
+    let unlisted = fetched.missed.len();
+    let tx_count = table_tx_count(&txs) + unreadable + unlisted;
     if let Some((key, dir)) = active {
         sort_block_rows(&mut txs, key, dir);
     }
-    // By height rather than by whatever the request named, so a sorted link
-    // from a page reached by hash still lands on this block.
-    let page = format!("/block/{}", header.height);
+    let page = block_link(&header);
+
+    // The tree fields are in the block's own JSON, not in its header. A
+    // document that does not decode costs this one row and nothing else:
+    // everything above it came from the header.
+    let tree = BlockTree::of(&got);
+    let depth = state.chain.depth_now(&header).await;
+
+    // The coinbase's output is newer than every tree asked about here. An
+    // orphan's sizes would be the main chain's, so it is asked nothing.
+    let probe = fetched
+        .txs
+        .first()
+        .and_then(|e| e.unified_ids.first().copied())
+        .filter(|_| !header.orphan_status);
+    let sizes = match probe {
+        Some(probe) => {
+            let grew = tree
+                .is_some()
+                .then(|| header.height.checked_add(TREE_ROOT_LAG))
+                .flatten();
+            let heights = txs
+                .iter()
+                .filter_map(|r| r.reference)
+                .chain(grew.into_iter().flat_map(|h| [h - 1, h]));
+            let chain_height = header.height.saturating_add(depth).saturating_add(1);
+            state.chain.tree_sizes(heights, probe, chain_height).await
+        }
+        None => HashMap::new(),
+    };
+    for r in &mut txs {
+        r.tree = tree_of(r.reference, &sizes);
+    }
 
     render(
         StatusCode::OK,
@@ -921,7 +1596,7 @@ pub async fn block(
             query: None,
             chain,
             height: header.height,
-            depth: header.depth,
+            depth,
             hash: header.hash.to_lowercase(),
             prev_hash: header.prev_hash.to_lowercase(),
             timestamp: header.timestamp,
@@ -930,16 +1605,36 @@ pub async fn block(
             size: header.block_size,
             weight: header.block_weight,
             tx_count,
+            unreadable,
+            unlisted,
+            orphan: header.orphan_status,
             reward: xmr(header.reward),
             difficulty: header.difficulty().to_string(),
             nonce: header.nonce,
             major_version: header.major_version,
             minor_version: header.minor_version,
+            tree_growth: tree
+                .as_ref()
+                .and_then(|_| tree_growth(header.height, &sizes)),
+            tree_layers: tree.as_ref().map(|t| t.n_layers),
+            tree_root: tree.map(|t| t.root),
             fee_sort: column_sort(&page, SortKey::Fee, active),
             size_sort: column_sort(&page, SortKey::Size, active),
             txs,
         },
     )
+}
+
+/// The block page's own address, for its sort links. By height rather than
+/// by whatever the request named, so a sorted link from a page reached by
+/// hash still lands on this block; but an orphan's height names the main
+/// chain's block, so it goes by its hash.
+fn block_link(header: &monerod_rpc::types::BlockHeader) -> String {
+    if header.orphan_status {
+        format!("/block/{}", header.hash.to_lowercase())
+    } else {
+        format!("/block/{}", header.height)
+    }
 }
 
 fn chain_error_page(chain: Option<ChainStatus>, e: &ChainError, title: &str) -> Page {
@@ -960,43 +1655,134 @@ fn chain_error_page(chain: Option<ChainStatus>, e: &ChainError, title: &str) -> 
     }
 }
 
-pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page {
-    let chain = status_of(&state).await;
-
+/// The transaction a page is about, decoded, or the error page to show
+/// instead. `chain` is moved into that page.
+async fn fetch_tx(
+    state: &AppState,
+    chain: &mut Option<ChainStatus>,
+    raw: &str,
+) -> Result<(TxEntry, TxJson), Page> {
     let Ok(hash) = raw.parse::<Hash32>() else {
-        return error_page(
-            chain,
+        return Err(error_page(
+            chain.take(),
             StatusCode::NOT_FOUND,
             "No such transaction",
-            &format!("{} is not a transaction hash.", echo(&raw)),
-        );
+            &format!("{} is not a transaction hash.", echo(raw)),
+        ));
     };
 
     let fetched = match state.chain.transactions(std::slice::from_ref(&hash)).await {
         Ok(f) => f,
-        Err(e) => return chain_error_page(chain, &e, &format!("No transaction {hash}")),
+        Err(e) => {
+            return Err(chain_error_page(
+                chain.take(),
+                &e,
+                &format!("No transaction {hash}"),
+            ));
+        }
     };
 
-    let Some(entry) = fetched.txs.first() else {
-        return error_page(
-            chain,
+    let Some(entry) = fetched.txs.into_iter().next() else {
+        return Err(error_page(
+            chain.take(),
             StatusCode::NOT_FOUND,
             "No such transaction",
             &format!("The daemon does not have transaction {hash}."),
-        );
+        ));
     };
 
     let Ok(tx) = entry.parse_json() else {
-        return error_page(
-            chain,
+        return Err(error_page(
+            chain.take(),
             StatusCode::BAD_GATEWAY,
             "Could not decode this transaction",
             "The daemon returned a transaction this explorer could not read.",
-        );
+        ));
     };
+    Ok((entry, tx))
+}
+
+/// The size of the curve tree an FCMP++ spend proved against, and the block
+/// carrying the root it was checked against with that root. Independent, so
+/// asked for together. See `RpcChainSource::proof_root` for why the root block
+/// is fetched rather than computed.
+/// The fees the block that mined the coinbase `entry` collected, and how many
+/// transactions paid them. `None` when the block at its height no longer has
+/// it as its coinbase, or when any of the block's transactions is missing or
+/// unreadable: a sum without one of them would understate the fees.
+async fn block_fees(state: &AppState, entry: &TxEntry) -> Option<(u64, usize)> {
+    let block = state
+        .chain
+        .block(BlockId::Height(entry.block_height))
+        .await
+        .ok()?;
+    if !block
+        .block_header
+        .miner_tx_hash
+        .eq_ignore_ascii_case(&entry.tx_hash)
+    {
+        return None;
+    }
+    let (fetched, _held) = state.chain.block_transactions(&block).await.ok()?;
+    if !fetched.missed.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut paid = 0;
+    for e in &fetched.txs {
+        let f = state.rows.of_block_tx(e)?;
+        if !f.coinbase {
+            total = total.checked_add(f.fee)?;
+            paid += 1;
+        }
+    }
+    Some((total, paid))
+}
+
+async fn tree_facts(
+    state: &AppState,
+    tx: &TxJson,
+    entry: &TxEntry,
+    reference: Option<u64>,
+) -> (Option<u64>, Option<(u64, String)>) {
+    tokio::join!(
+        state.chain.anonymity_set(
+            tx,
+            entry,
+            entry.block_height.saturating_add(entry.confirmations),
+        ),
+        async {
+            match reference {
+                Some(r) => state.chain.proof_root(r).await,
+                None => None,
+            }
+        },
+    )
+}
+
+/// The height ring ages are measured against: the block that spent them, or
+/// the tip for a transaction still in the pool, unknown without the chain's
+/// status.
+fn spent_height(entry: &TxEntry, chain: Option<&ChainStatus>) -> Option<u64> {
+    if entry.in_pool {
+        chain.map(|c| c.height)
+    } else {
+        Some(entry.block_height)
+    }
+}
+
+pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page {
+    let mut chain = status_of(&state).await;
+    let (entry, tx) = match fetch_tx(&state, &mut chain, &raw).await {
+        Ok(found) => found,
+        Err(page) => return page,
+    };
+    let entry = &entry;
 
     let f = TxFacts::from_entry(entry, &tx);
     let rings = state.chain.resolve_rings(&tx).await;
+    let reference = f.fcmp_pp.and_then(|x| x.reference_block);
+    let (anonymity_set, root_block) = tree_facts(&state, &tx, entry, reference).await;
 
     // A transaction in the pool is in no block, so the time it carries is the
     // time it arrived: `block_timestamp` is 0 there and renders as 1970. The
@@ -1007,22 +1793,20 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
         entry.block_timestamp
     };
 
-    // Ring ages are measured against the block that spent them, or the tip
-    // for a transaction still in the pool.
-    let spent_at = if entry.in_pool {
-        chain.as_ref().map_or(0, |c| c.height)
-    } else {
-        entry.block_height
-    };
+    let v2 = state.chain.v2_height().await;
+    let clock = spent_height(entry, chain.as_ref()).map(|at| Clock { at, v2 });
+    let oldest = clock.map_or(0, |c| {
+        axis_span(
+            rings.iter().flat_map(|r| &r.ring).map(|m| m.block_height),
+            c.at,
+        )
+    });
 
-    let oldest = axis_span(
-        rings.iter().flat_map(|r| &r.ring).map(|m| m.block_height),
-        spent_at,
-    );
-
+    let lens = ring_lens(&tx);
     let inputs: Vec<InputView> = rings
         .iter()
-        .map(|r| {
+        .zip(lens.iter().copied().chain(std::iter::repeat(0)))
+        .map(|(r, size)| {
             let ring: Vec<RingView> = r
                 .ring
                 .iter()
@@ -1035,45 +1819,77 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
             InputView {
                 key_image: r.key_image.to_hex(),
                 amount: visible_amount(r.amount),
+                size,
                 unavailable: r.ring_unavailable,
-                ages: age_strip(&ring, spent_at, oldest),
+                ages: clock.map(|c| age_strip(&ring, c, oldest)),
                 ring,
             }
         })
         .collect();
 
     let mut has_view_tags = false;
+    let unified_ids = entry.unified_ids_per_output(tx.vout.len());
+    // A pool transaction's outputs have no place in the tree yet.
+    let has_unified_ids = unified_ids.is_some() && !entry.in_pool;
     let outputs = tx
         .vout
         .iter()
-        .map(|o| {
-            let (key, view_tag) = match &o.target {
-                TxOutTarget::Key(k) => (k.clone(), String::new()),
-                TxOutTarget::TaggedKey(t) => {
-                    has_view_tags = true;
-                    (t.key.clone(), t.view_tag.clone())
-                }
-                _ => (String::new(), String::new()),
-            };
+        .enumerate()
+        .map(|(i, o)| {
+            // The key and the tag through the target's own accessors, the same
+            // ones the API uses, so a new output type is taught in one place.
+            let view_tag = o.target.view_tag().unwrap_or_default().to_owned();
+            has_view_tags |= !view_tag.is_empty();
+            let anchor = o
+                .target
+                .encrypted_janus_anchor()
+                .unwrap_or_default()
+                .to_owned();
             OutputView {
-                public_key: key,
+                public_key: o.target.public_key().unwrap_or_default().to_owned(),
                 amount: visible_amount(o.amount),
                 view_tag,
+                anchor,
+                unified_id: unified_ids.and_then(|ids| ids.get(i)).copied(),
             }
         })
         .collect();
 
+    let coinbase_totals = if f.coinbase && !entry.in_pool {
+        Some(CoinbaseTotals {
+            reward: xmr(f.xmr_outputs),
+            split: block_fees(&state, entry).await.and_then(|(fees, paid)| {
+                Some(RewardSplit {
+                    base: xmr(f.xmr_outputs.checked_sub(fees)?),
+                    fees: xmr(fees),
+                    paid,
+                })
+            }),
+        })
+    } else {
+        None
+    };
+
     let parsed = &f.extra;
     let mut extra_fields = Vec::new();
+    // Carrot keeps the tags but changes what they hold: the key under 0x01
+    // (and each one under 0x04) is the sender's ephemeral X25519 key, not an
+    // Ed25519 transaction key. Same 32 bytes, different curve, so the label
+    // says which.
+    let (pub_key_name, additional_name) = if f.carrot {
+        ("Ephemeral public key (X25519)", "Additional ephemeral key")
+    } else {
+        ("Transaction public key", "Additional public key")
+    };
     if let Some(k) = parsed.tx_pub_key_explorer_compat() {
         extra_fields.push(ExtraField {
-            name: "Transaction public key".to_owned(),
+            name: pub_key_name.to_owned(),
             value: k.to_hex(),
         });
     }
     for (i, k) in parsed.additional_pub_keys().iter().enumerate() {
         extra_fields.push(ExtraField {
-            name: format!("Additional public key {}", i + 1),
+            name: format!("{additional_name} {}", i + 1),
             value: k.to_hex(),
         });
     }
@@ -1112,18 +1928,422 @@ pub async fn transaction(State(state): Shared, Path(raw): Path<String>) -> Page 
             size: f.size,
             version_no: f.version,
             rct_type: f.rct_type,
-            ring_size: f.ring_size,
+            ring_min: lens.iter().copied().min().unwrap_or(0),
+            ring_max: lens.iter().copied().max().unwrap_or(0),
+            fcmp_pp: f.fcmp_pp.is_some(),
+            reference_block: f.fcmp_pp.and_then(|x| x.reference_block),
+            n_tree_layers: f.fcmp_pp.and_then(|x| x.n_tree_layers),
+            tree: anonymity_set
+                .and_then(|n| tree_picture(n, root_block.as_ref().map(|(_, root)| root.as_str()))),
+            root_block,
+            anonymity_set: anonymity_set.map(grouped),
+            proof_size: f.fcmp_pp.and_then(|x| x.proof_size).map(grouped),
+            carrot: f.carrot,
             unlock_time: f.unlock_time,
             payment_id: f.payment_id_hex(),
             payment_id8: f.payment_id8_hex(),
             inputs,
             outputs,
             has_view_tags,
+            has_unified_ids,
+            coinbase_totals,
             extra: f.extra_hex(),
             extra_fields,
             extra_undecoded: !parsed.is_complete(),
         },
     )
+}
+
+/// The walkthrough's steps, in order.
+const FCMP_STEPS: [&str; 7] = [
+    "The tree",
+    "Disguise the output",
+    "Prove the right to spend",
+    "Prove it is in the tree",
+    "Tie it to the chain",
+    "Balance the amounts",
+    "What anyone can tell",
+];
+
+/// A walk through an FCMP++ transaction's proof, one step at a time.
+///
+/// Steps switch by anchor and `:target`, as the Content-Security-Policy
+/// allows no script.
+#[derive(Template)]
+#[template(path = "fcmp.html")]
+struct FcmpPage {
+    version: &'static str,
+    query: Option<String>,
+    chain: Option<ChainStatus>,
+    hash: String,
+    steps: Vec<StepLink>,
+    in_pool: bool,
+    /// Bytes, grouped. `None` where this node no longer holds the proof.
+    proof_size: Option<String>,
+    anonymity_set: Option<String>,
+    reference_block: Option<u64>,
+    n_tree_layers: Option<u8>,
+    /// The block carrying the root the proof was checked against, and that
+    /// root.
+    root_block: Option<(u64, String)>,
+    inputs: Vec<FcmpInputView>,
+    /// The membership proof's bytes, grouped, and its share of the proof in
+    /// whole percent.
+    membership: Option<(String, u64)>,
+    tuple_len: usize,
+    sal_len: usize,
+    root_pok_len: usize,
+    fee: String,
+    outputs: usize,
+    range_proofs: usize,
+    /// The two circuit proofs' rows, shown only where they account for the
+    /// membership proof's actual length.
+    shape: Option<ShapeView>,
+    /// The curve the root is on: Selene for an odd layer count.
+    root_curve: Option<&'static str>,
+    /// The proof drawn to scale, one segment per part.
+    map: Vec<ProofSegment>,
+    map_labels: Option<map_labels::MapLabels>,
+    tree: Option<[tree_field::TreeField; 2]>,
+    /// How the tree's size gives each layer's, from the leaves up. Empty
+    /// where the size is not known.
+    layer_sums: Vec<LayerSum>,
+}
+
+/// One layer of a curve tree as a division: `children` members, `width` to
+/// a parent, make `nodes` nodes on `curve`.
+struct LayerSum {
+    children: String,
+    width: u64,
+    nodes: String,
+    curve: &'static str,
+}
+
+/// The layers of a tree of `leaves` outputs as `LayerSum`s.
+fn layer_sums(leaves: u64) -> Vec<LayerSum> {
+    use explorer_core::curve_tree::{Curve, group_width};
+
+    let mut children = leaves;
+    monerod_rpc::types::tree_layers(leaves)
+        .into_iter()
+        .enumerate()
+        .map(|(below, nodes)| {
+            let sum = LayerSum {
+                children: grouped(children),
+                width: group_width(below),
+                nodes: grouped(nodes),
+                curve: Curve::of_layer(below + 1).name(),
+            };
+            children = nodes;
+            sum
+        })
+        .collect()
+}
+
+struct ShapeView {
+    selene_rows: usize,
+    selene_rounds: u32,
+    helios_rows: usize,
+    helios_rounds: u32,
+}
+
+/// One part of the proof along the walkthrough's bar.
+struct ProofSegment {
+    /// Left and width in thousandths of the bar.
+    x: u32,
+    width: u32,
+    class: &'static str,
+    /// The step that explains this part.
+    step: usize,
+    bytes: usize,
+    label: String,
+}
+
+impl ProofSegment {
+    fn x_pct(&self) -> String {
+        format!("{}%", f64::from(self.x) / 10.0)
+    }
+
+    fn width_pct(&self) -> String {
+        format!("{}%", f64::from(self.width) / 10.0)
+    }
+}
+
+/// The bar's coordinate space, and the narrowest a part is drawn so it can
+/// still be seen and clicked.
+const MAP_WIDTH: u32 = 1000;
+const MAP_MIN_SEGMENT: f64 = 14.0;
+
+/// Lays the proof's parts along the bar, each as wide as its share of the
+/// bytes but never narrower than [`MAP_MIN_SEGMENT`].
+fn proof_map(inputs: usize, membership_len: usize) -> Vec<ProofSegment> {
+    use monerod_rpc::types::{FCMP_PP_ROOT_POK_LEN, FCMP_PP_SAL_LEN, FCMP_PP_TUPLE_LEN};
+
+    let mut parts: Vec<(usize, &'static str, usize, String)> = (1..=inputs)
+        .flat_map(|i| {
+            [
+                (
+                    FCMP_PP_TUPLE_LEN,
+                    "tuple",
+                    2,
+                    format!("Input {i}'s disguised output, {FCMP_PP_TUPLE_LEN} bytes"),
+                ),
+                (
+                    FCMP_PP_SAL_LEN,
+                    "sal",
+                    3,
+                    format!("Input {i}'s signature, {FCMP_PP_SAL_LEN} bytes"),
+                ),
+            ]
+        })
+        .collect();
+    let body = membership_len.saturating_sub(FCMP_PP_ROOT_POK_LEN);
+    parts.push((
+        body,
+        "member",
+        4,
+        format!("The membership proof, {} bytes", grouped(body as u64)),
+    ));
+    parts.push((
+        FCMP_PP_ROOT_POK_LEN,
+        "anchor",
+        5,
+        format!("The root anchor, {FCMP_PP_ROOT_POK_LEN} bytes"),
+    ));
+    lay_bar(parts)
+}
+
+/// The most of the bar that widening parts to [`MAP_MIN_SEGMENT`] may take
+/// from the rest before parts of a kind are drawn as one.
+const MAP_MAX_WIDENED: f64 = 20.0;
+
+/// Lays parts, each its bytes, class, step and label, along the bar in
+/// order, or one part of each class, in the order the classes first come,
+/// where drawing every part visibly would take the bar off scale.
+fn lay_bar(parts: Vec<(usize, &'static str, usize, String)>) -> Vec<ProofSegment> {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a chart coordinate, not chain arithmetic"
+    )]
+    let widths = |parts: &[(usize, &'static str, usize, String)]| -> Vec<f64> {
+        let total = parts.iter().map(|p| p.0).sum::<usize>().max(1) as f64;
+        parts
+            .iter()
+            .map(|p| p.0 as f64 / total * f64::from(MAP_WIDTH))
+            .collect()
+    };
+    let widened = |w: &[f64]| -> f64 { w.iter().map(|w| (MAP_MIN_SEGMENT - w).max(0.0)).sum() };
+    let parts = if widened(&widths(&parts)) > MAP_MAX_WIDENED {
+        by_class(parts)
+    } else {
+        parts
+    };
+    let drawn: Vec<f64> = widths(&parts)
+        .into_iter()
+        .map(|w| w.max(MAP_MIN_SEGMENT))
+        .collect();
+    let scale = f64::from(MAP_WIDTH) / drawn.iter().sum::<f64>();
+
+    let mut at = 0.0;
+    parts
+        .into_iter()
+        .zip(drawn)
+        .map(|((bytes, class, step, label), w)| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "within the bar's width by construction"
+            )]
+            let (x, end) = (
+                (at * scale).round() as u32,
+                ((at + w) * scale).round() as u32,
+            );
+            at += w;
+            // A pixel of space either side, so neighbours read as separate.
+            ProofSegment {
+                x: x + 1,
+                width: (end - x).saturating_sub(2),
+                class,
+                step,
+                bytes,
+                label,
+            }
+        })
+        .collect()
+}
+
+/// `parts` with each class's drawn as one, where the class first comes.
+fn by_class(
+    parts: Vec<(usize, &'static str, usize, String)>,
+) -> Vec<(usize, &'static str, usize, String)> {
+    let mut merged: Vec<(usize, &'static str, usize, String, usize)> = Vec::new();
+    for (bytes, class, step, label) in parts {
+        match merged.iter_mut().find(|m| m.1 == class) {
+            Some(m) => {
+                m.0 = m.0.saturating_add(bytes);
+                m.4 += 1;
+            }
+            None => merged.push((bytes, class, step, label, 1)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(bytes, class, step, label, n)| {
+            let what = match class {
+                _ if n == 1 => return (bytes, class, step, label),
+                "tuple" => "disguised outputs",
+                "sal" => "signatures",
+                "pseudo" => "pseudo-outputs",
+                "ring" => "ring signatures",
+                "range" => "range proofs",
+                _ => "parts",
+            };
+            let label = format!("{n} {what}, {} bytes", grouped(bytes as u64));
+            (bytes, class, step, label)
+        })
+        .collect()
+}
+
+struct StepLink {
+    n: usize,
+    title: &'static str,
+}
+
+struct FcmpInputView {
+    key_image: String,
+    pseudo_out: Option<String>,
+    /// `None` where the proof is not held.
+    disguise: Option<Disguise>,
+}
+
+/// An input's re-randomized output: O~, I~ and R.
+struct Disguise {
+    o_tilde: String,
+    i_tilde: String,
+    r: String,
+}
+
+pub async fn fcmp_proof(State(state): Shared, Path(raw): Path<String>) -> Page {
+    let mut chain = status_of(&state).await;
+    let (entry, tx) = match fetch_tx(&state, &mut chain, &raw).await {
+        Ok(found) => found,
+        Err(page) => return page,
+    };
+    if !tx.is_fcmp_pp() {
+        return error_page(
+            chain,
+            StatusCode::NOT_FOUND,
+            "Not an FCMP++ transaction",
+            &format!(
+                "Transaction {} has no FCMP++ proof to walk through.",
+                entry.tx_hash.to_lowercase()
+            ),
+        );
+    }
+    let (anonymity_set, root_block) = tree_facts(&state, &tx, &entry, tx.reference_block()).await;
+    render(
+        StatusCode::OK,
+        &fcmp_page(chain, &entry, &tx, anonymity_set, root_block),
+    )
+}
+
+fn fcmp_page(
+    chain: Option<ChainStatus>,
+    entry: &TxEntry,
+    tx: &TxJson,
+    anonymity_set: Option<u64>,
+    root_block: Option<(u64, String)>,
+) -> FcmpPage {
+    use monerod_rpc::types::{FCMP_PP_ROOT_POK_LEN, FCMP_PP_SAL_LEN, FCMP_PP_TUPLE_LEN};
+
+    let f = TxFacts::from_entry(entry, tx);
+    let prunable = tx.rctsig_prunable.as_ref();
+    let proof_len = prunable.and_then(|p| p.fcmp_pp_len());
+    let parts = prunable.and_then(|p| p.fcmp_pp_parts(tx.vin.len()));
+    let pseudo_outs = tx.pseudo_outs();
+    let disguises = parts
+        .as_ref()
+        .map(|p| p.inputs.as_slice())
+        .unwrap_or_default();
+
+    let inputs = tx
+        .vin
+        .iter()
+        .filter_map(|v| v.as_key())
+        .enumerate()
+        .map(|(i, k)| FcmpInputView {
+            key_image: k.k_image.clone(),
+            pseudo_out: pseudo_outs.get(i).cloned(),
+            disguise: disguises.get(i).map(|d| Disguise {
+                o_tilde: d.o_tilde.to_owned(),
+                i_tilde: d.i_tilde.to_owned(),
+                r: d.r.to_owned(),
+            }),
+        })
+        .collect();
+
+    let layers = tx.n_tree_layers();
+    let shape = parts
+        .as_ref()
+        .zip(layers.and_then(|l| explorer_core::fcmp::MembershipShape::of(tx.vin.len(), l)))
+        .filter(|(p, s)| p.membership_len == s.len)
+        .map(|(_, s)| ShapeView {
+            selene_rows: s.selene_rows,
+            selene_rounds: s.selene_rows.trailing_zeros(),
+            helios_rows: s.helios_rows,
+            helios_rounds: s.helios_rows.trailing_zeros(),
+        });
+    let map = parts
+        .as_ref()
+        .map(|p| proof_map(p.inputs.len(), p.membership_len))
+        .unwrap_or_default();
+    let tree = anonymity_set.and_then(|n| {
+        tree_field::tree_field(
+            n,
+            root_block.as_ref().map(|(_, root)| root.as_str()),
+            tx.reference_block(),
+            root_block.as_ref().map(|(b, _)| *b),
+        )
+    });
+
+    // Without the root anchor, which step 5 counts, as the bar does.
+    let membership = parts.as_ref().zip(proof_len).map(|(p, total)| {
+        let body = p.membership_len.saturating_sub(FCMP_PP_ROOT_POK_LEN);
+        (grouped(body as u64), (body * 100 / total.max(1)) as u64)
+    });
+
+    FcmpPage {
+        version: VERSION,
+        query: None,
+        chain,
+        hash: entry.tx_hash.to_lowercase(),
+        steps: FCMP_STEPS
+            .iter()
+            .enumerate()
+            .map(|(i, &title)| StepLink { n: i + 1, title })
+            .collect(),
+        in_pool: entry.in_pool,
+        proof_size: proof_len.map(|n| grouped(n as u64)),
+        anonymity_set: anonymity_set.map(grouped),
+        reference_block: tx.reference_block(),
+        n_tree_layers: tx.n_tree_layers(),
+        root_block,
+        inputs,
+        membership,
+        tuple_len: FCMP_PP_TUPLE_LEN,
+        sal_len: FCMP_PP_SAL_LEN,
+        root_pok_len: FCMP_PP_ROOT_POK_LEN,
+        fee: xmr(f.fee),
+        outputs: tx.vout.len(),
+        range_proofs: prunable.and_then(|p| p.bpp.as_ref()).map_or(0, Vec::len),
+        shape,
+        root_curve: layers
+            .map(|l| explorer_core::curve_tree::Curve::of_layer(usize::from(l)).name()),
+        map_labels: map_labels::map_labels(&map),
+        map,
+        tree,
+        layer_sums: anonymity_set.map(layer_sums).unwrap_or_default(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1148,17 +2368,6 @@ pub async fn mempool(State(state): Shared, Query(q): Query<SortQuery>) -> Page {
 
     let pool = match state.chain.mempool().await {
         Ok(p) => p,
-        Err(ChainError::NeedsUnrestricted(what)) => {
-            return error_page(
-                chain,
-                StatusCode::NOT_IMPLEMENTED,
-                "The mempool is unavailable",
-                &format!(
-                    "Showing {what} needs an unrestricted daemon. This one runs with \
-                     --restricted-rpc, which blocks /get_transaction_pool."
-                ),
-            );
-        }
         Err(e) => return chain_error_page(chain, &e, "Could not load the mempool"),
     };
 
@@ -1166,26 +2375,15 @@ pub async fn mempool(State(state): Shared, Query(q): Query<SortQuery>) -> Page {
     // pool: the latter always shows the newest transaction as having waited no
     // time at all, even on a pool nothing has arrived in for an hour.
     let asked_at = now();
-
-    let mut txs: Vec<PoolRow> = pool
-        .transactions
-        .iter()
-        .filter_map(|t| {
-            let tx = t.parse_json().ok()?;
-            let f = TxFacts::from_pool(t, &tx);
-            Some(PoolRow {
-                hash: t.id_hash.to_lowercase(),
-                age: age(asked_at, t.receive_time),
-                waiting_secs: waiting_secs(asked_at, t.receive_time),
-                fee: xmr_aligned(f.fee),
-                fee_atomic: f.fee,
-                ring: f.ring_size,
-                size: f.size,
-            })
-        })
-        .collect();
-    if let Some((key, dir)) = active {
-        sort_pool_rows(&mut txs, key, dir);
+    let mut txs = pool_rows(&state.rows, &pool.transactions, active, asked_at);
+    if txs.iter().any(|r| r.reference.is_some())
+        && let (Some(probe), Ok(info)) = (state.chain.tip_probe().await, state.chain.info().await)
+    {
+        let heights = txs.iter().filter_map(|r| r.reference);
+        let sizes = state.chain.tree_sizes(heights, probe, info.height).await;
+        for r in &mut txs {
+            r.tree = tree_of(r.reference, &sizes);
+        }
     }
 
     render(
@@ -1197,6 +2395,8 @@ pub async fn mempool(State(state): Shared, Query(q): Query<SortQuery>) -> Page {
             waiting_sort: column_sort("/mempool", SortKey::Waiting, active),
             fee_sort: column_sort("/mempool", SortKey::Fee, active),
             size_sort: column_sort("/mempool", SortKey::Size, active),
+            total: pool.transactions.len(),
+            cut: pool.transactions.len() > MEMPOOL_ROWS,
             txs,
         },
     )
@@ -1221,22 +2421,29 @@ pub async fn alt_blocks(State(state): Shared) -> Page {
         Err(e) => return chain_error_page(chain, &e, "Could not load alternative chains"),
     };
 
-    let chains = alt
-        .chains
-        .iter()
-        .map(|c| AltChainRow {
-            height: c.height,
-            length: c.length,
-            tip: c.height.saturating_add(c.length).saturating_sub(1),
-            block_hash: c.block_hash.to_lowercase(),
-            // ChainInfo has no accessor of its own; reassembling here keeps
-            // one call site rather than adding a fourth place a 128-bit
-            // value could be read from the wrong top word.
-            difficulty: monerod_rpc::types::reassemble_u128(c.difficulty, c.difficulty_top64)
-                .to_string(),
-            parent: c.main_chain_parent_block.to_lowercase(),
-        })
-        .collect();
+    let info = match state.chain.info().await {
+        Ok(i) => i,
+        Err(e) => return chain_error_page(chain, &e, "Could not load alternative chains"),
+    };
+    let tip = info.height.saturating_sub(1);
+
+    let mut main = std::collections::BTreeMap::new();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for h in alt_graph::main_heights(&alt.chains, tip) {
+        match runs.last_mut() {
+            Some((_, end)) if *end + 1 == h => *end = h,
+            _ => runs.push((h, h)),
+        }
+    }
+    for (start, end) in runs {
+        if let Ok(r) = state.chain.headers_range(start, end).await {
+            main.extend(
+                r.headers
+                    .into_iter()
+                    .map(|h| (h.height, h.hash.to_lowercase())),
+            );
+        }
+    }
 
     render(
         StatusCode::OK,
@@ -1244,7 +2451,8 @@ pub async fn alt_blocks(State(state): Shared) -> Page {
             version: VERSION,
             query: None,
             chain,
-            chains,
+            count: alt.chains.len(),
+            graph: alt_graph::alt_graph(&alt.chains, tip, &info.top_block_hash, &main),
         },
     )
 }
@@ -1270,11 +2478,13 @@ pub async fn search(State(state): Shared, Query(q): Query<SearchQuery>) -> Respo
         }
         Ok(BlockId::Hash(hash)) => {
             // A block hash and a transaction hash are the same shape, so the
-            // only way to tell them apart is to look one up.
-            let target = if state.chain.block(BlockId::Hash(hash)).await.is_ok() {
-                "block"
-            } else {
-                "tx"
+            // only way to tell them apart is to look one up. Only a not-found
+            // answer means it is not a block: a daemon that failed any other
+            // way sends the reader to the block page, which reports the
+            // failure, rather than to a transaction page that says "not found".
+            let target = match state.chain.block(BlockId::Hash(hash)).await {
+                Err(e) if e.is_not_found() => "tx",
+                _ => "block",
             };
             return axum::response::Redirect::to(&format!("/{target}/{cleaned}")).into_response();
         }
@@ -1286,7 +2496,7 @@ pub async fn search(State(state): Shared, Query(q): Query<SearchQuery>) -> Respo
         chain,
         StatusCode::NOT_FOUND,
         "Nothing found",
-        "Enter a block height, a block hash, or a transaction hash. Monero has \
+        "Enter a block number, a block hash, or a transaction hash. Monero has \
          no address index, so addresses cannot be searched.",
         Some(raw),
     )
@@ -1371,10 +2581,8 @@ mod example {
     ];
 }
 
-/// The API documentation, which is what the `API` link in the header points at.
-///
-/// It used to point at `/api/networkinfo`, which answered a reader looking for
-/// documentation with a wall of raw JSON.
+/// The API documentation, which is what the `API` link in the header points
+/// at: a reader looking for documentation gets a page, not raw JSON.
 pub async fn api_docs(State(state): Shared) -> Page {
     let chain = status_of(&state).await;
 
@@ -1401,6 +2609,7 @@ pub async fn api_docs(State(state): Shared) -> Page {
             max_transactions_limit: crate::api::handlers::MAX_TRANSACTIONS_LIMIT,
             max_mempool_limit: crate::api::handlers::MAX_MEMPOOL_LIMIT,
             max_block_range: state.limits.block_range,
+            max_range_mib: explorer_core::rpc_source::MAX_RANGE_KIB / 1024,
             min_postfix_len: state.limits.postfix_min,
             max_postfix_len: state.limits.postfix_max,
             min_anonymity_set: crate::api::handlers::MIN_ANONYMITY_SET,
@@ -1448,6 +2657,9 @@ mod tests {
 
     use super::*;
 
+    const FUNNEL_SPAN: u32 = STRIP_WIDTH - FUNNEL_LEFT - FUNNEL_RIGHT;
+    const FUNNEL_CENTRE: u32 = FUNNEL_LEFT + FUNNEL_SPAN / 2;
+
     fn status() -> Option<ChainStatus> {
         Some(ChainStatus {
             height: 3_185_431,
@@ -1456,7 +2668,38 @@ mod tests {
             pool: 7,
             target: 0,
             syncing: false,
+            daemon: Some("v0.18.3.3".to_owned()),
         })
+    }
+
+    /// The header names the daemon by its release tag, the version in bold,
+    /// and leaves it out when a restricted daemon keeps it back.
+    #[test]
+    fn the_header_names_the_daemon_release() {
+        assert_eq!(
+            daemon_release("0.18.3.3-release").as_deref(),
+            Some("v0.18.3.3")
+        );
+        assert_eq!(
+            daemon_release("0.19.0.0-beta.3.1-release").as_deref(),
+            Some("v0.19.0.0-beta.3.1")
+        );
+        assert_eq!(daemon_release(""), None);
+
+        let mut page = ErrorPage {
+            version: VERSION,
+            query: None,
+            chain: status(),
+            title: "Page not found".to_owned(),
+            detail: String::new(),
+        };
+        let html = page.render().expect("renders");
+        assert!(html.contains("<span>monerod <b>v0.18.3.3</b></span>"));
+
+        if let Some(c) = page.chain.as_mut() {
+            c.daemon = None;
+        }
+        assert!(!page.render().expect("renders").contains("monerod"));
     }
 
     /// The defence the whole HTML layer rests on. Escaping is the default,
@@ -1518,7 +2761,7 @@ mod tests {
             detail: "d".to_owned(),
         };
         let html = page.render().expect("renders");
-        assert!(html.contains("3185431"));
+        assert!(html.contains("Blocks <b>3185431</b>"), "{html}");
         assert!(html.contains("mainnet"));
         assert!(html.contains("691253322598"));
     }
@@ -1539,6 +2782,7 @@ mod tests {
             max_transactions_limit: h::MAX_TRANSACTIONS_LIMIT,
             max_mempool_limit: h::MAX_MEMPOOL_LIMIT,
             max_block_range: limits.block_range,
+            max_range_mib: explorer_core::rpc_source::MAX_RANGE_KIB / 1024,
             min_postfix_len: limits.postfix_min,
             max_postfix_len: limits.postfix_max,
             min_anonymity_set: h::MIN_ANONYMITY_SET,
@@ -1807,8 +3051,11 @@ mod tests {
                 );
             }
         }
+        // A floor, not a count: it proves the loop above read the recordings.
+        // The recordings are FCMP++ transactions, whose inputs name no ring
+        // members, and hold 45.
         assert!(
-            hashes > 50,
+            hashes > 30,
             "only {hashes} hashes were examined, so this test is not reading \
              the recordings"
         );
@@ -1820,6 +3067,15 @@ mod tests {
             .filter(|run| run.len() == 64)
             .map(ToOwned::to_owned)
             .collect()
+    }
+
+    /// Blocks per hour and per day at the two-minute target.
+    const BLOCKS_PER_HOUR: u64 = 30;
+    const BLOCKS_PER_DAY: u64 = 720;
+
+    /// Ages back from `at`, every block two minutes apart.
+    fn clock(at: u64) -> Clock {
+        Clock { at, v2: Some(1) }
     }
 
     fn ring_at(heights: &[u64]) -> Vec<RingView> {
@@ -1838,7 +3094,11 @@ mod tests {
     fn the_oldest_member_anchors_the_left_edge_and_the_newest_the_spend() {
         let spent_at = 3_000_000;
         let axis = 40 * BLOCKS_PER_DAY;
-        let strip = age_strip(&ring_at(&[spent_at, spent_at - axis]), spent_at, axis);
+        let strip = age_strip(
+            &ring_at(&[spent_at, spent_at - axis]),
+            clock(spent_at),
+            axis,
+        );
 
         assert_eq!(
             strip.marks.first().map(|m| m.stem),
@@ -1861,7 +3121,7 @@ mod tests {
             .iter()
             .map(|age| spent_at - age)
             .collect();
-        let strip = age_strip(&ring_at(&heights), spent_at, 30 * BLOCKS_PER_DAY);
+        let strip = age_strip(&ring_at(&heights), clock(spent_at), 30 * BLOCKS_PER_DAY);
 
         let mut checked = 0;
         for pair in strip.marks.windows(2) {
@@ -1890,7 +3150,7 @@ mod tests {
                 spent_at - 6 * BLOCKS_PER_HOUR,
                 spent_at - 365 * BLOCKS_PER_DAY,
             ]),
-            spent_at,
+            clock(spent_at),
             365 * BLOCKS_PER_DAY,
         );
 
@@ -1913,7 +3173,7 @@ mod tests {
         let spent_at = 3_000_000;
         let strip = age_strip(
             &ring_at(&[spent_at - BLOCKS_PER_DAY, spent_at - 365 * BLOCKS_PER_DAY]),
-            spent_at,
+            clock(spent_at),
             365 * BLOCKS_PER_DAY,
         );
 
@@ -1927,7 +3187,7 @@ mod tests {
         let spent_at = 3_000_000;
         let strip = age_strip(
             &ring_at(&[spent_at, spent_at - 2 * BLOCKS_PER_DAY]),
-            spent_at,
+            clock(spent_at),
             2 * BLOCKS_PER_DAY,
         );
 
@@ -1965,8 +3225,8 @@ mod tests {
         let spent_at = 3_000_000;
         let ring = ring_at(&[spent_at, spent_at - BLOCKS_PER_DAY]);
 
-        let alone = age_strip(&ring, spent_at, BLOCKS_PER_DAY);
-        let beside_an_older_input = age_strip(&ring, spent_at, 365 * BLOCKS_PER_DAY);
+        let alone = age_strip(&ring, clock(spent_at), BLOCKS_PER_DAY);
+        let beside_an_older_input = age_strip(&ring, clock(spent_at), 365 * BLOCKS_PER_DAY);
 
         assert_eq!(alone.marks.last().map(|m| m.stem), Some(0));
         assert!(
@@ -1977,12 +3237,81 @@ mod tests {
 
     #[test]
     fn an_age_is_labelled_in_the_unit_a_reader_would_use() {
-        assert_eq!(age_label(0), "0 min");
-        assert_eq!(age_label(5), "10 min");
-        assert_eq!(age_label(BLOCKS_PER_HOUR), "1 h");
-        assert_eq!(age_label(BLOCKS_PER_DAY), "1 d");
-        assert_eq!(age_label(29 * BLOCKS_PER_DAY), "29 d");
-        assert_eq!(age_label(45 * BLOCKS_PER_DAY), "1 mo");
+        let c = clock(3_000_000);
+        assert_eq!(c.age(0), "0 min");
+        assert_eq!(c.age(5), "10 min");
+        assert_eq!(c.age(BLOCKS_PER_HOUR), "1 h");
+        assert_eq!(c.age(BLOCKS_PER_DAY), "1 d");
+        assert_eq!(c.age(29 * BLOCKS_PER_DAY), "29 d");
+        assert_eq!(c.age(45 * BLOCKS_PER_DAY), "1 mo");
+    }
+
+    /// Before hard fork 2 an hour was sixty blocks, and the strip's labels
+    /// and marks say so.
+    #[test]
+    fn a_strip_from_before_hard_fork_2_counts_a_minute_a_block() {
+        let early = Clock {
+            at: 2_000,
+            v2: Some(3_000),
+        };
+        let strip = age_strip(&ring_at(&[1_940, 2_000 - 1_440]), early, 1_440);
+        assert_eq!(strip.marks.first().map(|m| m.label.as_str()), Some("1 h"));
+        let hour = strip
+            .ticks
+            .iter()
+            .find(|t| t.label == "1h")
+            .expect("an hour tick");
+        assert_eq!(hour.x, strip_x(60, 1_440));
+        let day = strip
+            .ticks
+            .iter()
+            .find(|t| t.label == "1d")
+            .expect("a day tick");
+        assert_eq!(day.x, strip_x(1_440, 1_440));
+    }
+
+    /// Blocks were a minute apart before hard fork 2, so an age reaching
+    /// back past it is shorter than two minutes a block makes it.
+    #[test]
+    fn blocks_before_hard_fork_2_count_a_minute_each() {
+        let v2 = 1_000;
+        let after = Clock {
+            at: 1_100,
+            v2: Some(v2),
+        };
+        assert_eq!(after.minutes(100), Some(200), "all after the fork");
+        assert_eq!(
+            after.minutes(101),
+            Some(202),
+            "the fork block itself is two minutes on"
+        );
+        assert_eq!(after.minutes(102), Some(203), "and the gap before it one");
+        assert_eq!(after.minutes(300), Some(2 * 101 + 199));
+        let before = Clock {
+            at: 500,
+            v2: Some(v2),
+        };
+        assert_eq!(before.minutes(60), Some(60));
+        assert_eq!(before.age(60), "1 h");
+        // The block at or just younger than each time.
+        for minutes in [0, 60, 201, 202, 203, 401, 10_000] {
+            let blocks = after.blocks(minutes).unwrap();
+            assert!(after.minutes(blocks).unwrap() <= minutes, "{minutes} min");
+            assert!(
+                after.minutes(blocks + 1).unwrap() > minutes,
+                "{minutes} min"
+            );
+        }
+        assert_eq!(after.blocks(202), Some(101));
+        assert_eq!(after.blocks(401), Some(300));
+        assert_eq!(before.blocks(60), Some(60));
+        let unknown = Clock {
+            at: 1_100,
+            v2: None,
+        };
+        assert_eq!((unknown.minutes(5), unknown.blocks(60)), (None, None));
+        assert_eq!(unknown.age(5), "5 blocks");
+        assert_eq!(unknown.age(1), "1 block");
     }
 
     /// A ring member mined after the spending block would underflow an
@@ -1990,7 +3319,7 @@ mod tests {
     /// must not render a wrong chart if it does.
     #[test]
     fn a_ring_member_newer_than_the_spend_does_not_wrap() {
-        let strip = age_strip(&ring_at(&[3_000_100]), 3_000_000, 0);
+        let strip = age_strip(&ring_at(&[3_000_100]), clock(3_000_000), 0);
 
         assert_eq!(
             strip.marks.first().map(|m| m.stem),
@@ -2022,6 +3351,24 @@ mod tests {
     /// It first read "51 recipients", which the Outputs column beside it
     /// already said -- a tag that repeats an adjacent cell costs a reader
     /// attention and tells them nothing.
+    /// A block is named by its number on every page, never by "height".
+    #[test]
+    fn a_block_is_called_by_its_number() {
+        let index = index_page().render().expect("renders");
+        assert!(index.contains(r#"<th class="num">Block</th>"#), "{index}");
+        assert!(index.contains(r#"placeholder="Block number, block hash, or transaction hash""#));
+        let block = block_page().render().expect("renders");
+        assert!(block.contains("<dt>Block number</dt>"), "{block}");
+        let tx = tx_page().render().expect("renders");
+        assert!(
+            tx.contains(r#"<th class="num">Block number</th><th>Output key</th>"#),
+            "{tx}"
+        );
+        for html in [index, block, tx] {
+            assert!(!html.to_lowercase().contains(">height<"));
+        }
+    }
+
     #[test]
     fn the_p2pool_tag_says_more_than_the_output_count_does() {
         let html = block_page().render().expect("renders");
@@ -2068,6 +3415,103 @@ mod tests {
         assert!(!is_p2pool(false, 2, false));
     }
 
+    /// A pool spend's ages count from the tip, which is unknown without the
+    /// chain's status; a mined one's from its own block.
+    #[test]
+    fn ring_ages_are_counted_from_a_known_height_only() {
+        let entry = |in_pool: bool| -> TxEntry {
+            serde_json::from_value(serde_json::json!({
+                "tx_hash": format!("{:064x}", 7), "as_hex": "", "as_json": "{}",
+                "block_height": 5, "block_timestamp": 0, "confirmations": 1,
+                "in_pool": in_pool, "double_spend_seen": false, "output_indices": [],
+            }))
+            .unwrap()
+        };
+        let chain = status();
+        assert_eq!(spent_height(&entry(false), None), Some(5));
+        assert_eq!(spent_height(&entry(true), chain.as_ref()), Some(3_185_431));
+        assert_eq!(spent_height(&entry(true), None), None);
+
+        let mut page = tx_page();
+        let ring = (0..16)
+            .map(|i| RingView {
+                height: 100 + i,
+                public_key: "2".repeat(64),
+                tx_hash: "3".repeat(64),
+            })
+            .collect();
+        page.inputs[1].ring = ring;
+        page.inputs[1].ages = None;
+        let html = page.render().unwrap();
+        assert!(html.contains("the members' ages are unknown"), "{html}");
+        page.inputs[1].ages = Some(age_strip(&page.inputs[1].ring, clock(200), 100));
+        let html = page.render().unwrap();
+        assert!(!html.contains("the members' ages are unknown"));
+        assert!(html.contains("class=\"ring-ages\""));
+    }
+
+    /// A pool spend's page, with the chain's status out of reach, shows its
+    /// ring without ages rather than ages counted from block 0; with the
+    /// status, it shows them.
+    #[tokio::test]
+    async fn a_pool_spends_ring_ages_wait_for_the_tip() {
+        let mut fetched: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/mainnet/get_transactions_rct5_clsag.json"
+        ))
+        .unwrap();
+        let entry = fetched["txs"].as_array_mut().unwrap().last_mut().unwrap();
+        entry["in_pool"] = true.into();
+        let hash = entry["tx_hash"].as_str().unwrap().to_owned();
+        let daemon = |status: bool| {
+            let fetched = fetched.clone();
+            explorer_core::fake_daemon::FakeDaemon::start(move |what, body| match what {
+                "get_transactions" => fetched.clone(),
+                "get_outs" => {
+                    let n = body["outputs"].as_array().map_or(0, Vec::len);
+                    let out = serde_json::json!({
+                        "key": "1".repeat(64), "mask": "2".repeat(64), "unlocked": true,
+                        "height": 3_185_000, "txid": "3".repeat(64),
+                    });
+                    serde_json::json!({"outs": vec![out; n], "status": "OK"})
+                }
+                "get_info" if status => serde_json::json!({"jsonrpc": "2.0", "id": "0", "result": {
+                    "height": 3_185_431, "target_height": 0, "difficulty": 1, "difficulty_top64": 0,
+                    "target": 120, "tx_count": 1, "tx_pool_size": 1, "alt_blocks_count": 0,
+                    "outgoing_connections_count": 0, "incoming_connections_count": 0,
+                    "white_peerlist_size": 0, "grey_peerlist_size": 0, "testnet": false,
+                    "stagenet": false, "nettype": "mainnet", "top_block_hash": "",
+                    "cumulative_difficulty": 1, "cumulative_difficulty_top64": 0,
+                    "block_size_limit": 0, "block_size_median": 0, "start_time": 0,
+                    "version": "test", "restricted": false, "status": "OK",
+                }}),
+                _ => serde_json::json!({"jsonrpc": "2.0", "id": "0",
+                    "error": {"code": -9, "message": "busy"}}),
+            })
+        };
+        let page = |daemon: explorer_core::fake_daemon::FakeDaemon| {
+            let hash = hash.clone();
+            async move {
+                let state = std::sync::Arc::new(AppState {
+                    chain: daemon.source(),
+                    limits: crate::config::Limits::default(),
+                    paths: crate::tree_paths::PathCache::default(),
+                    recent: Default::default(),
+                    rows: Default::default(),
+                });
+                transaction(State(state), Path(hash)).await.1
+            }
+        };
+        let without = page(daemon(false)).await;
+        assert!(
+            without.contains("the members' ages are unknown"),
+            "{without}"
+        );
+        assert!(!without.contains("class=\"ring-ages\""));
+        let with = page(daemon(true)).await;
+        assert!(with.contains("class=\"ring-ages\""), "{with}");
+        assert!(with.contains("<title>431 blocks old</title>"), "{with}");
+    }
+
     /// The hints are plain markup: no script, no external reference, and they
     /// work with JavaScript off, which is the only way they can work here.
     #[test]
@@ -2088,8 +3532,9 @@ mod tests {
         );
         assert_eq!(
             html.matches(r#"<svg class="icon""#).count(),
-            html.matches("<details class=\"hint\">").count(),
-            "every hint should carry the icon"
+            html.matches("<details class=\"hint\">").count()
+                + html.matches(r#"<details class="note-chip""#).count(),
+            "every hint and column note should carry the icon"
         );
         assert!(!html.to_lowercase().contains("<script"));
         assert!(!html.contains("onclick"));
@@ -2127,8 +3572,8 @@ mod tests {
             html.contains("signals"),
             "the hint does not say what a minor version is"
         );
-        // The upgrade cadence this used to claim stopped being true in 2022,
-        // and a page that dates itself is worse than one that does not.
+        // Forks follow no fixed schedule, and a page that dates itself is
+        // worse than one that does not.
         assert!(
             !html.contains("every six months"),
             "the hint is claiming a fork schedule again"
@@ -2496,9 +3941,9 @@ mod tests {
 
     /// The page documents the endpoint, not the daemon behind it.
     ///
-    /// It used to carry a notice saying whether a startup probe had found
-    /// `get_txids_loose`. A daemon that lacks the call says so in the answer
-    /// to the request that needed it, which is where a caller is looking.
+    /// It carries no notice about whether the daemon has `get_txids_loose`.
+    /// A daemon that lacks the call says so in the answer to the request that
+    /// needed it, which is where a caller is looking.
     #[test]
     fn the_page_does_not_report_on_the_daemon_behind_it() {
         let html = api_page().render().expect("renders");
@@ -2542,7 +3987,23 @@ mod tests {
                 hash: "a".repeat(64),
             }],
             page: 0,
+            older: Some(1),
         }
+    }
+
+    /// With no older page, the pager's link to one is dead.
+    #[test]
+    fn the_last_page_links_to_no_older_one() {
+        let mut page = index_page();
+        page.older = None;
+        let html = page.render().expect("renders");
+        assert!(html.contains("<span>Older &rarr;</span>"));
+        assert!(
+            index_page()
+                .render()
+                .expect("renders")
+                .contains(r#"<a href="/page/1">Older"#)
+        );
     }
 
     fn block_tx(coinbase: bool) -> BlockTxRow {
@@ -2550,10 +4011,15 @@ mod tests {
             hash: if coinbase { "c" } else { "d" }.repeat(64),
             coinbase,
             p2pool: is_p2pool(coinbase, 2, coinbase),
+            inputs: if coinbase { 0 } else { 3 },
             outputs: 2,
             fee: if coinbase { "0.0" } else { "0.00071136" }.to_owned(),
             fee_atomic: if coinbase { 0 } else { 711_360_000 },
             ring: if coinbase { 0 } else { 16 },
+            ring_max: if coinbase { 0 } else { 16 },
+            full_chain: false,
+            reference: None,
+            tree: None,
             size: 2_223,
         }
     }
@@ -2574,35 +4040,41 @@ mod tests {
             size: 40_490,
             weight: 40_490,
             tx_count: table_tx_count(&txs),
+            unreadable: 0,
+            unlisted: 0,
+            orphan: false,
             reward: "0.60160672".to_owned(),
             difficulty: "691253322598".to_owned(),
             nonce: 7,
             major_version: 16,
             minor_version: 16,
+            tree_root: None,
+            tree_layers: None,
+            tree_growth: None,
             fee_sort: column_sort("/block/3185430", SortKey::Fee, None),
             size_sort: column_sort("/block/3185430", SortKey::Size, None),
             txs,
         }
     }
 
-    fn pool_row(waiting_secs: u64, fee_atomic: u64, size: u64) -> PoolRow {
+    fn pool_row(size: u64) -> PoolRow {
         PoolRow {
             hash: "e".repeat(64),
             age: "00:00:00".to_owned(),
-            waiting_secs,
+            inputs: 2,
+            outputs: 3,
             fee: "0.0".to_owned(),
-            fee_atomic,
             ring: 16,
+            ring_max: 16,
+            full_chain: false,
+            reference: None,
+            tree: None,
             size,
         }
     }
 
     fn mempool_page(active: Option<(SortKey, SortDir)>) -> MempoolPage {
-        let txs = vec![
-            pool_row(10, 300, 2_000),
-            pool_row(30, 100, 1_000),
-            pool_row(20, 200, 3_000),
-        ];
+        let txs = vec![pool_row(2_000), pool_row(1_000), pool_row(3_000)];
         MempoolPage {
             version: VERSION,
             query: None,
@@ -2610,6 +4082,8 @@ mod tests {
             waiting_sort: column_sort("/mempool", SortKey::Waiting, active),
             fee_sort: column_sort("/mempool", SortKey::Fee, active),
             size_sort: column_sort("/mempool", SortKey::Size, active),
+            total: txs.len(),
+            cut: false,
             txs,
         }
     }
@@ -2712,31 +4186,164 @@ mod tests {
         assert_eq!(asc.state, "asc");
     }
 
+    /// A pool transaction as the daemon lists it, received at `received`,
+    /// paying `fee` and `size` bytes long.
+    fn pool_tx(received: u64, fee: u64, size: u64) -> PoolTxInfo {
+        let tx = serde_json::json!({
+            "version": 2, "unlock_time": 0, "extra": [], "vout": [],
+            "vin": [{"key": {"amount": 0, "key_offsets": vec![1; 16], "k_image": "ab".repeat(32)}}],
+        });
+        serde_json::from_value(serde_json::json!({
+            "id_hash": format!("{fee:064x}"), "tx_json": tx.to_string(), "blob_size": size,
+            "fee": fee, "max_used_block_id_hash": "", "max_used_block_height": 0,
+            "kept_by_block": false, "last_failed_height": 0, "last_failed_id_hash": "",
+            "receive_time": received, "relayed": true, "last_relayed_time": 0,
+            "do_not_relay": false, "double_spend_seen": false, "tx_blob": "",
+        }))
+        .expect("a pool transaction")
+    }
+
+    /// Each row's fee, which `pool_tx` writes into its hash.
+    fn fees(rows: &[PoolRow]) -> Vec<u64> {
+        rows.iter()
+            .map(|r| u64::from_str_radix(&r.hash, 16).expect("a fee"))
+            .collect()
+    }
+
     #[test]
     fn rows_sort_by_the_requested_column_in_the_requested_direction() {
-        let mut rows = vec![
-            pool_row(10, 300, 2_000),
-            pool_row(30, 100, 1_000),
-            pool_row(20, 200, 3_000),
+        let pool = [
+            pool_tx(990, 300, 2_000),
+            pool_tx(970, 100, 1_000),
+            pool_tx(980, 200, 3_000),
         ];
+        let pool = pool.map(Arc::new);
+        let rows = |key, dir| pool_rows(&RowCache::default(), &pool, Some((key, dir)), 1_000);
 
-        sort_pool_rows(&mut rows, SortKey::Fee, SortDir::Asc);
+        assert_eq!(fees(&rows(SortKey::Fee, SortDir::Asc)), [100, 200, 300]);
+        // Waiting 30, 20 and 10 seconds.
         assert_eq!(
-            rows.iter().map(|r| r.fee_atomic).collect::<Vec<_>>(),
-            vec![100, 200, 300]
+            fees(&rows(SortKey::Waiting, SortDir::Desc)),
+            [100, 200, 300]
+        );
+        assert_eq!(fees(&rows(SortKey::Waiting, SortDir::Asc)), [300, 200, 100]);
+        let sizes: Vec<u64> = rows(SortKey::Size, SortDir::Asc)
+            .iter()
+            .map(|r| r.size)
+            .collect();
+        assert_eq!(sizes, [1_000, 2_000, 3_000]);
+        assert!(
+            rows(SortKey::Fee, SortDir::Asc)
+                .iter()
+                .all(|r| r.ring == 16)
+        );
+    }
+
+    /// A row's figures are worked out once per transaction: a second view
+    /// takes them from the cache, not from parsing the transaction again;
+    /// and a pool row's are kept apart from the same transaction's block row.
+    #[test]
+    fn a_rows_figures_are_worked_out_once() {
+        let rows = RowCache::default();
+        let mut tx = pool_tx(0, 7, 900);
+        let first = rows.of_pool_tx(&tx).expect("figures");
+        assert_eq!((first.size, first.fee, first.ring), (900, 7, 16));
+        tx.tx_json = "not json".to_owned();
+        assert_eq!(rows.of_pool_tx(&tx), Some(first), "not parsed again");
+
+        let mined: TxEntry = serde_json::from_value(serde_json::json!({
+            "tx_hash": format!("{:064x}", 7), "as_hex": "00".repeat(50),
+            "as_json": r#"{"version":2,"unlock_time":0,"extra":[],"vout":[],"vin":[{"gen":{"height":5}}]}"#,
+            "block_height": 5, "block_timestamp": 0, "confirmations": 1, "in_pool": false,
+            "double_spend_seen": false, "output_indices": [],
+        }))
+        .expect("a mined entry");
+        let block = rows.of_block_tx(&mined).expect("figures");
+        assert!(block.coinbase && block.size == 50, "{block:?}");
+
+        // A pruned entry is shown as it is, and not kept.
+        let mut pruned: TxEntry = serde_json::from_value(serde_json::json!({
+            "tx_hash": format!("{:064x}", 8), "as_hex": "", "pruned_as_hex": "00".repeat(40),
+            "prunable_as_hex": "",
+            "as_json": r#"{"version":2,"unlock_time":0,"extra":[],"vout":[],"vin":[{"key":{"amount":0,"key_offsets":[1],"k_image":"ab"}}]}"#,
+            "block_height": 5, "block_timestamp": 0, "confirmations": 1, "in_pool": false,
+            "double_spend_seen": false, "output_indices": [],
+        }))
+        .expect("a pruned entry");
+        assert!(rows.of_block_tx(&pruned).is_some());
+        pruned.as_json = "not json".to_owned();
+        assert_eq!(rows.of_block_tx(&pruned), None, "parsed again");
+    }
+
+    /// Each pool row counts the outputs its transaction spends and makes,
+    /// from the transaction itself.
+    #[test]
+    fn the_mempool_table_counts_each_transactions_inputs_and_outputs() {
+        let mut tx = pool_tx(0, 1, 1);
+        tx.tx_json = serde_json::json!({
+            "version": 2, "unlock_time": 0, "extra": [],
+            "vin": (0..3).map(|_| serde_json::json!({"key": {
+                "amount": 0, "key_offsets": [1], "k_image": "ab".repeat(32),
+            }})).collect::<Vec<_>>(),
+            "vout": (0..5).map(|_| serde_json::json!({
+                "amount": 0, "target": {"key": "cd".repeat(32)},
+            })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let rows = pool_rows(&RowCache::default(), &[Arc::new(tx)], None, 0);
+        assert_eq!((rows[0].inputs, rows[0].outputs), (3, 5));
+
+        let html = mempool_page(None).render().expect("renders");
+        assert!(html.contains(
+            r#"<th class="num">Inputs</th>
+      <th class="num">Outputs</th>"#
+        ));
+        assert_eq!(
+            html.matches(
+                r#"<td class="num">2</td>
+      <td class="num">3</td>"#
+            )
+            .count(),
+            3
+        );
+    }
+
+    /// A pool longer than the page is sorted whole and cut after, so the
+    /// rows shown are the top of the whole pool, and says so.
+    #[test]
+    fn a_long_pool_shows_the_top_of_its_sorted_whole() {
+        let pool: Vec<Arc<PoolTxInfo>> = (1..=MEMPOOL_ROWS as u64 + 20)
+            .map(|fee| Arc::new(pool_tx(0, fee, 1)))
+            .collect();
+        let rows = pool_rows(
+            &RowCache::default(),
+            &pool,
+            Some((SortKey::Fee, SortDir::Desc)),
+            0,
+        );
+        assert_eq!(rows.len(), MEMPOOL_ROWS);
+        let fees = fees(&rows);
+        assert_eq!(fees.first(), Some(&(MEMPOOL_ROWS as u64 + 20)));
+        assert_eq!(fees.last(), Some(&21));
+        let unsorted = pool_rows(&RowCache::default(), &pool, None, 0);
+        assert_eq!(
+            unsorted[0].hash,
+            format!("{:064x}", 1),
+            "the daemon's order"
         );
 
-        sort_pool_rows(&mut rows, SortKey::Waiting, SortDir::Desc);
-        assert_eq!(
-            rows.iter().map(|r| r.waiting_secs).collect::<Vec<_>>(),
-            vec![30, 20, 10]
+        let mut page = mempool_page(None);
+        assert!(
+            !page
+                .render()
+                .expect("renders")
+                .contains("Showing the first")
         );
-
-        sort_pool_rows(&mut rows, SortKey::Size, SortDir::Asc);
-        assert_eq!(
-            rows.iter().map(|r| r.size).collect::<Vec<_>>(),
-            vec![1_000, 2_000, 3_000]
-        );
+        page.total = pool.len();
+        page.cut = true;
+        let html = page.render().expect("renders");
+        assert!(html.contains(&format!("{} transactions", MEMPOOL_ROWS + 20)));
+        assert!(html.contains(&format!("Showing the first {MEMPOOL_ROWS}, in the")));
     }
 
     #[test]
@@ -2813,16 +4420,16 @@ mod tests {
     /// whichever direction was asked for, rather than flipping arbitrarily.
     #[test]
     fn rows_tied_on_the_sort_key_keep_their_original_order() {
-        let mut rows = vec![
-            pool_row(5, 100, 1),
-            pool_row(5, 200, 2),
-            pool_row(5, 300, 3),
-        ];
-        sort_pool_rows(&mut rows, SortKey::Waiting, SortDir::Desc);
-        assert_eq!(
-            rows.iter().map(|r| r.fee_atomic).collect::<Vec<_>>(),
-            vec![100, 200, 300]
-        );
+        let pool = [pool_tx(5, 100, 1), pool_tx(5, 200, 2), pool_tx(5, 300, 3)].map(Arc::new);
+        for dir in [SortDir::Desc, SortDir::Asc] {
+            let rows = pool_rows(
+                &RowCache::default(),
+                &pool,
+                Some((SortKey::Waiting, dir)),
+                10,
+            );
+            assert_eq!(fees(&rows), [100, 200, 300]);
+        }
     }
 
     #[test]
@@ -2883,7 +4490,16 @@ mod tests {
             size: 2_223,
             version_no: 2,
             rct_type: 6,
-            ring_size: 16,
+            ring_min: 16,
+            ring_max: 16,
+            fcmp_pp: false,
+            reference_block: None,
+            n_tree_layers: None,
+            root_block: None,
+            anonymity_set: None,
+            tree: None,
+            proof_size: None,
+            carrot: false,
             unlock_time: 0,
             payment_id: String::new(),
             payment_id8: String::new(),
@@ -2891,20 +4507,22 @@ mod tests {
                 InputView {
                     key_image: "1".repeat(64),
                     amount: visible_amount(0),
+                    size: 1,
                     unavailable: false,
                     ring: vec![RingView {
                         height: 3_100_000,
                         public_key: "2".repeat(64),
                         tx_hash: "3".repeat(64),
                     }],
-                    ages: age_strip(&[], 0, 0),
+                    ages: Some(age_strip(&[], clock(0), 0)),
                 },
                 InputView {
                     key_image: "4".repeat(64),
                     amount: visible_amount(2_000_000_000_000),
+                    size: 16,
                     unavailable: false,
                     ring: Vec::new(),
-                    ages: age_strip(&[], 0, 0),
+                    ages: Some(age_strip(&[], clock(0), 0)),
                 },
             ],
             outputs: vec![
@@ -2912,18 +4530,1040 @@ mod tests {
                     public_key: "5".repeat(64),
                     amount: visible_amount(0),
                     view_tag: "94".to_owned(),
+                    anchor: String::new(),
+                    unified_id: None,
                 },
                 OutputView {
                     public_key: "6".repeat(64),
                     amount: visible_amount(3_000_000_000_000),
                     view_tag: "d6".to_owned(),
+                    anchor: String::new(),
+                    unified_id: None,
                 },
             ],
             has_view_tags: true,
+            has_unified_ids: false,
             extra: "01aa".to_owned(),
             extra_fields: Vec::new(),
             extra_undecoded: false,
+            coinbase_totals: None,
         }
+    }
+
+    /// A mined coinbase states its whole reward and the fees in it, and a
+    /// block whose transactions could not all be read shows no fee total
+    /// rather than a short one.
+    #[test]
+    fn a_coinbase_page_states_the_reward_and_the_fees() {
+        let mut page = tx_page();
+        page.coinbase = true;
+        page.coinbase_totals = Some(CoinbaseTotals {
+            reward: "0.600034780725".to_owned(),
+            split: Some(RewardSplit {
+                base: "0.6".to_owned(),
+                fees: "0.000034780725".to_owned(),
+                paid: 3,
+            }),
+        });
+        let html = page.render().expect("renders");
+        let rows = [
+            "<dt>Total block reward</dt><dd>0.600034780725 XMR</dd>",
+            "<dt>Base block reward</dt><dd>0.6 XMR</dd>",
+            "<dt>Miner fees collected</dt><dd>0.000034780725 XMR <span class=\"tag\">from 3 transactions</span></dd>",
+        ];
+        let at: Vec<usize> = rows
+            .iter()
+            .map(|r| html.find(r).unwrap_or_else(|| panic!("missing {r}")))
+            .collect();
+        assert!(at.is_sorted(), "the rows are out of order");
+
+        page.coinbase_totals = Some(CoinbaseTotals {
+            reward: "0.6".to_owned(),
+            split: Some(RewardSplit {
+                base: "0.6".to_owned(),
+                fees: "0".to_owned(),
+                paid: 0,
+            }),
+        });
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Miner fees collected</dt><dd>0 XMR</dd>"));
+
+        page.coinbase_totals = Some(CoinbaseTotals {
+            reward: "0.6".to_owned(),
+            split: None,
+        });
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Total block reward</dt>"));
+        assert!(!html.contains("Base block reward"));
+        assert!(!html.contains("fees collected"));
+
+        assert!(
+            !tx_page()
+                .render()
+                .expect("renders")
+                .contains("Total block reward")
+        );
+    }
+
+    /// The same page for an FCMP++ spend with Carrot outputs, as it would be
+    /// built from a type 7 transaction.
+    fn fcmp_tx_page() -> TxPage {
+        let mut page = tx_page();
+        page.rct_type = 7;
+        page.ring_min = 0;
+        page.ring_max = 0;
+        page.fcmp_pp = true;
+        page.reference_block = Some(3_012_345);
+        page.n_tree_layers = Some(6);
+        page.carrot = true;
+        for i in &mut page.inputs {
+            i.amount = None;
+            i.ring = Vec::new();
+        }
+        for o in &mut page.outputs {
+            o.amount = None;
+            o.view_tag = "a1b2c3".to_owned();
+            o.anchor = "7".repeat(32);
+        }
+        page
+    }
+
+    /// An FCMP++ input has no ring, and the page must say what it has instead
+    /// rather than print "0 ring members", which reads as no privacy at all.
+    #[test]
+    fn an_fcmp_pp_spend_shows_the_curve_tree_as_its_anonymity_set() {
+        let html = fcmp_tx_page().render().expect("renders");
+        assert!(html.contains("Every output in the curve tree"), "{html}");
+        assert!(
+            html.contains(r#"as of block <a href="/block/3012345">3012345</a>"#),
+            "the reference block links to its block:
+{html}"
+        );
+        assert!(html.contains("6 tree layers"));
+        assert!(!html.contains("ring members"), "{html}");
+        assert!(
+            !html.contains("Ring member ages"),
+            "no strip without a ring"
+        );
+        assert!(!html.contains("<dt>Ring size</dt>"));
+        assert!(!html.contains("refused this ring lookup"));
+        assert_eq!(
+            html.matches(r#"<span class="tag">FCMP++</span>"#).count(),
+            2
+        );
+        assert!(html.contains("FCMP++ (type 7)"));
+        assert!(!html.contains("RingCT type 7"));
+    }
+
+    /// Before v12 each input chose its ring, so the row gives the range, and a
+    /// ring of one is said to have no decoys rather than drawn as if it had.
+    #[test]
+    fn early_rings_show_their_range_and_a_ring_of_one_has_no_decoys() {
+        let html = tx_page().render().expect("renders");
+        assert!(html.contains("<dt>Ring size</dt><dd>16\n"), "{html}");
+        assert!(!html.contains(r#"<span class="tag">no decoys</span>"#));
+
+        let mut page = tx_page();
+        page.ring_min = 3;
+        page.ring_max = 5;
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Ring size</dt><dd>3 to 5\n"), "{html}");
+
+        let mut page = tx_page();
+        page.ring_min = 1;
+        page.ring_max = 1;
+        page.inputs.truncate(1);
+        let html = page.render().expect("renders");
+        assert!(
+            html.contains(r#"1 <span class="tag">no decoys</span>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<span class="tag">1 ring member</span>"#),
+            "{html}"
+        );
+        assert!(html.contains("This input has no decoys"));
+        assert!(!html.contains("Ring member ages"));
+        assert!(html.contains(&"2".repeat(64)), "the member is still listed");
+    }
+
+    /// An input's ring size is what it states, not how many members came back.
+    #[test]
+    fn an_unresolved_ring_keeps_its_size() {
+        let mut page = tx_page();
+        page.inputs[1].unavailable = true;
+        let html = page.render().expect("renders");
+        assert!(
+            html.contains(r#"<span class="tag">16 ring members</span>"#),
+            "{html}"
+        );
+        assert!(!html.contains("0 ring members"));
+    }
+
+    #[test]
+    fn ring_lens_are_per_spending_input() {
+        let tx: TxJson = serde_json::from_str(
+            r#"{"version":1,"unlock_time":0,"vin":[{"key":{"amount":5,"key_offsets":[1,2,3],"k_image":"aa"}},{"key":{"amount":5,"key_offsets":[4,5,6,7,8],"k_image":"bb"}}],"vout":[],"extra":[]}"#,
+        )
+        .expect("a v1 spend");
+        assert_eq!(ring_lens(&tx), vec![3, 5]);
+        let coinbase: TxJson = serde_json::from_str(
+            r#"{"version":2,"unlock_time":60,"vin":[{"gen":{"height":5}}],"vout":[],"extra":[],"rct_signatures":{"type":0}}"#,
+        )
+        .expect("a coinbase");
+        assert!(ring_lens(&coinbase).is_empty());
+    }
+
+    /// With the tree's size known, the row gives the count; the proof size and
+    /// each output's unified id have rows and a column of their own.
+    #[test]
+    fn a_known_tree_size_is_the_anonymity_set_and_the_proof_has_a_size() {
+        let mut page = fcmp_tx_page();
+        page.anonymity_set = Some(grouped(1_234_567));
+        page.proof_size = Some(grouped(6_528));
+        page.has_unified_ids = true;
+        for (i, o) in page.outputs.iter_mut().enumerate() {
+            o.unified_id = Some(900 + i as u64);
+        }
+        let html = page.render().expect("renders");
+        assert!(
+            html.contains(r#"1,234,567 outputs, as of block <a href="/block/3012345">"#),
+            "{html}"
+        );
+        assert!(!html.contains("Every output in the curve tree"));
+        assert!(html.contains("<dt>FCMP++ proof</dt><dd>6,528 bytes"));
+        assert!(html.contains(r#"<th class="num">Unified ID</th>"#));
+        // Each unified id links to its output's path, and the section to all
+        // of them.
+        let paths = format!("/tx/{}/paths", page.hash);
+        assert!(html.contains(&format!(r#"<a href="{paths}?output=1" title="This output's path through the curve tree">900</a>"#)));
+        assert!(html.contains(&format!(r#"<a href="{paths}?output=2" title="This output's path through the curve tree">901</a>"#)));
+        assert!(html.contains(&format!(r#"<a class="walk" href="{paths}">"#)));
+        // Without them, none of it appears.
+        let bare = fcmp_tx_page().render().expect("renders");
+        assert!(bare.contains("Every output in the curve tree"));
+        assert!(!bare.contains("FCMP++ proof"));
+        assert!(!bare.contains("Unified ID"));
+    }
+
+    #[test]
+    fn the_funnel_runs_from_the_root_down_with_the_curves_alternating() {
+        let t = tree_funnel(152_000_000, None, &WIDE_FUNNEL).expect("a tree");
+        let rows: Vec<_> = t
+            .rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.curve, r.count.as_deref(), r.width))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Root", Some("Helios"), Some("1"), FUNNEL_MIN_BAR),
+                ("Layer 5", Some("Selene"), Some("9"), 67),
+                ("Layer 4", Some("Helios"), Some("325"), 160),
+                ("Layer 3", Some("Selene"), Some("5,848"), 236),
+                ("Layer 2", Some("Helios"), Some("222,223"), 330),
+                ("Layer 1", Some("Selene"), Some("4,000,000"), 405),
+                ("Outputs", None, Some("152,000,000"), FUNNEL_SPAN),
+            ]
+        );
+        assert_eq!(t.layers, 6);
+        for (i, r) in t.rows.iter().enumerate() {
+            assert_eq!(r.x + r.width / 2, FUNNEL_CENTRE, "row {i} is centred");
+            assert_eq!(r.y, FUNNEL_TOP + FUNNEL_ROW * i as u32);
+        }
+        // Below the root, a column for each of its nine children: all but
+        // the last full, so 38 of layer 4's nodes each, 38 × 18 of layer
+        // 3's, and the rest in the last.
+        let nodes = |i: usize| -> Vec<u64> { t.rows[i].blocks.iter().map(|b| b.nodes).collect() };
+        assert_eq!(nodes(0), [1]);
+        assert_eq!(nodes(1), [1; 9]);
+        assert_eq!(nodes(2), [38, 38, 38, 38, 38, 38, 38, 38, 21]);
+        assert_eq!(&nodes(3)[..2], [684, 684]);
+        assert_eq!(nodes(3)[8], 5_848 - 8 * 684);
+        for (i, r) in t.rows.iter().enumerate().skip(1) {
+            assert_eq!(
+                nodes(i).iter().sum::<u64>(),
+                r.count
+                    .as_deref()
+                    .map_or(0, |c| c.replace(',', "").parse().unwrap())
+            );
+            let first = r.blocks.first().expect("a block");
+            let last = r.blocks.last().expect("a block");
+            assert_eq!(first.x, r.x.to_string(), "row {i} starts at its bar");
+            assert_eq!(
+                block_end(last),
+                (r.x + r.width).to_string(),
+                "and ends there"
+            );
+        }
+        // One band from the root to layer 5, then one for each column.
+        assert_eq!(t.webs.len(), 1 + 5 * 9);
+    }
+
+    /// A tree small enough for one Selene root, as on a young chain.
+    #[test]
+    fn a_one_layer_tree_shows_every_output() {
+        let root = "2348cda97f56d37466e0216de7454db6478b51d180ef8ca457f901eca2ce30a9";
+        let t = tree_funnel(22, Some(root), &WIDE_FUNNEL).expect("a tree");
+        assert_eq!(t.layers, 1);
+        assert_eq!(t.rows[0].curve, Some("Selene"));
+        let leaves = &t.rows[1];
+        assert_eq!((leaves.x, leaves.width), (150, 500));
+        // The outputs are the root's children: a block each, 3 apart.
+        assert_eq!(leaves.blocks.len(), 22);
+        assert!(
+            leaves
+                .blocks
+                .iter()
+                .all(|b| b.nodes == 1 && b.width == "19.9")
+        );
+        assert_eq!(leaves.blocks[1].x, "172.9");
+        assert_eq!(t.webs, ["395,28 405,28 650,44 150,44"]);
+        assert_eq!(t.height, 64);
+        assert_eq!(t.root.as_deref(), Some("2348cda97f56d374…"));
+
+        // 200 outputs: 6 Selene nodes under the root, 38 outputs each but
+        // the last 10.
+        let t = tree_funnel(200, None, &WIDE_FUNNEL).expect("a tree");
+        let outputs: Vec<u64> = t.rows[2].blocks.iter().map(|b| b.nodes).collect();
+        assert_eq!(outputs, [38, 38, 38, 38, 38, 10]);
+        assert!(
+            tree_funnel(22, None, &WIDE_FUNNEL)
+                .expect("a tree")
+                .root
+                .is_none()
+        );
+        assert!(tree_funnel(0, None, &WIDE_FUNNEL).is_none());
+    }
+
+    /// For a phone the labels go above the bars, so the whole tree fits the
+    /// narrow drawing's width.
+    #[test]
+    fn the_narrow_funnel_puts_each_label_above_its_bar() {
+        let t = tree_funnel(22, Some(&"ab".repeat(32)), &NARROW_FUNNEL).expect("a tree");
+        let rows: Vec<_> = t
+            .rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.x, r.y, r.label_y, r.width))
+            .collect();
+        assert_eq!(
+            rows,
+            [("Root", 155, 30, 22, 10), ("Outputs", 0, 74, 66, 320)]
+        );
+        assert_eq!(
+            (t.class, t.width, t.count_x, t.height, t.root_y),
+            ("narrow", 320, 160, 94, 22)
+        );
+        assert_eq!(t.webs, ["155,44 165,44 320,74 0,74"]);
+        assert_eq!(
+            (t.count_x, t.count_anchor, t.root_x),
+            (160, "middle", 160),
+            "the counts go over the bars, and the root's hash takes the root's"
+        );
+        assert_eq!(t.rows[0].count, None, "the hash stands in for the root's 1");
+        assert_eq!(t.rows[1].blocks[0].x, "0");
+
+        let wide = tree_funnel(22, None, &WIDE_FUNNEL).expect("a tree");
+        assert_eq!(
+            (wide.class, wide.width, wide.root_x, wide.root_y),
+            ("wide", 760, 400, 11)
+        );
+        assert_eq!((wide.count_x, wide.count_anchor), (760, "end"));
+        assert_eq!(
+            wide.rows[0].count.as_deref(),
+            Some("1"),
+            "without a hash, the root is counted"
+        );
+        assert_eq!(wide.rows[0].label_y, 26);
+    }
+
+    /// Drawn once for the transaction, above its inputs, from presentation
+    /// attributes only.
+    #[test]
+    fn a_known_tree_size_draws_the_tree() {
+        let mut page = fcmp_tx_page();
+        page.tree = tree_picture(22, Some(&"ab".repeat(32)));
+        let html = page.render().expect("renders");
+        assert_eq!(html.matches(r#"<figure class="curve-tree">"#).count(), 1);
+        assert_eq!(
+            html.matches(r#"<svg class="funnel wide" viewBox="0 0 760 64""#)
+                .count(),
+            1
+        );
+        assert_eq!(
+            html.matches(r#"<svg class="funnel narrow" viewBox="0 0 320 94""#)
+                .count(),
+            1
+        );
+        assert!(
+            html.contains(r#"aria-label="Curve tree of 22 outputs in 1 layer, the root"#),
+            "{html}"
+        );
+        assert!(html.contains(
+            r#"<text class="label" x="0" y="26">Root<tspan class="curve"> · Selene</tspan>"#
+        ));
+        assert!(html.contains(r#"text-anchor="end">22</text>"#));
+        assert!(html.contains(">abababababababab…</text>"));
+        assert!(
+            html.find("curve-tree") < html.find("input-card"),
+            "above the inputs"
+        );
+        assert!(!html.contains(" style="), "the CSP drops inline styles");
+
+        assert!(
+            !fcmp_tx_page()
+                .render()
+                .expect("renders")
+                .contains("curve-tree")
+        );
+        assert!(!tx_page().render().expect("renders").contains("curve-tree"));
+    }
+
+    /// However many outputs, a bar is split only into the root's children's
+    /// branches, so a mainnet-sized tree draws as few blocks as a small one
+    /// with as many branches, and every gap stays visible on a phone.
+    #[test]
+    fn a_mainnet_sized_tree_draws_only_its_branches() {
+        let [wide, narrow] = tree_picture(152_318_407, None).expect("a tree");
+        for t in [&wide, &narrow] {
+            assert_eq!(t.rows.len(), 7, "six layers and the outputs");
+            let blocks: Vec<_> = t.rows.iter().map(|r| r.blocks.len()).collect();
+            assert_eq!(blocks, [1, 9, 9, 9, 9, 9, 9]);
+            for r in &t.rows[1..] {
+                let ends: Vec<f64> = r
+                    .blocks
+                    .iter()
+                    .flat_map(|b| [b.x.parse::<f64>().unwrap(), block_end(b).parse().unwrap()])
+                    .collect();
+                assert!(
+                    ends.windows(2)
+                        .skip(1)
+                        .step_by(2)
+                        .all(|w| w[1] - w[0] >= 0.9),
+                    "{} {}: blocks stay apart",
+                    t.class,
+                    r.name
+                );
+            }
+        }
+
+        let mut page = fcmp_tx_page();
+        page.tree = Some([wide, narrow]);
+        let html = page.render().expect("renders");
+        assert_eq!(html.matches(r#"<rect class="bar"#).count(), 2 * (1 + 6 * 9));
+        assert!(!html.contains("<pattern") && !html.contains(r#"class="cut""#));
+        assert!(html.contains("<title>38 nodes</title>"));
+        assert!(html.contains("<title>1 node</title>"));
+    }
+
+    /// The walkthrough is linked under the inputs' heading, above the tree
+    /// when there is one.
+    #[test]
+    fn the_walkthrough_is_linked_from_the_tree() {
+        let link = r#"<a class="walk" href="/tx/abc/fcmp">How this spend stays private &rarr;</a>"#;
+        let mut page = fcmp_tx_page();
+        page.hash = "abc".to_owned();
+        page.tree = tree_picture(22, None);
+        let html = page.render().expect("renders");
+        assert_eq!(html.matches(link).count(), 1);
+        let at = html.find(link);
+        let heading = html.find(" Input").expect("the inputs' heading");
+        assert!(at > Some(heading), "under the heading");
+        assert!(
+            at < html.find(r#"<figure class="curve-tree">"#),
+            "above the tree"
+        );
+        assert!(!html.contains("how it works"));
+
+        page.tree = None;
+        let html = page.render().expect("renders");
+        assert_eq!(html.matches(link).count(), 1);
+        assert!(
+            html.find(link) < html.find("input-card"),
+            "above the inputs"
+        );
+
+        let mut ring = tx_page();
+        ring.hash = "abc".to_owned();
+        let html = ring.render().expect("renders");
+        assert!(!html.contains("/fcmp"));
+        assert_eq!(html.matches(&link.replace("/fcmp", "/ring")).count(), 1);
+        ring.coinbase = true;
+        assert!(!ring.render().expect("renders").contains(r#"class="walk""#));
+    }
+
+    fn fcmp_fixture(file: &str) -> Vec<(TxEntry, TxJson)> {
+        let json = match file {
+            "full" => include_str!("../../../fixtures/fcmp/get_transactions_fcmp.json"),
+            _ => include_str!("../../../fixtures/fcmp/get_transactions_fcmp_pruned.json"),
+        };
+        let resp: monerod_rpc::types::GetTransactionsResponse =
+            serde_json::from_str(json).expect("a fixture");
+        assert!(!resp.txs.is_empty());
+        resp.txs
+            .into_iter()
+            .map(|e| {
+                let tx = e.parse_json().expect("decodes");
+                (e, tx)
+            })
+            .collect()
+    }
+
+    /// Each input's own bytes are read from its place in the proof, and the
+    /// shared membership proof is what is left.
+    #[test]
+    fn the_walkthrough_shows_each_inputs_own_part_of_the_proof() {
+        for (entry, tx) in fcmp_fixture("full") {
+            let proof = tx
+                .rctsig_prunable
+                .as_ref()
+                .and_then(|p| p.fcmp_pp.clone())
+                .expect("a proof");
+            let n = tx.vin.len();
+            let page = fcmp_page(None, &entry, &tx, Some(62), Some((112, "9".repeat(64))));
+
+            assert_eq!(page.inputs.len(), n);
+            for (i, input) in page.inputs.iter().enumerate() {
+                let at = i * 960;
+                let d = input.disguise.as_ref().expect("the proof is held");
+                assert_eq!(d.o_tilde, proof[at..at + 64]);
+                assert_eq!(d.i_tilde, proof[at + 64..at + 128]);
+                assert_eq!(d.r, proof[at + 128..at + 192]);
+                assert_eq!(
+                    input.key_image,
+                    tx.vin[i].as_key().expect("a key input").k_image
+                );
+                assert_eq!(
+                    input.pseudo_out.as_deref(),
+                    Some(tx.pseudo_outs()[i].as_str())
+                );
+            }
+            let total = proof.len() / 2;
+            // What is left after the tuples and signatures, less the anchor.
+            let membership = total - n * 480 - 64;
+            assert_eq!(
+                page.membership,
+                Some((
+                    grouped(membership as u64),
+                    (membership * 100 / total) as u64
+                ))
+            );
+            assert_eq!(page.proof_size, Some(grouped(total as u64)));
+            assert_eq!(page.reference_block, Some(120));
+            assert_eq!(page.range_proofs, 1);
+
+            let html = page.render().expect("renders");
+            // The figures that come from the chain stand out from the prose.
+            assert!(html.contains(
+                "As of block <strong>120</strong>, the one this proof was built against, the tree held <strong>62</strong> outputs."
+            ));
+            assert!(html.contains("Block <strong>112</strong> already carries that tree's root:"));
+            // Step 7 counts the inputs: each spent its own output.
+            assert!(n > 1, "the captured transactions spend two outputs each");
+            assert!(html.contains(&format!(
+                "That each of its {n} inputs spent a different one of 62 outputs,\nby someone entitled to spend it, and only once. Not which ones."
+            )));
+            assert!(html.contains("<dt>Each input could be spending</dt>"));
+            let mut single = fcmp_page(None, &entry, &tx, Some(62), Some((112, "9".repeat(64))));
+            single.inputs.truncate(1);
+            let single = single.render().expect("renders");
+            assert!(single.contains(
+                "That one of 62 outputs\nwas spent, by someone entitled to spend it, and only once. Not which one."
+            ));
+            assert!(single.contains("<dt>Could be spending</dt>"));
+            assert!(html.contains("<dd>1 Bulletproofs+ proof over the outputs</dd>"));
+            let first = page
+                .inputs
+                .first()
+                .and_then(|i| i.disguise.as_ref())
+                .expect("one");
+            assert!(html.contains(&format!(r#"<dd class="hash">{}</dd>"#, first.o_tilde)));
+            assert!(html.contains(
+                r##"<a class="btn next" href="#s2">Next: Disguise the output &rarr;</a>"##
+            ));
+            assert_eq!(
+                html.matches("&larr; Back").count(),
+                6,
+                "every step but the first"
+            );
+            let last = html.find(r#"id="s7""#).expect("step 7");
+            assert_eq!(html.matches("Start again").count(), 1);
+            let again = html.find("Start again");
+            assert!(
+                again > Some(last) && again < html.find(r#"id="s1""#),
+                "on step 7"
+            );
+            assert!(html.contains(&format!("Its {}-byte FCMP++ proof", grouped(total as u64))));
+            for input in &page.inputs {
+                assert!(html.contains(&format!(
+                    r#"<dd class="hash mark">{}</dd>"#,
+                    input.key_image
+                )));
+            }
+            assert!(
+                html.rfind(r#"id="s1""#) > html.rfind(r#"id="s7""#),
+                "step 1 comes last, for the stylesheet's `~`"
+            );
+            assert!(!html.contains(" style="), "the CSP drops inline styles");
+        }
+    }
+
+    #[test]
+    fn the_walkthrough_counts_this_transactions_amounts() {
+        let (entry, tx) = fcmp_fixture("full").remove(1);
+        let html = fcmp_page(None, &entry, &tx, None, None)
+            .render()
+            .expect("renders");
+        assert!(html.contains("<dd>2 disguised amounts</dd>"));
+        assert!(html.contains("<dd>4 hidden amounts</dd>"));
+        assert!(
+            html.contains("<dd>0.0113292 XMR, the only amount in the clear</dd>"),
+            "{html}"
+        );
+        assert!(html.contains("all 2 inputs at once"));
+    }
+
+    /// Parts in the proof's own order, each linked to its step, edge to edge
+    /// with a pixel either side, filling the bar.
+    #[test]
+    fn the_proof_bar_lays_each_part_out_in_order() {
+        let map = proof_map(2, 5_568);
+        let order: Vec<_> = map.iter().map(|g| (g.class, g.step)).collect();
+        assert_eq!(
+            order,
+            [
+                ("tuple", 2),
+                ("sal", 3),
+                ("tuple", 2),
+                ("sal", 3),
+                ("member", 4),
+                ("anchor", 5)
+            ]
+        );
+        assert_eq!(map.first().map(|g| g.x), Some(1));
+        let last = map.last().expect("an anchor");
+        assert_eq!(last.x + last.width + 1, MAP_WIDTH);
+        for w in map.windows(2) {
+            assert_eq!(w[1].x, w[0].x + w[0].width + 2);
+        }
+        // To scale: 5,504 of 6,528 bytes, less what the narrow parts borrow.
+        let member = &map[4];
+        assert!((800..840).contains(&member.width), "{}", member.width);
+        assert!(
+            map[0].width < map[1].width,
+            "a tuple is a quarter of a signature"
+        );
+        assert_eq!(map[4].label, "The membership proof, 5,504 bytes");
+        assert_eq!(map[0].label, "Input 1's disguised output, 96 bytes");
+        assert_eq!(map[3].label, "Input 2's signature, 384 bytes");
+
+        // A 128-input proof draws each kind once, to scale, rather than 258
+        // slivers widened off it.
+        let wide = proof_map(128, 200_000);
+        let kinds: Vec<_> = wide.iter().map(|g| g.class).collect();
+        assert_eq!(kinds, ["tuple", "sal", "member", "anchor"]);
+        assert_eq!(wide[0].label, "128 disguised outputs, 12,288 bytes");
+        assert_eq!(wide[1].label, "128 signatures, 49,152 bytes");
+        assert_eq!(wide[2].label, "The membership proof, 199,936 bytes");
+        let total = 128.0 * 480.0 + 200_000.0;
+        for (g, bytes) in wide.iter().zip([12_288.0, 49_152.0, 199_936.0]) {
+            let share = f64::from(g.width + 2) / f64::from(MAP_WIDTH);
+            assert!((share - bytes / total).abs() < 0.015, "{}", g.label);
+        }
+        let end = wide.last().expect("an anchor");
+        assert_eq!(end.x + end.width + 1, MAP_WIDTH);
+
+        // Short of that, every part is drawn on its own.
+        assert_eq!(proof_map(4, 5_568).len(), 10);
+    }
+
+    /// The proof's shape, the tree, the root's curve and the bar all come
+    /// from this transaction, and every step's math starts closed.
+    #[test]
+    fn the_walkthrough_draws_this_proof_and_hides_the_math() {
+        let (entry, mut tx) = fcmp_fixture("full").remove(0);
+        let page = fcmp_page(None, &entry, &tx, Some(62), Some((112, "9".repeat(64))));
+        let s = page
+            .shape
+            .as_ref()
+            .expect("the shape accounts for the proof");
+        assert_eq!(
+            (
+                s.selene_rows,
+                s.selene_rounds,
+                s.helios_rows,
+                s.helios_rounds
+            ),
+            (256, 8, 128, 7)
+        );
+        assert_eq!(page.root_curve, Some("Helios"));
+        let html = page.render().expect("renders");
+        assert!(html.contains(
+            "Here the Selene proof has\n256 rows, folded in 8 rounds, and the Helios\nproof 128 rows in 7 rounds."
+        ), "{html}");
+        assert!(html.contains("<dt>Root is on</dt><dd>Helios</dd>"));
+        assert!(html.contains(r#"aria-label="Curve tree of 62 outputs in 2 layers"#));
+        assert!(html.contains(
+            "&lceil;62 &divide; 38&rceil; = 2 Selene nodes<br>&lceil;2 &divide; 18&rceil; = 1 Helios node, the root"
+        ));
+        assert!(html.contains("one line for each of its 2\nlayers."));
+        // Step 1 keeps its picture beside the words, the tree among them.
+        let first = &html[html.find(r#"id="s1""#).expect("step 1")..];
+        let tree = first
+            .find(r#"<figure class="curve-tree tree-field">"#)
+            .expect("the tree");
+        let pic = first.find(r#"<svg class="pic""#).expect("the picture");
+        assert!(tree < first.find("Show me the math").expect("math") && tree < pic);
+        assert!(!html.contains(" style="), "the CSP drops inline styles");
+        assert!(!html.contains(r#"class="maths" open"#));
+        assert_eq!(html.matches(r#"aria-current="step""#).count(), 7);
+        // Step 2 lights both inputs' tuples, step 4 the membership proof,
+        // step 5 the anchor, and nothing else is ever lit.
+        assert_eq!(html.matches(r#"class="seg tuple on""#).count(), 2);
+        assert_eq!(html.matches(r#"class="seg sal on""#).count(), 2);
+        assert_eq!(html.matches(r#"class="seg member on""#).count(), 1);
+        assert_eq!(html.matches(r#"class="seg anchor on""#).count(), 1);
+        assert_eq!(html.matches(r#"<svg class="proof-map""#).count(), 4);
+
+        // A layer count the proof's length does not fit leaves the shape out
+        // rather than print rows that describe some other proof.
+        tx.rctsig_prunable.as_mut().expect("prunable").n_tree_layers = Some(1);
+        let odd = fcmp_page(None, &entry, &tx, None, None);
+        assert!(odd.shape.is_none());
+        assert_eq!(odd.root_curve, Some("Selene"));
+        assert!(odd.tree.is_none());
+        let html = odd.render().expect("renders");
+        assert!(!html.contains("rows, folded in"));
+        assert!(
+            !html.contains("&lceil;"),
+            "no sums for a tree of unknown size"
+        );
+        assert!(
+            html.contains(r#"<path class="web" d="M96 38H104"#),
+            "the drawing is there without the tree"
+        );
+    }
+
+    /// A pruned node has none of the proof, and says so rather than showing
+    /// empty rows.
+    #[test]
+    fn a_pruned_proof_is_explained_without_its_bytes() {
+        for (entry, tx) in fcmp_fixture("pruned") {
+            let page = fcmp_page(None, &entry, &tx, None, None);
+            assert!(
+                page.inputs
+                    .iter()
+                    .all(|i| i.disguise.is_none() && i.pseudo_out.is_none())
+            );
+            assert_eq!(page.proof_size, None);
+            assert_eq!(page.membership, None);
+            let html = page.render().expect("renders");
+            assert!(html.contains("no longer holds this transaction's proof"));
+            assert!(!html.contains("&Otilde;</dt>"));
+            assert!(html.contains("Its FCMP++ proof is what makes that possible."));
+            assert!(
+                !html.contains("known once this transaction is mined"),
+                "it was"
+            );
+        }
+    }
+
+    /// A pool transaction's tree size cannot be asked for yet.
+    #[test]
+    fn a_pool_spend_says_its_tree_size_waits_for_a_block() {
+        let (mut entry, tx) = fcmp_fixture("full").remove(0);
+        entry.in_pool = true;
+        let html = fcmp_page(None, &entry, &tx, None, None)
+            .render()
+            .expect("renders");
+        assert!(html.contains("The tree's size is known once this transaction is mined."));
+        assert!(html.contains("The pool accepted its key images as new."));
+        assert!(html.contains("any output in the tree"));
+        assert!(!html.contains("outputs in the tree</dt>"));
+    }
+
+    #[test]
+    fn counts_group_their_thousands() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1_000), "1,000");
+        assert_eq!(grouped(150_123_456), "150,123,456");
+        assert_eq!(grouped(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    /// The root a proof was checked against is in a different block from the
+    /// one it names, and the page links both.
+    #[test]
+    fn the_reference_block_and_the_root_block_are_both_linked() {
+        let mut page = fcmp_tx_page();
+        page.root_block =
+            monerod_rpc::types::tree_root_block(3_012_345).map(|h| (h, "9".repeat(64)));
+        let html = page.render().expect("renders");
+        assert!(html.contains(r#"as of block <a href="/block/3012345">3012345</a>"#));
+        assert!(
+            html.contains(r#"root in block <a href="/block/3012337">3012337</a>"#),
+            "{html}"
+        );
+        assert!(html.contains("FCMP++ (type 7)"));
+        assert!(html.contains(&format!(r#"title="Tree root {}""#, "9".repeat(64))));
+
+        // A root block from before the fork carries no tree, so there is no
+        // link to make.
+        let bare = fcmp_tx_page().render().expect("renders");
+        assert!(!bare.contains("root in block"));
+    }
+
+    /// A pruned node knows the transaction is FCMP++ but not which tree it
+    /// named. The row stays; the claim about the block goes.
+    #[test]
+    fn a_pruned_fcmp_pp_spend_names_no_reference_block() {
+        let mut page = fcmp_tx_page();
+        page.pruned = true;
+        page.reference_block = None;
+        page.n_tree_layers = None;
+        let html = page.render().expect("renders");
+        assert!(html.contains("Every output in the curve tree"));
+        assert!(!html.contains("as of block"));
+        assert!(html.contains("the FCMP++ proof and the block it"));
+        assert!(!html.contains("Ring members are still resolved"));
+    }
+
+    /// Every column note is for a column the table shows, and the notes are
+    /// one group, so that opening one closes the rest. A chip holds only its
+    /// label: its text is a panel in the page's flow, shown by a rule of its
+    /// own, so that it moves the table down rather than covering it.
+    #[test]
+    fn every_column_note_is_for_a_column_shown() {
+        let mut with_ids = fcmp_tx_page();
+        with_ids.has_unified_ids = true;
+        for page in [tx_page(), fcmp_tx_page(), with_ids] {
+            let html = page.render().expect("renders");
+            // The rules that open a panel look for the chip within `.notes`.
+            let notes = html
+                .split_once(r#"<div class="notes">"#)
+                .and_then(|(_, rest)| rest.split_once("<table>"))
+                .map(|(notes, _)| notes)
+                .expect("the notes sit together before the table");
+            assert_eq!(
+                notes.matches(r#"class="note-panel""#).count(),
+                html.matches(r#"class="note-panel""#).count()
+            );
+            let chips: Vec<(&str, &str)> = notes
+                .split(r#"<details class="note-chip" name="output-notes" id="note-"#)
+                .skip(1)
+                .filter_map(|r| r.split_once(r#""><summary>"#))
+                .collect();
+            assert!(chips.len() >= 2, "{html}");
+            assert_eq!(chips.len(), html.matches(r#"class="note-chip""#).count());
+            assert_eq!(chips.len(), html.matches(r#"class="note-panel""#).count());
+            let mut labels = Vec::new();
+            for (key, rest) in chips {
+                let (label, chip) = rest.split_once(" <svg").expect("an icon");
+                assert!(
+                    chip.split_once("</summary>")
+                        .is_some_and(|(_, after)| after.starts_with("</details>")),
+                    "{label}'s text is inside its chip"
+                );
+                assert!(html.contains(&format!(r#"<div class="note-panel" id="panel-{key}">"#)));
+                assert!(
+                    STYLESHEET.contains(&format!(".notes:has(#note-{key}[open]) #panel-{key}")),
+                    "nothing opens {label}'s panel"
+                );
+                labels.push(label);
+            }
+            for n in labels {
+                assert!(
+                    html.contains(&format!("<th>{n}</th>"))
+                        || html.contains(&format!(r#"<th class="num">{n}</th>"#)),
+                    "{n} has no column"
+                );
+            }
+        }
+    }
+
+    /// Carrot outputs carry a three-byte view tag and an encrypted anchor, and
+    /// the note describes the three-byte tag, not the one-byte one.
+    #[test]
+    fn carrot_outputs_show_their_anchor_and_describe_their_view_tag() {
+        let html = fcmp_tx_page().render().expect("renders");
+        assert!(html.contains("<th>Janus anchor</th>"));
+        assert!(
+            html.contains(
+                r#"<details class="note-chip" name="output-notes" id="note-anchor"><summary>Janus anchor "#
+            )
+        );
+        assert_eq!(html.matches(&"7".repeat(32)).count(), 2);
+        assert!(html.contains("<code>a1b2c3</code>"));
+        assert!(html.contains("Three bytes that make scanning cheaper"));
+        assert!(!html.contains("One byte that makes scanning cheaper"));
+
+        let legacy = tx_page().render().expect("renders");
+        assert!(!legacy.contains("Janus anchor"));
+        assert!(legacy.contains("One byte that makes scanning cheaper"));
+        assert!(legacy.contains("<dt>Ring size</dt>"));
+    }
+
+    /// The tree row appears from the fork on and not before it.
+    #[test]
+    fn a_block_shows_its_curve_tree_only_when_it_has_one() {
+        let before = block_page().render().expect("renders");
+        assert!(!before.contains("Curve tree"));
+
+        let mut page = block_page();
+        page.major_version = 17;
+        page.minor_version = 17;
+        page.tree_root = Some("9".repeat(64));
+        page.tree_layers = Some(5);
+        let after = page.render().expect("renders");
+        assert!(after.contains("<dt>Curve tree</dt>"));
+        assert!(after.contains(&"9".repeat(64)));
+        assert!(after.contains("5 layers"));
+    }
+
+    /// Each row counts its inputs, and a coinbase, which spends nothing,
+    /// shows a dash as it does for its ring.
+    #[test]
+    fn the_block_table_counts_each_transactions_inputs() {
+        let html = block_page().render().expect("renders");
+        assert!(html.contains(
+            r#"<th class="num">Inputs</th>
+      <th class="num">Outputs</th>"#
+        ));
+        assert_eq!(html.matches(r#"<td class="num">3</td>"#).count(), 2);
+        let coinbase = &html[..html.find("d".repeat(64).as_str()).expect("a spend")];
+        assert!(
+            coinbase.contains(
+                r#"<td class="num">&mdash;</td>
+      <td class="num">2</td>"#
+            ),
+            "{html}"
+        );
+
+        let (_, tx) = fcmp_fixture("full").remove(0);
+        assert_eq!(spends(&tx), 2);
+        let coinbase: TxJson = serde_json::from_str(
+            r#"{"version":2,"unlock_time":60,"vin":[{"gen":{"height":5}}],"vout":[],"extra":[],"rct_signatures":{"type":0}}"#,
+        )
+        .expect("a coinbase");
+        assert_eq!(spends(&coinbase), 0);
+    }
+
+    /// A row whose inputs have rings of different sizes gives the range, as
+    /// the transaction's own page does, in the block table and the pool's.
+    #[test]
+    fn a_row_with_mixed_rings_gives_the_range() {
+        let mut page = block_page();
+        page.txs[1].ring = 3;
+        page.txs[1].ring_max = 5;
+        let html = page.render().expect("renders");
+        assert!(html.contains(r#"<td class="num">3 to 5</td>"#), "{html}");
+        assert!(html.contains(r#"<td class="num">16</td>"#), "{html}");
+
+        let mut pool = mempool_page(None);
+        pool.txs[0].ring = 3;
+        pool.txs[0].ring_max = 5;
+        let html = pool.render().expect("renders");
+        assert!(html.contains(r#"<td class="num">3 to 5</td>"#), "{html}");
+
+        let mut tx = pool_tx(0, 7, 900);
+        tx.tx_json = serde_json::json!({
+            "version": 1, "unlock_time": 0, "extra": [], "vout": [],
+            "vin": [
+                {"key": {"amount": 5, "key_offsets": [1, 2, 3, 4, 5], "k_image": "ab".repeat(32)}},
+                {"key": {"amount": 5, "key_offsets": [1, 2, 3], "k_image": "cd".repeat(32)}},
+            ],
+        })
+        .to_string();
+        let f = RowCache::default().of_pool_tx(&tx).expect("figures");
+        assert_eq!((f.ring, f.ring_max), (3, 5));
+    }
+
+    /// An FCMP++ row's column holds its tree's size when that is known, never
+    /// the 0 its ring size is, and a table with one heads it "Anon set".
+    #[test]
+    fn an_fcmp_pp_row_names_its_tree_in_the_ring_column() {
+        let fcmp = || BlockTxRow {
+            ring: 0,
+            full_chain: true,
+            reference: Some(300),
+            ..block_tx(false)
+        };
+        let ring_only = block_page().render().expect("renders");
+        assert!(ring_only.contains(r#"<th class="num">Ring</th>"#));
+        assert!(!ring_only.contains("Anon set"));
+        let ring_pool = mempool_page(None).render().expect("renders");
+        assert!(ring_pool.contains(r#"<th class="num">Ring</th>"#));
+
+        let mut page = block_page();
+        page.txs.push(BlockTxRow {
+            tree: Some("6,213".to_owned()),
+            ..fcmp()
+        });
+        page.txs.push(fcmp());
+        let html = page.render().expect("renders");
+        assert_eq!(html.matches(">6,213</span>").count(), 1, "{html}");
+        assert!(html.contains(r#"<th class="num">Anon set</th>"#), "{html}");
+        assert!(html.contains("one of the 6,213 outputs in the curve tree"));
+        assert_eq!(html.matches(">whole tree</span>").count(), 1, "{html}");
+        assert!(!html.contains(">0</td>"), "{html}");
+
+        let mut pool = mempool_page(None);
+        pool.txs.push(PoolRow {
+            ring: 0,
+            full_chain: true,
+            tree: Some("7,001".to_owned()),
+            ..pool_row(5)
+        });
+        let html = pool.render().expect("renders");
+        assert!(html.contains(">7,001</span>"), "{html}");
+        assert!(html.contains(r#"<th class="num">Anon set</th>"#), "{html}");
+    }
+
+    /// A row's tree is the one as of its own reference block, and an empty
+    /// tree, which no proof was built against, is not a size to show.
+    #[test]
+    fn a_rows_tree_is_the_one_as_of_its_reference_block() {
+        let sizes = HashMap::from([(300, 6_213), (301, 6_250), (302, 0)]);
+        assert_eq!(tree_of(Some(301), &sizes).as_deref(), Some("6,250"));
+        assert_eq!(tree_of(Some(300), &sizes).as_deref(), Some("6,213"));
+        assert_eq!(tree_of(Some(302), &sizes), None);
+        assert_eq!(tree_of(Some(303), &sizes), None);
+        assert_eq!(tree_of(None, &sizes), None);
+    }
+
+    /// A block's root is the tree as of eight blocks on, so its growth is
+    /// that tree's size against the one a block before it.
+    #[test]
+    fn a_blocks_growth_is_its_roots_tree_against_the_previous_one() {
+        let sizes = HashMap::from([(366, 6_970), (367, 6_988), (359, 6_800)]);
+        assert_eq!(
+            tree_growth(359, &sizes),
+            Some(("6,988".to_owned(), "18".to_owned()))
+        );
+        assert_eq!(tree_growth(358, &sizes), None, "no size as of 367 - 1");
+        let first = HashMap::from([(107, 0), (108, 38)]);
+        assert_eq!(
+            tree_growth(100, &first),
+            Some(("38".to_owned(), "38".to_owned())),
+            "an empty tree before it is a real 0"
+        );
+    }
+
+    #[test]
+    fn a_block_shows_its_trees_growth_only_when_known() {
+        let mut page = block_page();
+        page.tree_root = Some("9".repeat(64));
+        page.tree_layers = Some(3);
+        assert!(!page.render().expect("renders").contains("Tree size"));
+        page.tree_growth = Some(("6,988".to_owned(), "18".to_owned()));
+        let html = page.render().expect("renders");
+        assert!(
+            html.contains("<dd>6,988 outputs, 18 more than the block before"),
+            "{html}"
+        );
+        page.tree_growth = Some(("0".to_owned(), "0".to_owned()));
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dd>No outputs yet"), "{html}");
     }
 
     /// A RingCT amount is hidden, not zero, and the two must not render alike.
@@ -2974,9 +5614,25 @@ mod tests {
         );
         // The output column says so in words rather than printing a zero.
         assert_eq!(
-            html.matches(r#"<span class="tag">hidden</span>"#).count(),
+            html.matches(">hidden</span>").count(),
             1,
             "exactly one of the two outputs is a hidden RingCT amount"
+        );
+        assert!(
+            html.contains("A Bulletproofs+\n    range proof shows that the amount is not negative"),
+            "the amount's note says what hides it"
+        );
+        assert!(html.contains(
+            r#"<details class="note-chip" name="output-notes" id="note-amount"><summary>Amount "#
+        ));
+        let mut clear = tx_page();
+        for o in &mut clear.outputs {
+            o.amount.get_or_insert_with(|| "1.0".to_owned());
+        }
+        let html = clear.render().expect("renders");
+        assert!(
+            !html.contains("<summary>Amount "),
+            "no note where nothing is hidden"
         );
         assert!(
             html.contains("3.0"),
@@ -3102,5 +5758,148 @@ mod tests {
         let html = page.render().expect("renders");
         assert!(html.contains("monerod is unavailable"));
         assert!(!html.contains("class=\"status\""));
+    }
+
+    #[test]
+    fn the_alt_blocks_page_draws_each_chain_off_the_main_chain() {
+        let chain: monerod_rpc::types::ChainInfo = serde_json::from_value(serde_json::json!({
+            "block_hash": "AB".repeat(32), "height": 103, "length": 1,
+            "difficulty": 5, "difficulty_top64": 0, "wide_difficulty": "",
+            "block_hashes": ["AB".repeat(32)],
+            "main_chain_parent_block": "CD".repeat(32),
+        }))
+        .expect("a chain");
+        let main = [(103, "ef".repeat(32))].into_iter().collect();
+        let html = AltBlocksPage {
+            version: "test",
+            query: None,
+            chain: None,
+            count: 1,
+            graph: alt_graph::alt_graph(&[chain], 110, &"12".repeat(32), &main),
+        }
+        .render()
+        .expect("renders");
+        assert!(html.contains("1 known to this node"));
+        assert!(html.contains(&format!(
+            r#"<a class="ag-h" href="/block/103">103</a><a class="hash ag-main" href="/block/{0}" title="{0}">efefefef</a><a class="hash ag-alt" href="/block/{1}" title="{1}">abababab</a>"#,
+            "ef".repeat(32),
+            "ab".repeat(32)
+        )), "{html}");
+        assert!(
+            html.contains(r#"<div class="ag-gap">6 blocks</div>"#),
+            "{html}"
+        );
+        assert!(html.contains(&format!(r#"title="{0}">cdcdcdcd</a><span class="hash"></span><span class="ag-note">forked from</span>"#, "cd".repeat(32))), "{html}");
+    }
+
+    /// A block off the main chain says so, and links only by hash: its
+    /// height, sorted or stepped from, would name the main chain's block.
+    #[test]
+    fn an_orphaned_block_says_so_and_links_by_its_hash() {
+        let header = |orphan: bool| -> monerod_rpc::types::BlockHeader {
+            serde_json::from_value(serde_json::json!({
+                "major_version": 16, "minor_version": 16, "timestamp": 0,
+                "prev_hash": "b".repeat(64), "nonce": 0, "orphan_status": orphan,
+                "height": 70, "depth": 3, "hash": "AB".repeat(32), "difficulty": 1,
+                "difficulty_top64": 0, "wide_difficulty": "0x1", "cumulative_difficulty": 1,
+                "cumulative_difficulty_top64": 0, "wide_cumulative_difficulty": "0x1",
+                "reward": 1, "block_size": 1, "num_txes": 0, "pow_hash": "", "miner_tx_hash": "",
+            }))
+            .expect("a header")
+        };
+        assert_eq!(block_link(&header(false)), "/block/70");
+        let link = block_link(&header(true));
+        assert_eq!(link, format!("/block/{}", "ab".repeat(32)));
+
+        let mut page = block_page();
+        let main = page.render().expect("renders");
+        assert!(!main.contains("not on the main chain") && !main.contains("orphaned"));
+        assert!(main.contains(r#"<a href="/block/3185431">3185431 &rarr;</a>"#));
+
+        page.orphan = true;
+        page.fee_sort = column_sort(&link, SortKey::Fee, None);
+        let html = page.render().expect("renders");
+        assert!(html.contains("This block is not on the main chain."));
+        assert!(html.contains(r#"<span class="tag bad">orphaned</span>"#));
+        assert!(!html.contains("1 deep"));
+        assert!(html.contains(&format!(
+            r#"<a href="/block/{}">&larr; 3185429</a>"#,
+            "b".repeat(64)
+        )));
+        assert!(
+            !html.contains("/block/3185431"),
+            "no step to the main chain's next block"
+        );
+        assert!(html.contains(&format!("/block/{}?sort=fee", "ab".repeat(32))));
+    }
+
+    /// A transaction the daemon sent that does not decode is counted and
+    /// said to be missing from the table, not silently left out.
+    #[test]
+    fn an_unreadable_transaction_is_counted_and_noted() {
+        let mut page = block_page();
+        assert!(
+            !page
+                .render()
+                .expect("renders")
+                .contains("could not\nbe read")
+        );
+        page.unreadable = 2;
+        page.tx_count += 2;
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Transactions</dt><dd>5</dd>"));
+        assert!(
+            html.contains(
+                "2 of this block's transactions could not\nbe read, so they are not\nlisted below."
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn an_orphans_unlisted_transactions_are_counted_and_noted() {
+        let mut page = block_page();
+        page.orphan = true;
+        assert!(!page.render().expect("renders").contains("neither on"));
+        page.unlisted = 1;
+        page.tx_count += 1;
+        let html = page.render().expect("renders");
+        assert!(html.contains("<dt>Transactions</dt><dd>4</dd>"));
+        assert!(
+            html.contains("1 of its transactions is neither on\nthe main chain nor in the mempool, so it is not listed below."),
+            "{html}"
+        );
+    }
+
+    /// A lone ring input's card opens on its members; a lone FCMP++ input
+    /// has none to show, so its card starts closed.
+    #[test]
+    fn a_lone_input_opens_only_when_it_has_a_ring_to_show() {
+        let card = r#"<details class="input-card">"#;
+        let open = r#"<details class="input-card" open>"#;
+
+        let mut ring = tx_page();
+        ring.inputs.truncate(1);
+        let html = ring.render().expect("renders");
+        assert_eq!(
+            (html.matches(open).count(), html.matches(card).count()),
+            (1, 0)
+        );
+
+        let mut fcmp = fcmp_tx_page();
+        fcmp.inputs.truncate(1);
+        let html = fcmp.render().expect("renders");
+        assert_eq!(
+            (html.matches(open).count(), html.matches(card).count()),
+            (0, 1)
+        );
+        assert!(html.contains("This input has no ring."));
+
+        // Several inputs start closed either way.
+        let html = tx_page().render().expect("renders");
+        assert_eq!(
+            (html.matches(open).count(), html.matches(card).count()),
+            (0, 2)
+        );
     }
 }

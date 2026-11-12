@@ -27,8 +27,15 @@
   <dt>Timestamp</dt><dd>{{ timestamp }} &mdash; {{ timestamp_utc }} UTC <span class="tag">{{ age }} ago</span></dd>
   {% endif %}
   <dt>Fee</dt><dd>{{ fee }} XMR</dd>
+  {% if let Some(c) = coinbase_totals %}
+  <dt>Total block reward</dt><dd>{{ c.reward }} XMR</dd>
+  {% if let Some(s) = c.split %}
+  <dt>Base block reward</dt><dd>{{ s.base }} XMR</dd>
+  <dt>Miner fees collected</dt><dd>{{ s.fees }} XMR{% if s.paid > 0 %} <span class="tag">from {{ s.paid }} transaction{% if s.paid != 1 %}s{% endif %}</span>{% endif %}</dd>
+  {% endif %}
+  {% endif %}
   <dt>Size</dt><dd>{{ size }} bytes{% if pruned %} <span class="tag">prefix only</span>{% endif %}</dd>
-  <dt>Version</dt><dd>{{ version_no }}{% if rct_type > 0 %} &mdash; RingCT type {{ rct_type }}{% endif %}
+  <dt>Version</dt><dd>{{ version_no }}{% if fcmp_pp %} &mdash; FCMP++ (type {{ rct_type }}){% else if rct_type > 0 %} &mdash; RingCT type {{ rct_type }}{% endif %}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
     <p>The first number is the transaction format. Version 1 carried plain
     amounts that anyone could read, and version 2 hides them with RingCT,
@@ -36,24 +43,65 @@
     number names the RingCT scheme that hid them. Types 1 and 2 are the
     original scheme, types 3 and 4 replaced its range proofs with
     Bulletproofs, type 5 added CLSAG signatures, and type 6 uses
-    Bulletproofs+. Each of these is smaller and faster to verify than the one
-    before it, and none of them is more private. A block reward is public, so
-    a coinbase shows no RingCT type at all.</p></details>
+    Bulletproofs+. Type 1 signs a transaction's inputs together and type 2
+    signs each on its own, and both were in use at once. From type 3 to
+    type 6, each is smaller and faster to verify than the one before it.
+    None of them is more private than another. Type 7 is FCMP++. It
+    keeps RingCT's hidden amounts and Bulletproofs+, and replaces the ring
+    signature with a proof that each input spends one of the outputs in a
+    tree of every spendable output, so it is the first of these to widen the
+    anonymity set. monerod numbers it with the RingCT types although it has
+    no ring. A block reward is public, so a coinbase shows no type at
+    all.</p></details>
   </dd>
-  <dt>Ring size</dt><dd>{% if coinbase %}&mdash;{% else %}{{ ring_size }}{% endif %}
+  {% if fcmp_pp %}
+  <dt>Anonymity set</dt><dd>{% if let Some(count) = anonymity_set %}{{ count }} outputs{% else %}Every output in the curve tree{% endif %}{% if let Some(r) = reference_block %}, as of block <a href="/block/{{ r }}">{{ r }}</a>{% endif %}{% if let Some(n) = n_tree_layers %} <span class="tag">{{ n }} tree layer{% if *n != 1 %}s{% endif %}</span>{% endif %}{% if let Some((b, root)) = root_block %} <span class="tag" title="Tree root {{ root }}">root in block <a href="/block/{{ b }}">{{ b }}</a></span>{% endif %}
+    <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+    <p>This transaction spends with FCMP++, so its inputs have no ring. Each
+    input proves that it spends one of the outputs in a tree of every output
+    that was spendable at the block named here, and the proof does not say
+    which. The anonymity set is that whole tree, not 16 outputs, so there are
+    no decoys to list and no ages to compare. Outputs still locked then, and
+    everything created since, are not in it. The count is how many outputs the
+    tree held. Blocks carry the tree's root eight blocks ahead, so the root
+    this proof was checked against is in the block eight below
+    the one named. A pruned node drops the block number with the rest of the
+    proof. For a transaction still in the pool the daemon cannot be asked for
+    the count, because the question names one of the transaction's outputs,
+    and those have no place on the chain until it is mined.</p></details>
+  </dd>
+  {% if let Some(bytes) = proof_size %}
+  <dt>FCMP++ proof</dt><dd>{{ bytes }} bytes
+    <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+    <p>The size of the proof that every input spends an output in the tree
+    and is authorised to. It is fixed by how many inputs the transaction has
+    and how many layers the tree had, so it says nothing about which outputs
+    were spent. It grows by a layer's worth of data each time the tree gains
+    a layer.</p></details>
+  </dd>
+  {% endif %}
+  {% else %}
+  <dt>Ring size</dt><dd>{% if coinbase %}&mdash;{% else %}{{ ring_min }}{% if ring_max != ring_min %} to {{ ring_max }}{% endif %}{% if ring_max == 1 %} <span class="tag">no decoys</span>{% endif %}{% endif %}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
     <p>How many outputs each input could have spent. One of them is the real one
     and the rest are decoys drawn from the chain. Nothing on the chain says
     which is which. That set is the anonymity set for the input.
-    Consensus fixes the size for everyone, because a transaction that chose
-    its own would stand out. It has been 16 since August 2022. A coinbase
-    creates coins instead of spending them, so it has no ring.</p></details>
+    Consensus has fixed the size for everyone since October 2018, because a
+    transaction that chose its own would stand out. It was 11, and has been
+    16 since August 2022, except when spending an old public amount too rare
+    to find decoys for. Before that the sender chose it, above a minimum
+    that rose over time, and until November 2019 one input's ring could be
+    larger than another's. The earliest
+    transactions often used a ring of one, which has no decoys and shows the
+    output spent. A coinbase creates coins instead of spending them, so it
+    has no ring.</p></details>
   </dd>
+  {% endif %}
   <dt>Unlock time</dt><dd>{{ unlock_time }}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
-    <p>The height or time before which these outputs cannot be spent. Almost
+    <p>The block number or time before which these outputs cannot be spent. Almost
     every transaction sets 0, which means no lock. Consensus locks every
-    coinbase for 60 blocks, so a coinbase reads its own height plus 60.</p></details>
+    coinbase for 60 blocks, so a coinbase reads its own block number plus 60.</p></details>
   </dd>
   {% if payment_id != "" %}<dt>Payment ID</dt><dd><span class="hash">{{ payment_id }}</span>
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
@@ -75,31 +123,72 @@
 
 {% if pruned %}
 <div class="notice">
+  {% if fcmp_pp %}
+  This node is pruned and no longer holds this transaction's prunable half, so
+  the size above counts the prefix only, and the FCMP++ proof and the block it
+  was built against are unavailable.
+  {% else %}
   This node is pruned and no longer holds this transaction's prunable half, so
   the size above counts the prefix only and the ring signatures are unavailable.
   Ring members are still resolved in full, because the output table is never pruned.
+  {% endif %}
 </div>
 {% endif %}
 
 <h2>{% if coinbase %}Inputs{% else %}{{ inputs.len() }} Input{% if inputs.len() != 1 %}s{% endif %}{% endif %}</h2>
 {% if coinbase %}
-<p class="empty">A coinbase transaction has no inputs; it creates new coins.</p>
+<p class="empty">A coinbase transaction has no inputs because it creates new coins rather than spending existing ones. Monero's tail emission keeps those new coins at no less than 0.6 XMR a block for good, so the supply never stops growing. The miner also collects the fees of the block's other transactions.</p>
 {% else %}
+  <p class="walk-row"><a class="walk" href="/tx/{{ hash }}/{% if fcmp_pp %}fcmp{% else %}ring{% endif %}">How this spend stays private &rarr;</a></p>
+  {% if let Some(picture) = tree %}
+  <figure class="curve-tree">
+    <figcaption>Curve tree
+      <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+      <p>The tree every input on this page proved it spends from, as of the
+      reference block. The outputs are at the bottom. They are grouped 38 to a
+      Selene node, those 18 to a Helios node, and so on, alternating, up to a
+      single root. Each bar is one layer, and its width is logarithmic in its
+      size. Below the root, each bar is split the same way into one block for
+      each of the root's children: a column is everything under one of them,
+      and the last is short. Every input spends one of the outputs at the
+      bottom, and nothing here says which.</p></details>
+    </figcaption>
+    <div class="scroll">
+    {% for t in picture %}{% include "funnel.html" %}{% endfor %}
+    </div>
+  </figure>
+  {% endif %}
   {% for i in inputs %}
-  <details class="input-card"{% if inputs.len() == 1 %} open{% endif %}>
+  <details class="input-card"{% if inputs.len() == 1 && !fcmp_pp %} open{% endif %}>
     <summary>
       <span>Input {{ loop.index }}</span>
       <span>Key image <span class="hash mark">{{ i.key_image }}</span></span>
-      <span class="tag">{{ i.ring.len() }} ring members</span>
+      {% if fcmp_pp %}<span class="tag">FCMP++</span>{% else %}<span class="tag">{{ i.size }} ring member{% if i.size != 1 %}s{% endif %}</span>{% endif %}
       {% if let Some(amount) = i.amount %}<span class="tag">{{ amount }} XMR</span>{% endif %}
     </summary>
     <div class="body">
-      {% if i.unavailable %}
+      {% if fcmp_pp %}
+      <p class="empty indented">
+        This input has no ring. It proves that it spends one of the outputs in
+        the curve tree, so there are no members to list. The key image above is
+        what stops the same output from being spent twice.
+      </p>
+      {% else if i.unavailable %}
       <p class="empty indented">
         The daemon refused this ring lookup, so its members are not shown.
         The other inputs on this page are unaffected.
       </p>
       {% else %}
+      {% if i.size == 1 %}
+      <p class="empty indented">
+        This input has no decoys, so the output below is the one it spent.
+      </p>
+      {% else if i.ages.is_none() %}
+      <p class="empty indented">
+        This node could not read how many blocks the chain has, so the members' ages are unknown.
+      </p>
+      {% else %}
+      {% if let Some(ages) = i.ages %}
       <figure class="ring-ages">
         <figcaption>Ring member ages
           <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
@@ -116,18 +205,20 @@
         <svg class="strip" viewBox="0 0 {{ crate::html::STRIP_WIDTH }} {{ crate::html::STRIP_HEIGHT }}"
              role="img" aria-label="Ring member ages, oldest at the left and this transaction at the right">
           <rect class="track" x="0" y="0" rx="3" width="{{ crate::html::STRIP_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"/>
-          {% for t in i.ages.ticks %}<line class="grid" x1="{{ t.x }}" y1="0" x2="{{ t.x }}" y2="{{ crate::html::STRIP_BAND }}"/>{% endfor %}
-          {% for m in i.ages.marks %}<rect class="halo" x="{{ m.halo }}" y="0" rx="2" width="{{ crate::html::HALO_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"><title>{{ m.label }} old</title></rect>{% endfor %}
-          {% for m in i.ages.marks %}<rect class="stem" x="{{ m.stem }}" y="0" width="{{ crate::html::STEM_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"/>{% endfor %}
+          {% for t in ages.ticks %}<line class="grid" x1="{{ t.x }}" y1="0" x2="{{ t.x }}" y2="{{ crate::html::STRIP_BAND }}"/>{% endfor %}
+          {% for m in ages.marks %}<rect class="halo" x="{{ m.halo }}" y="0" rx="2" width="{{ crate::html::HALO_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"><title>{{ m.label }} old</title></rect>{% endfor %}
+          {% for m in ages.marks %}<rect class="stem" x="{{ m.stem }}" y="0" width="{{ crate::html::STEM_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"/>{% endfor %}
           <rect class="frame" x="0" y="0" rx="3" width="{{ crate::html::STRIP_WIDTH }}" height="{{ crate::html::STRIP_BAND }}"/>
-          {% for t in i.ages.ticks %}<text class="tick" x="{{ t.x }}" y="{{ crate::html::TICK_BASELINE }}" text-anchor="middle">{{ t.label }}</text>{% endfor %}
+          {% for t in ages.ticks %}<text class="tick" x="{{ t.x }}" y="{{ crate::html::TICK_BASELINE }}" text-anchor="middle">{{ t.label }}</text>{% endfor %}
           <text class="tick edge" x="{{ crate::html::STRIP_WIDTH }}" y="{{ crate::html::TICK_BASELINE }}" text-anchor="end">this tx</text>
         </svg>
         </div>
       </figure>
+      {% endif %}
+      {% endif %}
       <div class="scroll">
       <table>
-        <thead><tr><th class="num">#</th><th class="num">Height</th><th>Output key</th><th>In transaction</th></tr></thead>
+        <thead><tr><th class="num">#</th><th class="num">Block number</th><th>Output key</th><th>In transaction</th></tr></thead>
         <tbody>
         {% for m in i.ring %}
           <tr>
@@ -147,30 +238,68 @@
 {% endif %}
 
 <h2>{{ outputs.len() }} Output{% if outputs.len() != 1 %}s{% endif %}</h2>
-<div class="legend">
-  <div>Stealth address
-    <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+{% if has_unified_ids %}<p class="walk-row"><a class="walk" href="/tx/{{ hash }}/paths">Where {% if outputs.len() == 1 %}this output sits{% else %}these outputs sit{% endif %} in the curve tree &rarr;</a></p>{% endif %}
+<div class="notes">
+<div class="note-chips">
+  <details class="note-chip" name="output-notes" id="note-stealth"><summary>Stealth address <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary></details>
+  {% if self.hidden_amounts() %}<details class="note-chip" name="output-notes" id="note-amount"><summary>Amount <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary></details>{% endif %}
+  {% if has_view_tags %}<details class="note-chip" name="output-notes" id="note-tag"><summary>View tag <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary></details>{% endif %}
+  {% if carrot %}<details class="note-chip" name="output-notes" id="note-anchor"><summary>Janus anchor <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary></details>{% endif %}
+  {% if has_unified_ids %}<details class="note-chip" name="output-notes" id="note-uid"><summary>Unified ID <svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary></details>{% endif %}
+</div>
+  <div class="note-panel" id="panel-stealth">
     <p>Every output is paid to a fresh address used only once. The sender
     derives it from the recipient's address and a random secret, so the
     recipient's real address never reaches the chain.
     Two payments to the same person share nothing an observer can link. The
     recipient finds the outputs that are theirs by scanning the chain with
-    their view key.</p></details>
+    their view key.</p>
   </div>
-  {% if has_view_tags %}<div>View tag
-    <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+  {% if self.hidden_amounts() %}<div class="note-panel" id="panel-amount">
+    <p>Hidden in a Pedersen commitment, which only the sender and the
+    recipient can open. {% if rct_type >= 6 %}A Bulletproofs+{% else if rct_type >= 3 %}A Bulletproof{% else %}A Borromean{% endif %}
+    range proof shows that the amount is not negative, without revealing it,
+    so no one can create coins by sending less than nothing. The network
+    still checks that the inputs and outputs balance.</p>
+  </div>{% endif %}
+  {% if has_view_tags %}<div class="note-panel" id="panel-tag">
+    {% if carrot %}
+    <p>Three bytes that make scanning cheaper. A wallet has to test every output
+    on the chain to find the ones it can spend, and that test is expensive.
+    The view tag is a cheap first check, drawn from the same shared secret as
+    the stealth address. Carrot widened it from one byte to three, so it now
+    rules out all but one in about 16.7 million outputs before the expensive
+    check runs, where one byte let one in 256 through. It reveals nothing
+    beyond which bucket an output falls in.</p>
+    {% else %}
     <p>One byte that makes scanning cheaper. A wallet has to test every output on
     the chain to find the ones it can spend, and that test is expensive. The
     view tag is a cheap first check, drawn from the same shared secret as
     the stealth address. It rules out 255 of every 256 outputs before the
     expensive check runs. It arrived in August 2022. It reveals nothing
-    beyond which of the 256 buckets an output falls in.</p></details>
+    beyond which of the 256 buckets an output falls in.</p>
+    {% endif %}
+  </div>{% endif %}
+  {% if carrot %}<div class="note-panel" id="panel-anchor">
+    <p>Sixteen bytes, encrypted to the recipient. When they decrypt it, the
+    anchor lets their wallet check that the output was built for the address
+    it arrived at. Without that check a sender who knows two of someone's
+    addresses could build an output against one and send it to the other,
+    then wait to see whether the payment is acknowledged, and learn that the
+    two addresses belong to the same person. Carrot added it. To anyone else it is random.</p>
+  </div>{% endif %}
+  {% if has_unified_ids %}<div class="note-panel" id="panel-uid">
+    <p>The output's place in the single sequence of all outputs on the
+    chain, whatever their amount, that the FCMP++ tree is built from. A node
+    finds the output's path through the tree by it, and the path is what a
+    wallet needs to spend the output. It is public: anyone can read it here,
+    and follow it to the path.</p>
   </div>{% endif %}
 </div>
 <div class="scroll">
 <table>
   <thead><tr><th class="num">#</th><th>Stealth address</th>
-    <th class="num">Amount</th>{% if has_view_tags %}<th>View tag</th>{% endif %}</tr></thead>
+    <th class="num">Amount</th>{% if has_view_tags %}<th>View tag</th>{% endif %}{% if carrot %}<th>Janus anchor</th>{% endif %}{% if has_unified_ids %}<th class="num">Unified ID</th>{% endif %}</tr></thead>
   <tbody>
   {% for o in outputs %}
     <tr>
@@ -178,6 +307,8 @@
       <td><span class="hash">{{ o.public_key }}</span></td>
       <td class="num">{% if let Some(amount) = o.amount %}{{ amount }}{% else %}<span class="tag">hidden</span>{% endif %}</td>
       {% if has_view_tags %}<td><code>{{ o.view_tag }}</code></td>{% endif %}
+      {% if carrot %}<td><span class="hash">{{ o.anchor }}</span></td>{% endif %}
+      {% if has_unified_ids %}<td class="num">{% if let Some(id) = o.unified_id %}<a href="/tx/{{ hash }}/paths?output={{ loop.index }}" title="This output's path through the curve tree">{{ id }}</a>{% endif %}</td>{% endif %}
     </tr>
   {% endfor %}
   </tbody>
@@ -189,7 +320,8 @@
   <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
   <p>A free-form byte field that every transaction carries. It normally holds
   the transaction public key, which the recipient needs to recognise their
-  outputs. It can also hold an encrypted payment ID, and on a coinbase the
+  outputs. From Carrot on, that key is an ephemeral X25519 key rather than an
+  Ed25519 one, in the same place and the same 32 bytes. It can also hold an encrypted payment ID, and on a coinbase the
   tags a pool or a merge-mining setup adds. Consensus does not require it to
   parse, so some transactions carry bytes that decode to nothing. Those are
   shown raw below.</p></details>

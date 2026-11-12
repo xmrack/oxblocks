@@ -19,8 +19,8 @@
 //! from: this comment claimed they existed long before they did.
 
 use explorer_core::fmt::timestamp_utc;
-use explorer_core::{Hash32, ResolvedInput, TxFacts};
-use monerod_rpc::types::{PoolTxInfo, TxEntry, TxJson, TxOutTarget};
+use explorer_core::{BlockTree, Hash32, ResolvedInput, TxFacts};
+use monerod_rpc::types::{BlockHeader, PoolTxInfo, TxEntry, TxJson};
 use serde::Serialize;
 
 /// One ring member.
@@ -49,19 +49,43 @@ pub struct ApiInput {
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiOutput {
     pub amount: u64,
+    /// A Carrot output's encrypted Janus anchor, 32 hex characters. `null` for
+    /// every output from before Carrot, which has none.
+    pub encrypted_janus_anchor: Option<String>,
     pub public_key: String,
+    /// The output's index among every output on the chain, of every amount,
+    /// which a wallet uses to ask for the output's path through the curve
+    /// tree. `null` for a transaction still in the pool, and on a daemon from
+    /// before FCMP++.
+    pub unified_id: Option<u64>,
+    /// Two hex characters before Carrot and six from it. `null` for an output
+    /// from before view tags, not `""`, which would read as a tag of no bytes.
+    pub view_tag: Option<String>,
 }
 
-/// `get_tx_json` — the shared 12-key transaction object that appears inside
-/// `/api/block`, `/api/transactions` and `/api/mempool`.
+/// The transaction object that appears inside `/api/block`,
+/// `/api/transactions` and `/api/mempool`.
 #[derive(Debug, Clone, Serialize)]
 pub struct TxSummary {
     pub coinbase: bool,
     pub extra: String,
+    /// The FCMP++ proof's length in bytes. `null` in the same cases as
+    /// `reference_block`.
+    pub fcmp_pp_proof_size: Option<u64>,
     pub mixin: u64,
+    /// The curve tree's layer count when the FCMP++ proof was built. `null`
+    /// in the same cases as `reference_block`.
+    pub n_tree_layers: Option<u8>,
     pub payment_id: String,
     pub payment_id8: String,
     pub rct_type: u8,
+    /// The height the curve tree was taken at when an FCMP++ transaction's
+    /// inputs were proven. Its root is in block `reference_block - 8`; see
+    /// [`monerod_rpc::types::TREE_ROOT_LAG`]. `null` for a ring spend and a
+    /// coinbase, and for an FCMP++ transaction whose prunable half the node no
+    /// longer holds, since the field is stored there. Read `rct_type` to tell
+    /// the last case apart.
+    pub reference_block: Option<u64>,
     pub tx_fee: u64,
     pub tx_hash: String,
     pub tx_size: u64,
@@ -73,21 +97,38 @@ pub struct TxSummary {
     pub xmr_outputs: u64,
 }
 
-/// `/api/transaction` — the 13 shared keys plus seven more.
+/// `/api/transaction` — the shared keys plus the placement, the inputs, the
+/// outputs and the tree size.
 #[derive(Debug, Clone, Serialize)]
 pub struct TxDetail {
+    /// How many outputs the curve tree held as of `reference_block`: the
+    /// number of outputs each FCMP++ input could be spending. `null` for a
+    /// ring spend, for a transaction still in the pool, where `reference_block`
+    /// is `null`, and when the daemon cannot say. Filled only by
+    /// `/api/transaction`, and so by `/api/search` on a transaction hash,
+    /// which answers through it, because it costs a daemon call.
+    pub anonymity_set: Option<u64>,
     pub block_height: u64,
     pub coinbase: bool,
     pub confirmations: u64,
     pub current_height: u64,
     pub extra: String,
+    /// See [`TxSummary::fcmp_pp_proof_size`].
+    pub fcmp_pp_proof_size: Option<u64>,
+    /// Whether the transaction waits in the pool rather than sits in a block.
+    /// A pool transaction also reads `block_height` 0 and `confirmations` 0.
+    pub in_pool: bool,
     /// `null`, not `[]`, for a coinbase transaction, which spends nothing.
     pub inputs: Option<Vec<ApiInput>>,
     pub mixin: u64,
+    /// See [`TxSummary::n_tree_layers`].
+    pub n_tree_layers: Option<u8>,
     pub outputs: Vec<ApiOutput>,
     pub payment_id: String,
     pub payment_id8: String,
     pub rct_type: u8,
+    /// See [`TxSummary::reference_block`].
+    pub reference_block: Option<u64>,
     pub timestamp: u64,
     pub timestamp_utc: String,
     pub tx_fee: u64,
@@ -105,12 +146,60 @@ pub struct BlockDetail {
     pub block_height: u64,
     pub current_height: u64,
     pub hash: String,
+    /// The curve tree's layer count, from the FCMP++ fork on, and 0 while the
+    /// tree is empty. `null` when no tree is reported: below the fork, when
+    /// the daemon's block carries no well-formed tree, and in `/api/blocks`
+    /// for a post-fork block whose body could not be fetched.
+    pub n_tree_layers: Option<u8>,
     /// Integer here. The *same* value is a JSON float in `/api/transactions`.
     /// On one block that is 95511 against 95511.0.
     pub size: u64,
     pub timestamp: u64,
     pub timestamp_utc: String,
+    /// The curve tree root this block commits to, hex, from the FCMP++ fork
+    /// on. `null` in the same cases as `n_tree_layers`.
+    pub tree_root: Option<String>,
     pub txs: Vec<TxSummary>,
+}
+
+impl BlockDetail {
+    /// One block's API representation, from its header and its transactions.
+    ///
+    /// Shared by `/api/block` and `/api/blocks/<start>/<end>`, because the
+    /// element type of the range response is exactly the single-block
+    /// response. Takes the header rather than a whole `get_block`, because a
+    /// range is answered from `get_block_headers_range` and fetches a block's
+    /// body only when the block holds transactions or carries a curve tree.
+    pub fn build(
+        header: &BlockHeader,
+        depth: u64,
+        entries: &[TxEntry],
+        tree: Option<&BlockTree>,
+    ) -> BlockDetail {
+        let mut txs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry.parse_json() {
+                Ok(tx) => txs.push(TxSummary::build(entry, &tx)),
+                // One undecodable transaction must not lose the whole block page.
+                Err(e) => tracing::warn!(tx = %entry.tx_hash, "skipping: {e}"),
+            }
+        }
+
+        BlockDetail {
+            block_height: header.height,
+            // The tip, derived from this block's depth: `depth` is 0 for the tip,
+            // and `current_height` is the chain *height* (tip + 1). Block
+            // 2,000,000 at depth 1,765,612 reports current_height 3,765,613.
+            current_height: header.height.saturating_add(depth).saturating_add(1),
+            hash: normalise_hash(&header.hash),
+            n_tree_layers: tree.map(|t| t.n_layers),
+            size: header.block_size,
+            timestamp: header.timestamp,
+            timestamp_utc: timestamp_utc(header.timestamp),
+            tree_root: tree.map(|t| t.root.clone()),
+            txs,
+        }
+    }
 }
 
 impl TxSummary {
@@ -132,10 +221,13 @@ impl TxSummary {
         Self {
             coinbase: f.coinbase,
             extra: f.extra_hex(),
+            fcmp_pp_proof_size: f.fcmp_pp.and_then(|x| x.proof_size),
             mixin: f.ring_size as u64,
+            n_tree_layers: f.fcmp_pp.and_then(|x| x.n_tree_layers),
             payment_id: f.payment_id_hex(),
             payment_id8: f.payment_id8_hex(),
             rct_type: f.rct_type,
+            reference_block: f.fcmp_pp.and_then(|x| x.reference_block),
             tx_fee: f.fee,
             tx_hash: hash.to_lowercase(),
             tx_size: f.size,
@@ -156,6 +248,7 @@ struct Placement {
     block_height: u64,
     timestamp: u64,
     confirmations: u64,
+    in_pool: bool,
 }
 
 impl Placement {
@@ -167,6 +260,7 @@ impl Placement {
             block_height: entry.block_height,
             timestamp: entry.block_timestamp,
             confirmations: current_height.saturating_sub(entry.block_height),
+            in_pool: false,
         }
     }
 
@@ -175,6 +269,7 @@ impl Placement {
             block_height: 0,
             timestamp: received,
             confirmations: 0,
+            in_pool: true,
         }
     }
 }
@@ -190,6 +285,9 @@ impl TxDetail {
             &entry.tx_hash,
             &TxFacts::from_entry(entry, tx),
             tx,
+            entry
+                .unified_ids_per_output(tx.vout.len())
+                .unwrap_or_default(),
             rings,
             &Placement::of(entry, current_height),
             current_height,
@@ -197,12 +295,7 @@ impl TxDetail {
     }
 
     /// The same shape for a transaction still in the pool, built from the pool
-    /// listing itself.
-    ///
-    /// `/get_transaction_pool` already carries each transaction's JSON, so
-    /// asking `/get_transactions` for the same hashes is a round trip spent
-    /// re-fetching what the daemon has already sent. A pool entry states its
-    /// own size and fee, which is why `TxFacts` has a second constructor.
+    /// listing itself, which carries each transaction's JSON, size and fee.
     pub fn build_pool(
         info: &PoolTxInfo,
         tx: &TxJson,
@@ -213,6 +306,7 @@ impl TxDetail {
             &info.id_hash,
             &TxFacts::from_pool(info, tx),
             tx,
+            &[],
             rings,
             &Placement::pool(info.receive_time),
             current_height,
@@ -223,6 +317,7 @@ impl TxDetail {
         hash: &str,
         f: &TxFacts,
         tx: &TxJson,
+        unified_ids: &[u64],
         rings: &[ResolvedInput],
         at: &Placement,
         current_height: u64,
@@ -258,34 +353,38 @@ impl TxDetail {
         let outputs = tx
             .vout
             .iter()
-            .map(|o| ApiOutput {
+            .enumerate()
+            .map(|(i, o)| ApiOutput {
                 amount: o.amount,
-                public_key: match &o.target {
-                    TxOutTarget::Key(k) => k.clone(),
-                    TxOutTarget::TaggedKey(t) => t.key.clone(),
-                    other => {
-                        // Legacy script outputs exist only in the pre-v1 era
-                        // and carry no one-time key. Render empty rather than
-                        // inventing one.
-                        let _ = other;
-                        String::new()
-                    }
-                },
+                // Legacy script outputs exist only in the pre-v1 era and carry
+                // no one-time key, so they render empty rather than inventing
+                // one. Every other target, Carrot's included, names its key
+                // through the target's own accessors, which the HTML pages
+                // share.
+                encrypted_janus_anchor: o.target.encrypted_janus_anchor().map(str::to_owned),
+                public_key: o.target.public_key().map(str::to_owned).unwrap_or_default(),
+                unified_id: unified_ids.get(i).copied(),
+                view_tag: o.target.view_tag().map(str::to_owned),
             })
             .collect();
 
         Self {
+            anonymity_set: None,
             block_height: at.block_height,
             coinbase: f.coinbase,
             confirmations: at.confirmations,
             current_height,
             extra: f.extra_hex(),
+            fcmp_pp_proof_size: f.fcmp_pp.and_then(|x| x.proof_size),
+            in_pool: at.in_pool,
             inputs,
             mixin: f.ring_size as u64,
+            n_tree_layers: f.fcmp_pp.and_then(|x| x.n_tree_layers),
             outputs,
             payment_id: f.payment_id_hex(),
             payment_id8: f.payment_id8_hex(),
             rct_type: f.rct_type,
+            reference_block: f.fcmp_pp.and_then(|x| x.reference_block),
             timestamp: at.timestamp,
             timestamp_utc: timestamp_utc(at.timestamp),
             tx_fee: f.fee,
@@ -400,10 +499,13 @@ mod tests {
         TxSummary {
             coinbase: false,
             extra: String::new(),
+            fcmp_pp_proof_size: None,
             mixin: 16,
+            n_tree_layers: None,
             payment_id: String::new(),
             payment_id8: String::new(),
             rct_type: 0,
+            reference_block: None,
             tx_fee: 0,
             tx_hash: String::new(),
             tx_size: 0,
@@ -416,24 +518,32 @@ mod tests {
 
     fn detail() -> TxDetail {
         TxDetail {
+            anonymity_set: None,
             block_height: 0,
             coinbase: false,
             confirmations: 0,
             current_height: 0,
             extra: String::new(),
+            fcmp_pp_proof_size: None,
+            in_pool: false,
             inputs: Some(vec![ApiInput {
                 amount: 0,
                 key_image: String::new(),
                 mixins: Some(vec![mixin()]),
             }]),
             mixin: 16,
+            n_tree_layers: None,
             outputs: vec![ApiOutput {
                 amount: 0,
+                encrypted_janus_anchor: None,
                 public_key: String::new(),
+                unified_id: None,
+                view_tag: None,
             }],
             payment_id: String::new(),
             payment_id8: String::new(),
             rct_type: 0,
+            reference_block: None,
             timestamp: 0,
             timestamp_utc: String::new(),
             tx_fee: 0,
@@ -463,7 +573,10 @@ mod tests {
         assert_sorted(
             &declared_keys(&ApiOutput {
                 amount: 0,
+                encrypted_janus_anchor: Some(String::new()),
                 public_key: String::new(),
+                unified_id: Some(0),
+                view_tag: Some(String::new()),
             }),
             "ApiOutput",
         );
@@ -474,9 +587,11 @@ mod tests {
                 block_height: 0,
                 current_height: 0,
                 hash: String::new(),
+                n_tree_layers: Some(2),
                 size: 0,
                 timestamp: 0,
                 timestamp_utc: String::new(),
+                tree_root: Some(String::new()),
                 txs: vec![summary()],
             }),
             "BlockDetail",
@@ -501,14 +616,105 @@ mod tests {
             keys.iter().any(|k| k == "inputs") && keys.iter().any(|k| k == "outputs"),
             "the containing fields themselves were missed"
         );
-        assert_eq!(keys.len(), 20, "TxDetail has 20 fields of its own");
+        assert_eq!(keys.len(), 25, "TxDetail has 25 fields of its own");
 
         // A value that happens to be a string must not be read as a key.
         let probe = ApiOutput {
             amount: 0,
+            encrypted_janus_anchor: None,
             public_key: "not_a_key".to_owned(),
+            unified_id: None,
+            view_tag: None,
         };
-        assert_eq!(declared_keys(&probe), vec!["amount", "public_key"]);
+        assert_eq!(
+            declared_keys(&probe),
+            vec![
+                "amount",
+                "encrypted_janus_anchor",
+                "public_key",
+                "unified_id",
+                "view_tag"
+            ]
+        );
+    }
+
+    /// An FCMP++ transaction with Carrot outputs, through the same builder
+    /// `/api/transaction` uses: every output publishes its one-time address.
+    #[test]
+    fn an_fcmp_pp_transaction_publishes_its_keys_and_an_empty_ring() {
+        let entry: TxEntry = serde_json::from_value(serde_json::json!({
+            "tx_hash": "AB".repeat(32), "in_pool": false,
+            "block_height": 3_012_400, "block_timestamp": 1_790_000_000,
+        }))
+        .unwrap();
+        let tx: TxJson = serde_json::from_value(serde_json::json!({
+            "version": 2, "unlock_time": 0,
+            "vin": [{"key": {"amount": 0, "key_offsets": [], "k_image": "cc".repeat(32)}}],
+            "vout": [{"amount": 0, "target": {"carrot_v1": {
+                "key": "dd".repeat(32), "view_tag": "a1b2c3",
+                "encrypted_janus_anchor": "ee".repeat(16)}}}],
+            "extra": [],
+            "rct_signatures": {"type": 7, "txnFee": 91_000_000},
+            "rctsig_prunable": {"reference_block": 3_012_390, "n_tree_layers": 6},
+        }))
+        .unwrap();
+        let rings = explorer_core::unexpanded_inputs(&tx);
+        let detail = TxDetail::build(&entry, &tx, &rings, 3_012_401);
+
+        assert_eq!(detail.rct_type, 7);
+        assert_eq!(detail.mixin, 0);
+        assert_eq!(detail.reference_block, Some(3_012_390));
+        assert_eq!(detail.n_tree_layers, Some(6));
+        assert_eq!(detail.outputs[0].public_key, "dd".repeat(32));
+        assert_eq!(detail.outputs[0].view_tag.as_deref(), Some("a1b2c3"));
+        assert_eq!(
+            detail.outputs[0].encrypted_janus_anchor,
+            Some("ee".repeat(16))
+        );
+
+        // The block and mempool lists carry the tree fields too.
+        let summary = TxSummary::build(&entry, &tx);
+        assert_eq!(summary.reference_block, Some(3_012_390));
+        assert_eq!(summary.n_tree_layers, Some(6));
+
+        let inputs = detail.inputs.as_ref().expect("a spend lists its inputs");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            inputs[0].mixins.as_ref().map(Vec::len),
+            Some(0),
+            "no ring is an empty list, not a withheld one"
+        );
+    }
+
+    /// A ring-era transaction answers `null` for everything FCMP++ and Carrot
+    /// added, and a one-byte view tag where its output has one.
+    #[test]
+    fn a_ring_transaction_has_null_tree_fields_and_no_anchor() {
+        let entry: TxEntry = serde_json::from_value(serde_json::json!({
+            "tx_hash": "AB".repeat(32), "in_pool": true, "received_timestamp": 1,
+        }))
+        .unwrap();
+        let tx: TxJson = serde_json::from_value(serde_json::json!({
+            "version": 2, "unlock_time": 0,
+            "vin": [{"key": {"amount": 0, "key_offsets": [5], "k_image": "cc".repeat(32)}}],
+            "vout": [
+                {"amount": 0, "target": {"tagged_key": {"key": "dd".repeat(32), "view_tag": "9f"}}},
+                {"amount": 0, "target": {"key": "ee".repeat(32)}},
+            ],
+            "extra": [],
+            "rct_signatures": {"type": 6, "txnFee": 1},
+        }))
+        .unwrap();
+        let rings = explorer_core::unexpanded_inputs(&tx);
+        let value = serde_json::to_value(TxDetail::build(&entry, &tx, &rings, 10)).unwrap();
+
+        assert_eq!(value["reference_block"], serde_json::Value::Null);
+        assert_eq!(value["n_tree_layers"], serde_json::Value::Null);
+        assert_eq!(value["outputs"][0]["view_tag"], "9f");
+        assert_eq!(value["outputs"][1]["view_tag"], serde_json::Value::Null);
+        for out in value["outputs"].as_array().unwrap() {
+            assert_eq!(out["encrypted_janus_anchor"], serde_json::Value::Null);
+        }
     }
 
     /// What the ordering actually rests on today.

@@ -5,14 +5,15 @@
 
 <p>
   Every endpoint below is a <code class="lit">GET</code>. None of them needs a
-  key, a header or a session. The response bodies match those of xmrblocks, so
-  a client written for that explorer reads these without changes.
+  key, a header or a session. The keys for FCMP++ and Carrot are listed under
+  <a href="#shape-block">the block</a> and
+  <a href="#shape-txsummary">transaction</a> shapes.
 </p>
 
 <p>
-  Each endpoint carries a <code class="lit">curl</code> line. The lines name
-  <code class="lit">$OXBLOCKS</code> instead of a host. Set it to the base URL
-  of this explorer, scheme included, and the examples run as written.
+  The example responses on this page were recorded from a regtest chain run by
+  monerod's FCMP++ branch, so their block numbers are small and their transactions
+  spend with FCMP++. Every hash and amount in them is one that chain holds.
 </p>
 
 <h2>The envelope</h2>
@@ -27,11 +28,19 @@
 
 <p>
   <code class="lit">fail</code> means the caller asked for something this
-  explorer will not answer, such as an argument that does not parse or a height
+  explorer will not answer, such as an argument that does not parse or a block number
   past the tip. <code class="lit">error</code> means this explorer or its daemon
-  could not answer. Messages say little about internals. A daemon the explorer
-  cannot reach gives you &ldquo;the explorer could not reach its daemon&rdquo;
-  and no address.
+  could not answer.
+</p>
+
+<p>
+  That includes the answers no endpoint writes. A path under
+  <code class="lit">/api/</code> that names no endpoint gets a
+  <code class="lit">404</code>, and a method other than
+  <code class="lit">GET</code> gets a <code class="lit">405</code>. A request
+  that outlives its deadline gets a <code class="lit">504</code>, a request
+  body over the limit gets a <code class="lit">413</code>, and a panic caught
+  in a handler gets a <code class="lit">500</code>.
 </p>
 
 <h3>Status codes</h3>
@@ -45,70 +54,33 @@
   <thead><tr><th class="num">Code</th><th>Meaning</th></tr></thead>
   <tbody>
     <tr><td class="num">200</td><td>The answer is in <code class="lit">data</code>.</td></tr>
-    <tr><td class="num">400</td><td>The argument is not one this explorer reads, or a limit is over its cap.</td></tr>
+    <tr><td class="num">400</td><td>The argument is not one this explorer reads, or the request is over one of its limits.</td></tr>
     <tr><td class="num">404</td><td>The argument was well formed and the chain does not hold it.</td></tr>
     <tr><td class="num">500</td><td>A bug here.</td></tr>
     <tr><td class="num">502</td><td>The daemon could not be reached, or answered with something unusable.</td></tr>
-    <tr><td class="num">503</td><td>This deployment cannot serve the endpoint, because its daemon lacks the call.</td></tr>
+    <tr><td class="num">503</td><td>This deployment cannot serve the endpoint, because its daemon lacks the call, or the explorer is busy with other requests for now.</td></tr>
   </tbody>
 </table>
 </div>
 
-<p>
-  Keys are sorted alphabetically at every level. Enveloped responses carry
-  <code class="lit">Content-Type: application/json</code> and
-  <code class="lit">Access-Control-Allow-Origin: *</code>. The server compresses
-  them with gzip, deflate or brotli when the request offers one.
-</p>
-
-<p>
-  <strong>Three answers are not enveloped</strong>, because the layers above
-  this API produce them. A request that outlives its deadline gets a bare
-  <code class="lit">504</code>. A request body over the limit gets a
-  <code class="lit">413</code>. A panic caught in a handler gets a
-  <code class="lit">500</code>. All three are
-  <code class="lit">text/plain</code> and carry no
-  <code class="lit">status</code> member. All three still carry the security
-  headers.
-</p>
-
-<p>
-  <code class="lit">HEAD</code> works wherever <code class="lit">GET</code>
-  works, without the body. Any other method gets a bare
-  <code class="lit">405</code> with <code class="lit">Allow: GET,HEAD</code> and
-  <strong>no</strong> <code class="lit">Access-Control-*</code> headers. There
-  is no preflight handler, so a cross-origin request that needs one fails. A
-  simple cross-origin <code class="lit">GET</code> works.
-</p>
-
-<h2>How arguments are read</h2>
-
-<p>
-  The explorer reads arguments as given. A height is decimal digits. A hash is
-  64 hex characters in either case. A postfix is hex. Anything else gets a
-  <code class="lit">400</code>, and so does a <code class="lit">page</code> or
-  <code class="lit">limit</code> that is not a plain number. The explorer strips
-  nothing and repairs nothing, so <code class="lit">/api/block/1,23</code> gets
-  a <code class="lit">400</code> rather than block 123.
-</p>
-
 <h2>Endpoints</h2>
 
 <ul class="toc">
-  <li><a href="#version">/api/version</a></li>
-  <li><a href="#networkinfo">/api/networkinfo</a></li>
-  <li><a href="#block">/api/block/&lt;id&gt;</a></li>
-  <li><a href="#rawblock">/api/rawblock/&lt;id&gt;</a></li>
-  <li><a href="#blocks">/api/blocks/&lt;start&gt;/&lt;end&gt;</a></li>
-  <li><a href="#transaction">/api/transaction/&lt;hash&gt;</a></li>
-  <li><a href="#rawtransaction">/api/rawtransaction/&lt;hash&gt;</a></li>
-  <li><a href="#private">/api/transaction/private/&lt;postfix&gt;</a></li>
-  <li><a href="#transactions">/api/transactions</a></li>
-  <li><a href="#mempool">/api/mempool</a></li>
-  <li><a href="#recent">/api/transactions/recent</a></li>
-  <li><a href="#search">/api/search/&lt;query&gt;</a></li>
-  <li><a href="#feeestimate">/api/feeestimate</a></li>
-  <li><a href="#health">/health</a></li>
+  <li><a href="#version"><span class="verb">GET</span><code>/api/version</code><span class="what">API and daemon versions</span></a></li>
+  <li><a href="#networkinfo"><span class="verb">GET</span><code>/api/networkinfo</code><span class="what">Chain and node state</span></a></li>
+  <li><a href="#block"><span class="verb">GET</span><code>/api/block/&lt;id&gt;</code><span class="what">One block and its transactions</span></a></li>
+  <li><a href="#rawblock"><span class="verb">GET</span><code>/api/rawblock/&lt;id&gt;</code><span class="what">A block as monerod decoded it</span></a></li>
+  <li><a href="#blocks"><span class="verb">GET</span><code>/api/blocks/&lt;start&gt;/&lt;end&gt;</code><span class="what">A range of blocks</span></a></li>
+  <li><a href="#transaction"><span class="verb">GET</span><code>/api/transaction/&lt;hash&gt;</code><span class="what">One transaction, rings resolved</span></a></li>
+  <li><a href="#paths"><span class="verb">GET</span><code>/api/transaction/&lt;hash&gt;/paths</code><span class="what">Its outputs' paths in the curve tree</span></a></li>
+  <li><a href="#rawtransaction"><span class="verb">GET</span><code>/api/rawtransaction/&lt;hash&gt;</code><span class="what">A transaction as monerod decoded it</span></a></li>
+  <li><a href="#private"><span class="verb">GET</span><code>/api/transaction/private/&lt;postfix&gt;</code><span class="what">Transactions by hash suffix</span></a></li>
+  <li><a href="#transactions"><span class="verb">GET</span><code>/api/transactions</code><span class="what">Recent blocks, page by page</span></a></li>
+  <li><a href="#mempool"><span class="verb">GET</span><code>/api/mempool</code><span class="what">Transactions waiting to be mined</span></a></li>
+  <li><a href="#recent"><span class="verb">GET</span><code>/api/transactions/recent</code><span class="what">Recent blocks and the pool at once</span></a></li>
+  <li><a href="#search"><span class="verb">GET</span><code>/api/search/&lt;query&gt;</code><span class="what">A block number or hash, looked up</span></a></li>
+  <li><a href="#feeestimate"><span class="verb">GET</span><code>/api/feeestimate</code><span class="what">The daemon's fee estimate</span></a></li>
+  <li><a href="#health"><span class="verb">GET</span><code>/health</code><span class="what">Liveness and cache occupancy</span></a></li>
 </ul>
 
 <section class="endpoint" id="version">
@@ -175,10 +147,10 @@
 </section>
 
 <section class="endpoint" id="block">
-  <h3><span class="verb">GET</span><code class="lit">/api/block/&lt;height|hash&gt;</code></h3>
+  <h3><span class="verb">GET</span><code class="lit">/api/block/&lt;number|hash&gt;</code></h3>
   <p>
     One block and every transaction in it, coinbase first. The argument is a
-    height when it is eight characters or fewer, and a block hash when it is
+    block number when it is eight characters or fewer, and a block hash when it is
     exactly 64 hex characters. Anything else gets a
     <code class="lit">400</code>. The bound of eight counts characters, not
     value.
@@ -197,7 +169,7 @@
 </section>
 
 <section class="endpoint" id="rawblock">
-  <h3><span class="verb">GET</span><code class="lit">/api/rawblock/&lt;height|hash&gt;</code></h3>
+  <h3><span class="verb">GET</span><code class="lit">/api/rawblock/&lt;number|hash&gt;</code></h3>
   <p>
     The block as monerod decoded it. The explorer sorts the keys of the
     daemon's own <code class="lit">json</code> document and adds nothing to it.
@@ -218,7 +190,13 @@
     Each block costs the daemon a call, so an unbounded range would let one
     request make millions of them. A wider range gets a
     <code class="lit">400</code>, and the refusal is arithmetic on the two
-    heights, so it costs the daemon nothing.
+    block numbers, so it costs the daemon nothing.
+  </p>
+  <p>
+    <strong>The blocks in one range may hold {{ max_range_mib }} MiB at
+    most</strong>, by the sizes their headers give. A range holding more gets
+    a <code class="lit">400</code> once those headers are fetched, and a
+    narrower range is served.
   </p>
   <p><a href="/api/blocks/{{ sample_range_start }}/{{ sample_height }}">/api/blocks/{{ sample_range_start }}/{{ sample_height }}</a></p>
   <pre class="blob">curl -s "$OXBLOCKS/api/blocks/{{ sample_range_start }}/{{ sample_height }}"</pre>
@@ -232,13 +210,19 @@
   <h3><span class="verb">GET</span><code class="lit">/api/transaction/&lt;hash&gt;</code></h3>
   <p>
     One transaction, with <strong>every ring resolved</strong>. Each input
-    lists its ring members with the height, one time key and source transaction
+    lists its ring members with the block number, one time key and source transaction
     of each. This is the only endpoint that resolves rings, because it costs
-    one daemon call for each input.
+    a daemon call for the transaction's ring members, and one for each input
+    when the daemon refuses them together. An FCMP++ transaction has no rings
+    to resolve; it costs one call for its tree size instead.
   </p>
   <p>
-    Returns a <a href="#shape-txdetail">transaction detail object</a>. It also
+    Returns a <a href="#shape-txdetail">transaction detail object</a>, and is
+    one of two endpoints that fill its <code class="lit">anonymity_set</code>,
+    with <a href="#search">/api/search</a> on a transaction hash, which
+    answers through this one. It also
     serves a transaction in the pool, which reports
+    <code class="lit">in_pool</code> <code class="lit">true</code>,
     <code class="lit">block_height</code> 0,
     <code class="lit">confirmations</code> 0, and the time it arrived in place
     of a block timestamp.
@@ -248,6 +232,51 @@
     <summary>Example response</summary>
     <pre class="blob">{{ example_transaction }}</pre>
   </details>
+</section>
+
+<section class="endpoint" id="paths">
+  <h3><span class="verb">GET</span><code class="lit">/api/transaction/&lt;hash&gt;/paths?block=&amp;from=&amp;output=</code></h3>
+  <p>
+    The paths through the FCMP++ curve tree of a mined transaction's outputs,
+    as of <code class="lit">block</code>, or the tip when it is left out: 50
+    outputs at most, starting at output <code class="lit">from</code>, counted
+    from 0, or output <code class="lit">output</code> alone, counted from 1 as
+    the transaction page lists them. Each parameter is a plain number, and an
+    empty one counts as left out. The explorer recomputes each path's hashes from
+    its leaves up and compares the result with the root in block
+    <code class="lit">block</code> &minus; 8. <code class="lit">root_check</code>
+    is <code class="lit">matches</code> when the path of every output in the
+    tree so far holds and reaches that root, <code class="lit">fails</code>
+    when one does not or the daemon sends none for an output its lock puts in
+    the tree, and <code class="lit">unchecked</code> when no output is in the
+    tree yet or no block carries the root. The paths, the transaction and the
+    root all come from this explorer's daemon, so a match shows they agree
+    with each other, not that the daemon is honest.
+  </p>
+  <p>
+    Each output carries its <code class="lit">unified_id</code> and its
+    <code class="lit">last_locked_block</code>. The tree holds the output from
+    that block on. An output in the tree also carries its
+    <code class="lit">leaf_idx</code>, its <code class="lit">check</code>
+    (<code class="lit">holds</code>, <code class="lit">broken</code>,
+    <code class="lit">unreadable</code>, <code class="lit">misshapen</code> or
+    <code class="lit">not_the_output</code>, for a path whose leaf is not the
+    output's key and commitment as its transaction records them),
+    and its <code class="lit">groups</code>, from the leaves to the root. Each
+    group gives its <code class="lit">layer</code>, <code class="lit">curve</code>,
+    <code class="lit">layer_size</code>, its first member's place in the layer
+    as <code class="lit">start</code>, and the ancestor's place in the group as
+    <code class="lit">offset</code>. The leaves' group lists its
+    <code class="lit">leaves</code>, each with its unified id, kind, output key
+    and commitment. Every other group lists its <code class="lit">members</code>
+    as compressed points.
+  </p>
+  <p>
+    A transaction in the pool is a 404: its outputs have no place in the tree
+    until it is mined and they unlock. So is a block past the tip, and a
+    window that starts past the transaction's last output.
+  </p>
+  <pre class="blob">curl -s "$OXBLOCKS/api/transaction/&lt;hash&gt;/paths"</pre>
 </section>
 
 <section class="endpoint" id="rawtransaction">
@@ -264,13 +293,15 @@
   <p>
     Every transaction whose hash <em>ends</em> with the hex postfix you give.
     The caller picks the one it wants on its own machine, so the explorer never
-    learns which one that was. Returns <code class="lit">txs</code> and
-    <code class="lit">missed_txs</code>.
+    learns which one that was. Returns <code class="lit">txs</code>,
+    <code class="lit">txs_no</code>, the number of transactions in
+    <code class="lit">txs</code>, and <code class="lit">missed_txs</code>.
   </p>
   <p>
     Rings stay <strong>unresolved</strong> here. Each input carries its amount
     and key image, and <code class="lit">mixins</code> is
-    <code class="lit">null</code>. Resolving every ring in the set would cost
+    <code class="lit">null</code>, except on an FCMP++ input, which has no
+    ring and reads <code class="lit">[]</code>. Resolving every ring in the set would cost
     thousands of calls for a caller that wants one transaction. Ask for that
     one through <a href="#transaction">/api/transaction</a>.
   </p>
@@ -297,9 +328,9 @@
   </p>
   <div class="scroll">
   <table>
-    <thead><tr><th>Parameter</th><th>Default</th><th>Maximum</th><th>Notes</th></tr></thead>
+    <thead><tr><th>Parameter</th><th class="num">Default</th><th class="num">Maximum</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td><code class="lit">page</code></td><td class="num">0</td><td>none</td><td>counts back from the tip</td></tr>
+      <tr><td><code class="lit">page</code></td><td class="num">0</td><td class="num">none</td><td>counts back from the tip</td></tr>
       <tr><td><code class="lit">limit</code></td><td class="num">25</td><td class="num">{{ max_transactions_limit }}</td><td>over the cap gets a 400</td></tr>
     </tbody>
   </table>
@@ -307,7 +338,11 @@
   <p>
     One page costs one header range, one call for each block that holds
     transactions, and one batched fetch. The cap stops a single request from
-    reaching a thousand blocks of the operator's daemon.
+    reaching a thousand blocks of the operator's daemon. A page whose blocks
+    hold more than {{ max_range_mib }} MiB, as
+    <a href="#blocks">/api/blocks</a> describes, gets a
+    <code class="lit">400</code>; ask for a smaller
+    <code class="lit">limit</code>.
   </p>
   <p>
     <code class="lit">total_page_no</code> rounds <em>up</em>, so the count
@@ -330,9 +365,9 @@
   </p>
   <div class="scroll">
   <table>
-    <thead><tr><th>Parameter</th><th>Default</th><th>Maximum</th><th>Notes</th></tr></thead>
+    <thead><tr><th>Parameter</th><th class="num">Default</th><th class="num">Maximum</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td><code class="lit">page</code></td><td class="num">0</td><td>none</td><td>counts back from the newest</td></tr>
+      <tr><td><code class="lit">page</code></td><td class="num">0</td><td class="num">none</td><td>counts back from the newest</td></tr>
       <tr><td><code class="lit">limit</code></td><td class="num">{{ max_mempool_limit }}</td><td class="num">{{ max_mempool_limit }}</td><td>over the cap gets a 400</td></tr>
     </tbody>
   </table>
@@ -362,8 +397,17 @@
     <a href="#private">the private lookup</a>.
   </p>
   <p>
-    The block window is fixed. The pool is not. During a flood of unconfirmed
-    transactions this is the most expensive endpoint here.
+    The pool comes first. Each pool transaction has
+    <code class="lit">in_pool</code> <code class="lit">true</code>, and
+    <code class="lit">mempool_txs_no</code> counts them. Every transaction
+    after them is from a block and has <code class="lit">in_pool</code>
+    <code class="lit">false</code>.
+  </p>
+  <p>
+    Where those blocks hold more than {{ max_range_mib }} MiB, the oldest are
+    left out, and <code class="lit">from_height</code> says where the window
+    begins. Like <a href="#mempool">/api/mempool</a>, it needs an
+    unrestricted daemon, and it fails rather than answer without the pool.
   </p>
   <p><a href="/api/transactions/recent">/api/transactions/recent</a></p>
   <pre class="blob">curl -s "$OXBLOCKS/api/transactions/recent"</pre>
@@ -374,9 +418,9 @@
 </section>
 
 <section class="endpoint" id="search">
-  <h3><span class="verb">GET</span><code class="lit">/api/search/&lt;height|hash&gt;</code></h3>
+  <h3><span class="verb">GET</span><code class="lit">/api/search/&lt;number|hash&gt;</code></h3>
   <p>
-    Reads the shape of the argument. A short number is a height. 64 hex
+    Reads the shape of the argument. A short number is a block number. 64 hex
     characters are tried as a block hash and then as a transaction hash. The
     object that matches comes back with a <code class="lit">title</code> field
     naming what it is, either <code class="lit">"block"</code> or
@@ -387,7 +431,7 @@
     <strong>Addresses are not searchable.</strong> Monero has no address index.
     Building one needs a secret view key, which this explorer never asks for.
   </p>
-  <pre class="blob">curl -s "$OXBLOCKS/api/search/&lt;height|hash&gt;"</pre>
+  <pre class="blob">curl -s "$OXBLOCKS/api/search/&lt;number|hash&gt;"</pre>
   <details class="response">
     <summary>Example response, a block match</summary>
     <pre class="blob">{{ example_search_block }}</pre>
@@ -401,8 +445,10 @@
 <section class="endpoint" id="feeestimate">
   <h3><span class="verb">GET</span><code class="lit">/api/feeestimate?grace_blocks=</code></h3>
   <p>
-    The fee per byte that the daemon estimates.
-    <code class="lit">grace_blocks</code> defaults to 10.
+    The fee per byte that the daemon estimates over the next
+    <code class="lit">grace_blocks</code> blocks, at most 1000. Left out, it is
+    the window wallets use: 10 blocks, and 1000 from hard fork 17. A value that
+    is not such a number gets a <code class="lit">400</code>.
     <code class="lit">fee</code> and <code class="lit">fee_per_kb</code> report
     the same number. The estimate has been per byte since 2019, and the second
     key kept its old name.
@@ -451,9 +497,29 @@
     <code class="lit">timestamp</code>, <code class="lit">timestamp_utc</code>,
     and <code class="lit">txs</code>, an array of
     <a href="#shape-txsummary">transaction summaries</a> with the coinbase
-    first. <code class="lit">current_height</code> is the height of the chain.
-    The explorer works it out from the depth of this block, so it costs no
-    second call.
+    first. <code class="lit">current_height</code> is the number of blocks in the chain.
+    <a href="#block">/api/block</a> reads it from the daemon's chain info,
+    which the explorer holds for a few seconds, and
+    <a href="#blocks">/api/blocks</a> works it out from the depth each header
+    in the range carries.
+  </p>
+  <p>
+    <code class="lit">tree_root</code> is the root of the curve tree the block
+    commits to, in hex, and <code class="lit">n_tree_layers</code> is the
+    tree's layer count. Both are <code class="lit">null</code> when no tree is
+    reported: below the FCMP++ fork, whose block format has no tree, when the
+    daemon's block does not carry a well-formed tree, and in
+    <a href="#blocks">/api/blocks</a> for a post-fork block whose body the
+    daemon did not return. A tree with no outputs yet has
+    <code class="lit">n_tree_layers</code> 0 and a root of zeros. Both fields
+    are in the block's body, after its transaction list, and no header call
+    returns them, so from the fork on <a href="#blocks">/api/blocks</a> fetches
+    every block's body. The root runs eight blocks ahead of the block: block H
+    carries the tree as it stands at block H + 8. A proof whose
+    <code class="lit">reference_block</code> is R was therefore checked
+    against the <code class="lit">tree_root</code> of block R &minus; 8, not
+    of block R. For a reference block less than eight past the fork, block
+    R &minus; 8 is from before it and no block carries that root.
   </p>
 </section>
 
@@ -466,11 +532,32 @@
     <code class="lit">tx_fee</code>, <code class="lit">tx_hash</code>,
     <code class="lit">tx_size</code>, <code class="lit">tx_version</code>,
     <code class="lit">unlock_time</code>, <code class="lit">xmr_inputs</code>,
-    <code class="lit">xmr_outputs</code>.
+    <code class="lit">xmr_outputs</code>, <code class="lit">reference_block</code>,
+    <code class="lit">n_tree_layers</code> and
+    <code class="lit">fcmp_pp_proof_size</code>.
+  </p>
+  <p>
+    <code class="lit">reference_block</code> is the block number the curve tree was
+    taken at when an FCMP++ transaction's inputs were proven: the tree of
+    every output spendable with that block as the tip. Its root is in the
+    body of block <code class="lit">reference_block</code> &minus; 8; see
+    <a href="#shape-block">the block object</a>. And
+    <code class="lit">n_tree_layers</code> is how many layers that tree had.
+    Both are <code class="lit">null</code> for a ring spend and a coinbase.
+    Both sit in the prunable half of the transaction, so they are also
+    <code class="lit">null</code> for an FCMP++ transaction that a pruned node
+    no longer holds in full. Its <code class="lit">rct_type</code> still reads
+    7. <code class="lit">fcmp_pp_proof_size</code> is the FCMP++ proof's
+    length in bytes, which the input count and the layer count fix, and it is
+    <code class="lit">null</code> in the same cases.
   </p>
   <p>
     <code class="lit">mixin</code> is the <strong>ring size</strong>, not the
-    ring size minus one, and it is 0 for a coinbase.
+    ring size minus one, and it is 0 for a coinbase. It is also 0 for an
+    FCMP++ transaction, <code class="lit">rct_type</code> 7, whose inputs
+    prove membership in the curve tree and so have no ring. Read
+    <code class="lit">rct_type</code> before reading a 0 here as no anonymity
+    set.
   </p>
   <p>
     <code class="lit">xmr_inputs</code> and
@@ -489,8 +576,28 @@
   <p>
     Everything in the summary, plus <code class="lit">block_height</code>,
     <code class="lit">confirmations</code>, <code class="lit">current_height</code>,
+    <code class="lit">in_pool</code>,
     <code class="lit">timestamp</code>, <code class="lit">timestamp_utc</code>,
-    <code class="lit">inputs</code> and <code class="lit">outputs</code>.
+    <code class="lit">inputs</code>, <code class="lit">outputs</code> and
+    <code class="lit">anonymity_set</code>.
+  </p>
+  <p>
+    <code class="lit">in_pool</code> is <code class="lit">true</code> for a
+    transaction that waits in the pool and <code class="lit">false</code> for
+    one in a block. A pool transaction also reports
+    <code class="lit">block_height</code> 0 and
+    <code class="lit">confirmations</code> 0.
+  </p>
+  <p>
+    <code class="lit">anonymity_set</code> is how many
+    outputs the curve tree held as of <code class="lit">reference_block</code>,
+    which is how many outputs each FCMP++ input could be spending. It is
+    <code class="lit">null</code> for a ring spend, for a transaction still in
+    the pool, wherever <code class="lit">reference_block</code> is
+    <code class="lit">null</code>, on every endpoint but
+    <a href="#transaction">/api/transaction</a> and a transaction found
+    through <a href="#search">/api/search</a>, and when the daemon cannot
+    answer, as one from before FCMP++ cannot.
   </p>
   <p>
     <code class="lit">inputs</code> is <code class="lit">null</code> for a
@@ -501,7 +608,25 @@
     <code class="lit">null</code> when the ring was not resolved, either
     because the endpoint does not resolve rings or because the daemon refused
     the lookup. An empty array would say the input has no ring members, which
-    is a different statement.
+    is a different statement, and it is exactly the statement an FCMP++ input
+    makes: its <code class="lit">mixins</code> is <code class="lit">[]</code>
+    on every endpoint, because there is no ring to withhold.
+  </p>
+  <p>
+    Each output carries <code class="lit">amount</code>,
+    <code class="lit">public_key</code>, <code class="lit">view_tag</code>,
+    <code class="lit">encrypted_janus_anchor</code> and
+    <code class="lit">unified_id</code>. <code class="lit">unified_id</code> is
+    the output's index among every output on the chain, of every amount,
+    which a wallet uses to ask for the output's path through the curve tree.
+    It is <code class="lit">null</code> for a transaction still in the pool
+    and on a daemon from before FCMP++, which does not report it.
+    <code class="lit">public_key</code> is the one-time address,
+    Carrot's included. <code class="lit">view_tag</code> is two hex characters
+    for an output from before Carrot and six for a Carrot output, and
+    <code class="lit">null</code> for an output from before view tags.
+    <code class="lit">encrypted_janus_anchor</code> is 32 hex characters on a
+    Carrot output and <code class="lit">null</code> on every other.
   </p>
 </section>
 
@@ -513,7 +638,8 @@
   deployment enforces, set by the operator at startup. A request that asks for
   more than one of them allows gets a 400 that names the bound it crossed. The
   recent window is not a request parameter at all. It is fixed for every
-  caller.
+  caller, and shortened only as <a href="#recent">its endpoint</a>
+  describes.
 </p>
 
 <div class="scroll">
@@ -523,6 +649,7 @@
     <tr><td><code class="lit">/api/transactions</code> limit</td><td class="num">{{ max_transactions_limit }}</td></tr>
     <tr><td><code class="lit">/api/mempool</code> limit</td><td class="num">{{ max_mempool_limit }}</td></tr>
     <tr><td><code class="lit">/api/blocks</code> span</td><td class="num">{{ max_block_range }}</td></tr>
+    <tr><td>one range of blocks, by their sizes</td><td class="num">{{ max_range_mib }} MiB</td></tr>
     <tr><td>private lookup, postfix length</td><td class="num">{{ min_postfix_len }}&ndash;{{ max_postfix_len }}</td></tr>
     <tr><td>private lookup, expected matches</td><td class="num">{{ min_anonymity_set }}&ndash;{{ max_private_tx_matches }}</td></tr>
     <tr><td><code class="lit">/api/transactions/recent</code> window</td><td class="num">{{ recent_blocks }}</td></tr>
@@ -538,8 +665,7 @@
   <code class="lit">/myoutputs</code>, <code class="lit">/prove</code>,
   <code class="lit">/rawtx</code> and <code class="lit">/checkandpush</code>
   pages that use them. They need a secret view key or raw transaction hex in a
-  request to a server that could log it. Leaving them out removes that risk
-  instead of managing it.
+  request to a server that could log it.
 </p>
 
 <p>

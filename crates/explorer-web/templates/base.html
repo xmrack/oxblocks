@@ -18,7 +18,7 @@
       <a href="/api">API</a>
     </nav>
     <form class="search" action="/search" method="get">
-      <input type="text" name="q" placeholder="Block height, block hash, or transaction hash"
+      <input type="text" name="q" placeholder="Block number, block hash, or transaction hash"
              aria-label="Search" spellcheck="false" autocomplete="off"{% if let Some(q) = query %} value="{{ q }}"{% endif %}>
       <button type="submit">Search</button>
     </form>
@@ -28,10 +28,11 @@
 {% if let Some(c) = chain %}
 <div class="wrap">
   <div class="status">
-    <span>Height <b>{{ c.height }}</b></span>
+    <span>Blocks <b>{{ c.height }}</b></span>
     <span>{{ c.nettype }}</span>
     <span>Difficulty <b>{{ c.difficulty }}</b></span>
     <span>Mempool <b>{{ c.pool }}</b></span>
+    {% if let Some(v) = c.daemon %}<span>monerod <b>{{ v }}</b></span>{% endif %}
     {% if c.syncing %}<span>syncing &mdash; <b>{{ c.target }}</b> target</span>{% endif %}
   </div>
 </div>

@@ -13,7 +13,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 # hyper directly rather than reqwest. reqwest is a fine client, but this crate
-# uses one shape of it -- POST JSON to a fixed URL, read JSON back -- and it
+# uses one shape of it -- POST to a fixed URL, read the body back -- and it
 # enables tower-http/follow-redirect, which Cargo unifies into the whole
 # workspace and which drags in `url` -> `idna` -> ~25 ICU crates. We then set
 # the redirect policy to `none`, so all of that was carried in order to be
@@ -22,13 +22,21 @@ hyper = { version = "1", default-features = false, features = ["client", "http1"
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring", "webpki-tokio"], optional = true }
+# For pinning a daemon's own certificate, which no public CA signed.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+ring = { version = "0.17", default-features = false, optional = true }
 tokio = { version = "1", default-features = false, features = ["time"] }
+# monero-oxide's decoder for monerod's binary answers, at the revision the
+# rest of the workspace pins.
+monero-epee = { version = "0.2.1", git = "https://github.com/monero-oxide/monero-oxide", rev = "31c26d96eaadbba910ffe3613ad8b4cf9c598a93" }
 
 [features]
 default = ["tls"]
 # Only needed to reach a remote node over HTTPS. A loopback monerod does not
 # need this, and dropping it removes the whole TLS stack from the build.
-tls = ["dep:hyper-rustls"]
+tls = ["dep:hyper-rustls", "dep:rustls", "dep:ring"]
+# `epee::encode_root`, for a test standing in for monerod.
+test-support = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

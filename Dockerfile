@@ -4,8 +4,11 @@
 # no package manager and nothing to write. It holds one binary, dynamically
 # linked against glibc -- which is why the base is the `cc` variant rather than
 # `static`. The stylesheet is compiled in, so there is no asset directory.
+#
+# Both bases are pinned by digest, so a tag moved upstream changes nothing
+# here. Bump the digests to take the base images' security fixes.
 
-FROM rust:1.88-slim AS build
+FROM rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS build
 WORKDIR /src
 
 # Dependencies first, so editing source does not re-download the tree.
@@ -23,12 +26,13 @@ COPY . .
 RUN touch crates/*/src/lib.rs crates/explorer-web/src/main.rs \
  && cargo build --release --locked -p explorer-web
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build /src/target/release/oxblocks /usr/local/bin/oxblocks
 
 # Binds inside the container; publish it with -p. Defaults to loopback, which
 # would be unreachable from outside the container, so this is set explicitly.
 EXPOSE 8081
-USER nonroot:nonroot
+# Numeric, so that a runtime enforcing non-root can tell without a passwd file.
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/oxblocks"]
 CMD ["--bind", "0.0.0.0:8081", "--daemon-url", "http://host.docker.internal:18081"]

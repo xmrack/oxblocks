@@ -5,8 +5,9 @@
 //!
 //! Hand-written rather than pulled in. The project's argument is a small
 //! audited dependency tree, and what is needed here is roughly a hundred lines
-//! with invariants a reader can check: bounded size, optional expiry,
-//! least-recently-used eviction. Eviction scans the map, which is O(n) — a
+//! with invariants a reader can check: bounded size, in entries and, where the
+//! values are daemon-sized, in bytes; optional expiry; least-recently-used
+//! eviction. Eviction scans the map, which is O(n) — a
 //! correct scan beats an intrusive linked list nobody wants to audit — but the
 //! scan clears a batch rather than one entry, so its cost is amortised over
 //! thousands of inserts.
@@ -72,6 +73,9 @@ const EVICT_FRACTION: usize = 16;
 
 struct Entry<V> {
     value: Arc<V>,
+    /// What [`Cache::within_bytes`]'s measure gave the value, or 0 without
+    /// one.
+    weight: usize,
     /// Logical clock reading, for least-recently-used ordering. A counter
     /// rather than a timestamp so that ordering does not depend on clock
     /// resolution or monotonicity.
@@ -81,6 +85,8 @@ struct Entry<V> {
 
 struct Inner<K, V> {
     map: HashMap<K, Entry<V>>,
+    /// The sum of the entries' weights.
+    bytes: usize,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -90,6 +96,15 @@ pub struct Cache<K, V> {
     inner: Mutex<Inner<K, V>>,
     capacity: usize,
     ttl: Option<Duration>,
+    budget: Option<Budget<V>>,
+}
+
+/// A ceiling on the bytes a cache's values hold, by a measure of each.
+struct Budget<V> {
+    bytes: usize,
+    weigh: fn(&V) -> usize,
+    /// The heaviest value kept.
+    largest: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +139,7 @@ impl<K: Eq + Hash + Clone, V> Cache<K, V> {
         Self {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
+                bytes: 0,
                 clock: 0,
                 hits: 0,
                 misses: 0,
@@ -133,7 +149,40 @@ impl<K: Eq + Hash + Clone, V> Cache<K, V> {
             // one entry instead.
             capacity: capacity.max(1),
             ttl,
+            budget: None,
         }
+    }
+
+    /// Hold the values to `bytes` in all, as `weigh` measures each, as well
+    /// as to the entry count.
+    ///
+    /// For values whose size the daemon decides, such as a block's or a
+    /// transaction's hex: a count alone bounds nothing when one entry can be
+    /// as large as the daemon cares to make it. A value weighing more than a
+    /// sixteenth of the budget is returned but not kept, so no one entry can
+    /// empty the cache to make room for itself.
+    #[must_use]
+    pub fn within_bytes(mut self, bytes: usize, weigh: fn(&V) -> usize) -> Self {
+        self.budget = Some(Budget {
+            bytes,
+            weigh,
+            largest: bytes / EVICT_FRACTION,
+        });
+        self
+    }
+
+    /// Keep values weighing up to `bytes`, rather than a sixteenth of the
+    /// budget, and never more than half of it.
+    ///
+    /// For a cache whose every entry is one of a few large ones, such as a
+    /// whole block's transactions: a sixteenth would turn away the very
+    /// entries it exists to keep.
+    #[must_use]
+    pub fn keeping_up_to(mut self, bytes: usize) -> Self {
+        if let Some(b) = &mut self.budget {
+            b.largest = bytes.min(b.bytes / 2);
+        }
+        self
     }
 
     /// Fetch, if present and unexpired.
@@ -150,8 +199,9 @@ impl<K: Eq + Hash + Clone, V> Cache<K, V> {
                 .map
                 .get(key)
                 .is_some_and(|e| e.stored_at.elapsed() >= ttl)
+            && let Some(old) = inner.map.remove(key)
         {
-            inner.map.remove(key);
+            inner.bytes = inner.bytes.saturating_sub(old.weight);
         }
 
         inner.clock += 1;
@@ -181,6 +231,7 @@ impl<K: Eq + Hash + Clone, V> Cache<K, V> {
         let mut ages: Vec<u64> = inner.map.values().map(|e| e.used_at).collect();
         if drop_count >= ages.len() {
             inner.map.clear();
+            inner.bytes = 0;
             return;
         }
         // `select_nth_unstable(n)` puts the (n+1)-th smallest age at index n,
@@ -189,13 +240,39 @@ impl<K: Eq + Hash + Clone, V> Cache<K, V> {
         let (_, cutoff, _) = ages.select_nth_unstable(drop_count);
         let cutoff = *cutoff;
         inner.map.retain(|_, e| e.used_at >= cutoff);
+        inner.bytes = inner.map.values().map(|e| e.weight).sum();
+    }
+
+    /// Drop the least recently used entries until the rest weigh at most
+    /// `target` bytes.
+    fn evict_to_bytes(inner: &mut Inner<K, V>, target: usize) {
+        let mut ages: Vec<(u64, usize)> =
+            inner.map.values().map(|e| (e.used_at, e.weight)).collect();
+        ages.sort_unstable();
+        let mut bytes = inner.bytes;
+        let mut cutoff = 0;
+        for (used_at, weight) in ages {
+            if bytes <= target {
+                break;
+            }
+            bytes = bytes.saturating_sub(weight);
+            cutoff = used_at + 1;
+        }
+        inner.map.retain(|_, e| e.used_at >= cutoff);
+        inner.bytes = inner.map.values().map(|e| e.weight).sum();
     }
 
     /// Store, evicting a batch of the least recently used entries if that
     /// would exceed capacity. Returns the stored value so a caller can use it
     /// without a second lookup.
     pub fn insert(&self, key: K, value: V) -> Arc<V> {
+        let weight = self.budget.as_ref().map_or(0, |b| (b.weigh)(&value));
         let value = Arc::new(value);
+        if let Some(b) = &self.budget
+            && weight > b.largest
+        {
+            return value;
+        }
         let Ok(mut inner) = self.inner.lock() else {
             return value;
         };
@@ -203,14 +280,30 @@ impl<K: Eq + Hash + Clone, V> Cache<K, V> {
         inner.clock += 1;
         let clock = inner.clock;
 
-        if !inner.map.contains_key(&key) && inner.map.len() >= self.capacity {
+        if let Some(old) = inner.map.remove(&key) {
+            inner.bytes = inner.bytes.saturating_sub(old.weight);
+        }
+        if inner.map.len() >= self.capacity {
             Self::evict_batch(&mut inner, self.capacity);
         }
+        if let Some(b) = &self.budget
+            && inner.bytes.saturating_add(weight) > b.bytes
+        {
+            // Down to a sixteenth of the budget below what this entry needs,
+            // so that the next few inserts do not each pay for a scan.
+            let target = b
+                .bytes
+                .saturating_sub(weight)
+                .saturating_sub(b.bytes / EVICT_FRACTION);
+            Self::evict_to_bytes(&mut inner, target);
+        }
 
+        inner.bytes = inner.bytes.saturating_add(weight);
         inner.map.insert(
             key,
             Entry {
                 value: Arc::clone(&value),
+                weight,
                 used_at: clock,
                 stored_at: Instant::now(),
             },
@@ -236,6 +329,49 @@ impl<K: Eq + Hash + Clone, V> Cache<K, V> {
     }
 }
 
+/// One fetch at a time per key, so that callers missing a cache together wait
+/// for the first one's answer rather than each asking the daemon.
+///
+/// A caller takes the key's turn with [`Flights::enter`], looks in the cache
+/// again once it has it, and fetches only if the answer is still missing. A
+/// key's lock lives only while someone holds or waits for it.
+pub struct Flights<K> {
+    locks: Mutex<HashMap<K, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl<K> Default for Flights<K> {
+    fn default() -> Self {
+        Self {
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: Hash + Eq + Clone> Flights<K> {
+    /// Wait for `key`'s turn. Several keys taken at once must be taken in one
+    /// order everywhere, or two callers can each hold what the other waits
+    /// for.
+    pub async fn enter(&self, key: &K) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = match self.locks.lock() {
+            Ok(mut locks) => {
+                locks.retain(|_, l| l.strong_count() > 0);
+                match locks.get(key).and_then(std::sync::Weak::upgrade) {
+                    Some(lock) => lock,
+                    None => {
+                        let lock = Arc::new(tokio::sync::Mutex::new(()));
+                        locks.insert(key.clone(), Arc::downgrade(&lock));
+                        lock
+                    }
+                }
+            }
+            // As for the cache: a poisoned map costs the coalescing, not the
+            // answer.
+            Err(_) => Arc::new(tokio::sync::Mutex::new(())),
+        };
+        lock.lock_owned().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -248,6 +384,66 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn a_byte_budget_bounds_what_is_kept() {
+        let cache: Cache<u32, Vec<u8>> = Cache::permanent(1000).within_bytes(1600, Vec::len);
+        for k in 0..100 {
+            cache.insert(k, vec![0; 50]);
+        }
+        let weights = |c: &Cache<u32, Vec<u8>>| {
+            let inner = c.inner.lock().unwrap();
+            (
+                inner.bytes,
+                inner.map.values().map(|e| e.weight).sum::<usize>(),
+            )
+        };
+        let (held, summed) = weights(&cache);
+        assert!(held <= 1600, "{held}");
+        assert_eq!(held, summed);
+        // The newest survive, and eviction takes only what it must.
+        assert!(cache.get(&99).is_some());
+        assert!(cache.get(&0).is_none());
+        assert!(cache.stats().len >= 28, "{}", cache.stats().len);
+
+        // Over a sixteenth of the budget, a value is handed back, not kept.
+        let big = cache.insert(1000, vec![0; 101]);
+        assert_eq!(big.len(), 101);
+        assert!(cache.get(&1000).is_none());
+
+        // Replacing an entry replaces its weight.
+        cache.insert(99, vec![0; 10]);
+        let (held, summed) = weights(&cache);
+        assert_eq!(held, summed);
+    }
+
+    /// A cache of a few large entries keeps them, up to the size it was told
+    /// and never past half its budget, and makes room by evicting the oldest.
+    #[test]
+    fn a_cache_of_large_entries_keeps_them() {
+        let cache: Cache<u32, Vec<u8>> = Cache::permanent(16)
+            .within_bytes(1600, Vec::len)
+            .keeping_up_to(600);
+        cache.insert(1, vec![0; 500]);
+        cache.insert(2, vec![0; 500]);
+        assert!(cache.get(&1).is_some() && cache.get(&2).is_some());
+        cache.insert(3, vec![0; 500]);
+        cache.insert(4, vec![0; 500]);
+        assert!(cache.get(&4).is_some());
+        assert!(cache.get(&1).is_none(), "the oldest made room");
+        assert!(cache.stats().len <= 3);
+
+        cache.insert(5, vec![0; 601]);
+        assert!(cache.get(&5).is_none(), "past what it was told");
+
+        let capped: Cache<u32, Vec<u8>> = Cache::permanent(16)
+            .within_bytes(1000, Vec::len)
+            .keeping_up_to(5000);
+        capped.insert(1, vec![0; 501]);
+        assert!(capped.get(&1).is_none(), "never past half the budget");
+        capped.insert(2, vec![0; 500]);
+        assert!(capped.get(&2).is_some());
+    }
 
     #[test]
     fn only_buried_blocks_may_be_cached_by_height() {
@@ -351,12 +547,14 @@ mod tests {
 
     #[test]
     fn an_expired_entry_is_a_miss() {
-        let c: Cache<u64, u64> = Cache::expiring(4, Duration::from_millis(40));
-        c.insert(1, 10);
+        let c: Cache<u64, Vec<u8>> =
+            Cache::expiring(4, Duration::from_millis(40)).within_bytes(1600, Vec::len);
+        c.insert(1, vec![0; 10]);
         assert!(c.get(&1).is_some());
         std::thread::sleep(Duration::from_millis(60));
         assert!(c.get(&1).is_none(), "the entry outlived its ttl");
         assert_eq!(c.stats().len, 0, "and is dropped, not merely hidden");
+        assert_eq!(c.inner.lock().unwrap().bytes, 0, "with its weight");
     }
 
     #[test]
@@ -404,5 +602,32 @@ mod tests {
             h.join().expect("no thread panicked");
         }
         assert!(c.stats().len <= 64);
+    }
+
+    /// Callers of one key take turns; callers of another do not wait.
+    #[tokio::test]
+    async fn flights_of_one_key_take_turns() {
+        let flights: Arc<Flights<u8>> = Arc::default();
+        let first = flights.enter(&1).await;
+        let waiting = {
+            let flights = Arc::clone(&flights);
+            tokio::spawn(async move { drop(flights.enter(&1).await) })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished(), "the second caller of key 1 waits");
+        drop(flights.enter(&2).await);
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            flights
+                .locks
+                .lock()
+                .unwrap()
+                .values()
+                .all(|l| l.strong_count() == 0)
+        );
     }
 }

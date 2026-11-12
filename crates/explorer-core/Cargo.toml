@@ -13,11 +13,27 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "time"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+# monero-oxide, for the FCMP++ curve tree's hash, generators and curves, the
+# Ed25519 arithmetic that turns an output into a leaf, and the FCMP++ proof's
+# layout. The revision monerod's stressnet v3 branch builds with (its
+# `src/fcmp_pp/fcmp_pp_rust/Cargo.toml`).
+monero-fcmp-plus-plus = { version = "0.1", git = "https://github.com/monero-oxide/monero-oxide", rev = "31c26d96eaadbba910ffe3613ad8b4cf9c598a93" }
+monero-fcmp-plus-plus-generators = { version = "0.1", git = "https://github.com/monero-oxide/monero-oxide", rev = "31c26d96eaadbba910ffe3613ad8b4cf9c598a93" }
+helioselene = { version = "0.1", git = "https://github.com/monero-oxide/monero-oxide", rev = "31c26d96eaadbba910ffe3613ad8b4cf9c598a93" }
+ec-divisors = { version = "0.1", git = "https://github.com/monero-oxide/monero-oxide", rev = "31c26d96eaadbba910ffe3613ad8b4cf9c598a93", features = ["ed25519"] }
+monero-ed25519 = { version = "0.1", git = "https://github.com/monero-oxide/monero-oxide", rev = "31c26d96eaadbba910ffe3613ad8b4cf9c598a93" }
+dalek-ff-group = "0.5"
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
+
+[features]
+# `fake_daemon`, a stand-in monerod for the web crate's tests.
+fake-daemon = ["monerod-rpc/test-support"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+monerod-rpc = { path = "../monerod-rpc", version = "0.1.0", features = ["test-support"] }
 
 [lints]
 workspace = true

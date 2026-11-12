@@ -80,12 +80,26 @@ pub enum ChainError {
 
     /// The call needs an unrestricted daemon and this one is restricted.
     ///
-    /// monerod blocks `/get_transaction_pool`, `get_alternate_chains`,
-    /// `get_coinbase_tx_sum` and `/get_alt_blocks_hashes` under
+    /// monerod blocks `get_alternate_chains`, `get_coinbase_tx_sum` and
+    /// `/get_alt_blocks_hashes` under
     /// `--restricted-rpc`, so these pages are unavailable by configuration
     /// rather than broken.
     #[error("{0} requires an unrestricted monerod")]
     NeedsUnrestricted(&'static str),
+
+    /// The daemon answered, but not with the shape the call expects.
+    #[error("the daemon's answer to {what} could not be read: {detail}")]
+    BadAnswer { what: &'static str, detail: String },
+
+    /// A range of blocks holds more than one request may fetch. See
+    /// [`crate::rpc_source::MAX_RANGE_KIB`].
+    #[error("blocks {start} to {end} hold {kib} KiB, more than one request may fetch")]
+    RangeTooLarge { start: u64, end: u64, kib: u64 },
+
+    /// The explorer is holding as much as it may, and the request waited
+    /// its turn for too long. Callers should treat this as temporary.
+    #[error("the explorer is busy: {0}")]
+    Busy(&'static str),
 
     #[error(transparent)]
     Rpc(#[from] monerod_rpc::RpcError),
@@ -96,7 +110,7 @@ impl ChainError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Unavailable(_) => true,
+            Self::Unavailable(_) | Self::Busy(_) => true,
             Self::Rpc(e) => e.is_transient(),
             _ => false,
         }
@@ -131,10 +145,20 @@ impl ChainError {
             Self::NeedsUnrestricted(what) => {
                 format!("{what} requires an unrestricted monerod")
             }
+            Self::BadAnswer { what, .. } => {
+                format!("the daemon's answer to {what} could not be read")
+            }
+            Self::RangeTooLarge { start, end, kib } => format!(
+                "blocks {start} to {end} hold {} MiB, more than one request may fetch; \
+                 ask for fewer blocks",
+                kib.div_ceil(1024)
+            ),
+            Self::Busy(what) => format!("the explorer is busy with {what}; try again shortly"),
             // These carry internals. Say what happened, not where.
-            Self::Unavailable(_) | Self::Rpc(_) => {
+            Self::Unavailable(_) | Self::Rpc(monerod_rpc::RpcError::Transport { .. }) => {
                 "the explorer could not reach its daemon".to_owned()
             }
+            Self::Rpc(_) => "the explorer's daemon gave an answer it could not use".to_owned(),
         }
     }
 }
@@ -156,7 +180,9 @@ pub struct ResolvedInput {
     /// Zero for RingCT, the denomination for pre-RingCT.
     pub amount: u64,
     pub key_image: Hash32,
-    /// Empty when the ring could not be resolved.
+    /// Empty when the ring could not be resolved, and for every input of an
+    /// FCMP++ transaction, which proves membership in the curve tree as of its
+    /// reference block instead of naming a ring. `ring_unavailable` tells the two apart.
     ///
     /// monerod fails an entire `/get_outs` batch if any one index is out of
     /// range, so one unresolvable input must not blank the whole page. That

@@ -21,7 +21,16 @@ impl BaseUrl {
     /// A query or fragment is refused rather than dropped: it means whoever
     /// configured this had something else in mind, and silently ignoring it
     /// would talk to a URL they did not ask for.
+    ///
+    /// So are credentials in the authority (`user:pass@host`). This client
+    /// never sends them, and the URL is logged at startup and carried in
+    /// errors, where a password does not belong.
     pub fn parse(raw: &str) -> Result<Self, String> {
+        // `http::Uri` drops a fragment without a word, so it is looked for
+        // before the parse.
+        if raw.contains('#') {
+            return Err("a fragment is not meaningful here".to_owned());
+        }
         let uri: Uri = raw.parse().map_err(|e| format!("not a URL: {e}"))?;
 
         match uri.scheme_str() {
@@ -36,6 +45,9 @@ impl BaseUrl {
             .as_str();
         if authority.is_empty() {
             return Err("no host".to_owned());
+        }
+        if authority.contains('@') {
+            return Err("credentials in the URL are not sent, so they are refused".to_owned());
         }
 
         if let Some(pq) = uri.path_and_query()
@@ -61,12 +73,15 @@ impl BaseUrl {
     /// `path` must be a bare segment: every caller passes a literal monerod
     /// endpoint name (`json_rpc`, `get_outs`). Rejecting anything else keeps a
     /// future caller from smuggling `../`, a query, or a whole other URL into
-    /// the address this client connects to.
+    /// the address this client connects to. The one dot allowed is a `.bin`
+    /// suffix, which is how monerod names its binary endpoints; the name before
+    /// it is held to the same rule.
     pub fn join(&self, path: &str) -> Result<Uri, String> {
-        if path.is_empty() {
+        let name = path.strip_suffix(".bin").unwrap_or(path);
+        if name.is_empty() {
             return Err("empty endpoint".to_owned());
         }
-        if !path
+        if !name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         {
@@ -78,11 +93,45 @@ impl BaseUrl {
     }
 }
 
+/// `raw` as an error may show it: everything before its last `@` is replaced,
+/// since a refused URL's authority cannot be told apart from its path, and a
+/// password may hold any of `/?#`.
+pub(crate) fn shown(raw: &str) -> String {
+    let (scheme, rest) = raw.split_once("://").map_or(("", raw), |(s, r)| (s, r));
+    match rest.rsplit_once('@') {
+        Some((_, host)) if scheme.is_empty() => format!("<credentials>@{host}"),
+        Some((_, host)) => format!("{scheme}://<credentials>@{host}"),
+        None => raw.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn a_fragment_or_credentials_are_refused_not_dropped() {
+        assert!(BaseUrl::parse("http://h:1/mon#frag").is_err());
+        assert!(BaseUrl::parse("http://h:1#").is_err());
+        assert!(BaseUrl::parse("http://user:pass@h:1/").is_err());
+        assert!(BaseUrl::parse("http://user@h:1/").is_err());
+        assert!(BaseUrl::parse("http://h:1/").is_ok());
+    }
+
+    #[test]
+    fn credentials_are_not_shown_in_errors() {
+        assert_eq!(
+            shown("http://user:pa@ss@h:1/mon"),
+            "http://<credentials>@h:1/mon"
+        );
+        assert_eq!(shown("user@h:1"), "<credentials>@h:1");
+        assert_eq!(
+            shown("http://u:p#s/x@h:1/mon"),
+            "http://<credentials>@h:1/mon"
+        );
+    }
 
     #[test]
     fn a_plain_host_gains_a_trailing_slash() {
@@ -164,5 +213,15 @@ mod tests {
         assert!(b.join("json_rpc?x=1").is_err());
         assert!(b.join("http://elsewhere/json_rpc").is_err());
         assert!(b.join("json rpc").is_err());
+
+        // A binary endpoint's suffix, and nothing that merely contains a dot.
+        assert_eq!(
+            b.join("get_path_by_unified_id.bin").unwrap().to_string(),
+            "http://127.0.0.1:18081/mon/get_path_by_unified_id.bin"
+        );
+        assert!(b.join(".bin").is_err());
+        assert!(b.join("...bin").is_err());
+        assert!(b.join("../x.bin").is_err());
+        assert!(b.join("get_outs.json").is_err());
     }
 }

@@ -1,13 +1,16 @@
 //! Transport for the monerod daemon RPC.
 //!
-//! monerod exposes two different calling conventions and they fail differently:
+//! monerod exposes three calling conventions and they fail differently:
 //!
 //! * `POST /json_rpc` — a JSON-RPC 2.0 envelope. Failures arrive as an `error`
 //!   member alongside HTTP 200.
 //! * `POST /<endpoint>` — a bare JSON body (`/get_transactions`, `/get_outs`,
 //!   …). Failures arrive as a `"status"` string alongside HTTP 200.
+//! * `POST /<endpoint>.bin` — the same, in epee's binary format rather than
+//!   JSON. Used for the one figure monerod reports only in binary; see
+//!   [`crate::epee`].
 //!
-//! Both are normalised into [`RpcError`] here so that callers never have to
+//! All are normalised into [`RpcError`] here so that callers never have to
 //! remember which convention a given call uses.
 
 use std::time::Duration;
@@ -18,18 +21,32 @@ use hyper::header::{ACCEPT, CONTENT_TYPE, HeaderValue, USER_AGENT};
 use hyper::{Method, Request};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::value::RawValue;
 
 use crate::error::{RpcError, Status, TransportKind};
 use crate::url::BaseUrl;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The waits before each retry of a request no answer came back for.
+///
+/// monerod closes connections over its per-address limit as it accepts them,
+/// `--rpc-max-connections-per-private-ip` (25 by default) and the public one
+/// (3), so a burst at the limit sees some refused that a moment later would
+/// be served. Every call this client makes is a read, so asking again is
+/// safe.
+const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(250)];
+
 /// How much of a failing response body is kept for the error message.
 ///
 /// This is remote input on its way into logs, so it is bounded. monerod's own
 /// error bodies are far shorter than this.
 const MAX_ERROR_BODY: usize = 256;
+
+/// The most of a failing response's body that is read, to take
+/// [`MAX_ERROR_BODY`] characters from.
+const MAX_ERROR_BODY_READ: u64 = 64 * 1024;
 
 /// The largest response this client will accumulate, unless told otherwise.
 ///
@@ -38,6 +55,25 @@ const MAX_ERROR_BODY: usize = 256;
 /// over a wide block range is the largest legitimate response and is nowhere
 /// near this.
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The largest answer to a call whose answer is a few kilobytes whatever
+/// the chain holds, such as `get_info`. Decoded, an answer
+/// takes several times its size in memory, so a daemon answering one of
+/// these at the general ceiling could take gigabytes.
+pub const SMALL_ANSWER_BYTES: u64 = 1024 * 1024;
+
+/// The calls whose answers are a few kilobytes whatever the chain holds.
+const SMALL_ANSWERS: &[&str] = &[
+    "get_info",
+    "get_last_block_header",
+    "get_block_header_by_hash",
+    "get_block_header_by_height",
+    "get_fee_estimate",
+    "get_transaction_pool_stats",
+    "get_version",
+    "get_height",
+    "hard_fork_info",
+];
 
 #[cfg(feature = "tls")]
 type Connector = hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
@@ -62,9 +98,19 @@ pub struct ClientBuilder {
     timeout: Duration,
     max_response_bytes: u64,
     user_agent: Option<String>,
+    pinned: Option<[u8; 32]>,
 }
 
 impl ClientBuilder {
+    /// Trust the daemon's certificate whose SHA-256 is `sha256`, and no
+    /// other, in place of the public CAs: monerod serves one it signed
+    /// itself.
+    #[cfg(feature = "tls")]
+    pub const fn pinned_certificate(mut self, sha256: [u8; 32]) -> Self {
+        self.pinned = Some(sha256);
+        self
+    }
+
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -82,15 +128,12 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> Result<Client, RpcError> {
-        let base =
-            BaseUrl::parse(&self.base).map_err(|e| RpcError::BadUrl(self.base.clone(), e))?;
+        let base = BaseUrl::parse(&self.base)
+            .map_err(|e| RpcError::BadUrl(crate::url::shown(&self.base), e))?;
 
         let user_agent = self
             .user_agent
-            .map(|ua| {
-                HeaderValue::from_str(&ua)
-                    .map_err(|e| RpcError::BadUrl(ua.clone(), format!("bad user agent: {e}")))
-            })
+            .map(|ua| HeaderValue::from_str(&ua).map_err(|e| RpcError::BadUserAgent(e.to_string())))
             .transpose()?;
 
         // Nothing here follows redirects: hyper's client does not, and there
@@ -99,7 +142,7 @@ impl ClientBuilder {
         // misconfiguration, a compromised daemon -- therefore cannot point it
         // at a host the operator never named.
         Ok(Client {
-            http: HyperClient::builder(TokioExecutor::new()).build(connector()),
+            http: HyperClient::builder(TokioExecutor::new()).build(connector(self.pinned)?),
             base,
             timeout: self.timeout,
             max_response_bytes: self.max_response_bytes,
@@ -115,6 +158,7 @@ impl Client {
             timeout: DEFAULT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             user_agent: None,
+            pinned: None,
         }
     }
 
@@ -133,15 +177,15 @@ impl Client {
     /// arrived would mean the memory had already been taken before the limit
     /// was consulted. This stops at the first frame that crosses it.
     async fn collect_body(
-        &self,
         response: hyper::Response<hyper::body::Incoming>,
         context: &'static str,
+        max_bytes: u64,
     ) -> Result<Bytes, RpcError> {
         let too_large = |len| RpcError::ResponseTooLarge { context, len };
 
         // A declared length over the ceiling is refused before reading at all.
         if let Some(len) = response.body().size_hint().exact()
-            && len > self.max_response_bytes
+            && len > max_bytes
         {
             return Err(too_large(len));
         }
@@ -158,7 +202,7 @@ impl Client {
                 continue;
             };
             let total = (buf.len() as u64).saturating_add(chunk.len() as u64);
-            if total > self.max_response_bytes {
+            if total > max_bytes {
                 return Err(too_large(total));
             }
             buf.extend_from_slice(chunk);
@@ -166,36 +210,57 @@ impl Client {
         Ok(Bytes::from(buf))
     }
 
-    /// POST a body to `path` and return the parsed JSON, without interpreting it.
+    /// POST a body to `path` as JSON and return the answer's bytes.
     async fn post(
         &self,
         path: &str,
         context: &'static str,
         body: &impl Serialize,
-    ) -> Result<serde_json::Value, RpcError> {
+    ) -> Result<Bytes, RpcError> {
+        let payload =
+            serde_json::to_vec(body).map_err(|source| RpcError::Encode { context, source })?;
+        let ceiling = if SMALL_ANSWERS.contains(&context) {
+            SMALL_ANSWER_BYTES.min(self.max_response_bytes)
+        } else {
+            self.max_response_bytes
+        };
+        self.exchange(path, context, "application/json", payload, ceiling)
+            .await
+    }
+
+    /// POST `payload` to `path` and return the body of a successful answer.
+    async fn exchange(
+        &self,
+        path: &str,
+        context: &'static str,
+        media_type: &'static str,
+        payload: Vec<u8>,
+        max_bytes: u64,
+    ) -> Result<Bytes, RpcError> {
         let uri = self
             .base
             .join(path)
             .map_err(|e| RpcError::BadUrl(format!("{}{path}", self.base.as_str()), e))?;
 
-        let payload =
-            serde_json::to_vec(body).map_err(|source| RpcError::Encode { context, source })?;
-
-        let mut request = Request::builder()
-            .method(Method::POST)
-            .uri(uri)
-            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .header(ACCEPT, HeaderValue::from_static("application/json"))
-            .body(Full::new(Bytes::from(payload)))
-            .map_err(|e| RpcError::BadUrl(path.to_owned(), e.to_string()))?;
-        if let Some(ua) = &self.user_agent {
-            request.headers_mut().insert(USER_AGENT, ua.clone());
-        }
+        let payload = Bytes::from(payload);
+        let request = || {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri(uri.clone())
+                .header(CONTENT_TYPE, HeaderValue::from_static(media_type))
+                .header(ACCEPT, HeaderValue::from_static(media_type))
+                .body(Full::new(payload.clone()))
+                .map_err(|e| RpcError::BadUrl(path.to_owned(), e.to_string()))?;
+            if let Some(ua) = &self.user_agent {
+                request.headers_mut().insert(USER_AGENT, ua.clone());
+            }
+            Ok::<_, RpcError>(request)
+        };
 
         // One deadline across the whole exchange -- connect, send, read the
         // head, read the body -- rather than one per stage, which would let a
         // daemon that stalls in each stage in turn take twice as long as the
-        // operator configured. reqwest applied its timeout the same way.
+        // operator configured.
         let deadline = tokio::time::Instant::now() + self.timeout;
         let expired = |stage: &str| RpcError::Transport {
             context,
@@ -203,30 +268,51 @@ impl Client {
             message: format!("{stage} within {:?}", self.timeout),
         };
 
-        let sent = tokio::time::timeout_at(deadline, self.http.request(request))
-            .await
-            .map_err(|_| expired("no response"))?;
-
-        let response = sent.map_err(|e| RpcError::Transport {
-            context,
-            kind: if e.is_connect() {
-                TransportKind::Connect
-            } else {
-                TransportKind::Other
-            },
-            message: e.to_string(),
-        })?;
+        let mut waits = RETRY_WAITS.iter();
+        let response = loop {
+            let sent = tokio::time::timeout_at(deadline, self.http.request(request()?))
+                .await
+                .map_err(|_| expired("no response"))?;
+            match sent {
+                Ok(response) => break response,
+                Err(e) => {
+                    if let Some(wait) = waits.next() {
+                        tracing::debug!("{context}: retrying after {e}");
+                        tokio::time::timeout_at(deadline, tokio::time::sleep(*wait))
+                            .await
+                            .map_err(|_| expired("no response"))?;
+                        continue;
+                    }
+                    return Err(RpcError::Transport {
+                        context,
+                        kind: if e.is_connect() {
+                            TransportKind::Connect
+                        } else {
+                            TransportKind::Other
+                        },
+                        message: e.to_string(),
+                    });
+                }
+            }
+        };
 
         let http_status = response.status();
-        let bytes = tokio::time::timeout_at(deadline, self.collect_body(response, context))
-            .await
-            .map_err(|_| expired("body not read"))??;
-
         if !http_status.is_success() {
             // Keep a bounded slice of the body: monerod's error pages are short,
-            // but this is remote input and it ends up in logs.
-            let body = String::from_utf8_lossy(&bytes);
-            let body: String = body.chars().take(MAX_ERROR_BODY).collect();
+            // but this is remote input and it ends up in logs. Only that much
+            // is read, not the whole answer up to `max_bytes`.
+            let read = tokio::time::timeout_at(
+                deadline,
+                Self::collect_body(response, context, MAX_ERROR_BODY_READ),
+            )
+            .await
+            .map_err(|_| expired("body not read"))?;
+            let body = match read {
+                Ok(bytes) => {
+                    crate::error::printable(&String::from_utf8_lossy(&bytes), MAX_ERROR_BODY)
+                }
+                Err(_) => "<error body too large to read>".to_owned(),
+            };
             return Err(RpcError::Http {
                 context,
                 status: http_status.as_u16(),
@@ -234,7 +320,9 @@ impl Client {
             });
         }
 
-        serde_json::from_slice(&bytes).map_err(|source| RpcError::Decode { context, source })
+        tokio::time::timeout_at(deadline, Self::collect_body(response, context, max_bytes))
+            .await
+            .map_err(|_| expired("body not read"))?
     }
 
     /// Call a JSON-RPC 2.0 method on `/json_rpc`.
@@ -256,7 +344,29 @@ impl Client {
             params: Option<P>,
         }
 
-        let mut value = self
+        /// The envelope of the answer. `result` and `error` are kept as text
+        /// and parsed once, each into the type that reads it: parsing into a
+        /// `serde_json::Value` holds the answer in memory many times over.
+        #[derive(Deserialize)]
+        struct Reply<'a> {
+            #[serde(borrow, default)]
+            error: Option<&'a RawValue>,
+            #[serde(borrow, default)]
+            result: Option<&'a RawValue>,
+        }
+
+        /// What is read of an `error`: anything else in it is skipped
+        /// without being kept, and an `error` of another shape still fails
+        /// the call, with no code or message.
+        #[derive(Deserialize, Default)]
+        struct Fault {
+            #[serde(default)]
+            code: Option<i64>,
+            #[serde(default)]
+            message: Option<String>,
+        }
+
+        let bytes = self
             .post(
                 "json_rpc",
                 method,
@@ -268,40 +378,31 @@ impl Client {
                 },
             )
             .await?;
+        let reply: Reply<'_> =
+            serde_json::from_slice(&bytes).map_err(|e| RpcError::decode(method, &e))?;
 
-        if let Some(error) = value.get("error") {
+        if let Some(error) = reply.error {
+            let fault: Fault = serde_json::from_str(error.get()).unwrap_or_default();
             return Err(RpcError::JsonRpc {
                 method,
-                code: error
-                    .get("code")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0),
-                message: error
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("<no message>")
-                    .to_owned(),
+                code: fault.code.unwrap_or(0),
+                message: fault.message.map_or_else(
+                    || "<no message>".to_owned(),
+                    |m| crate::error::printable(&m, MAX_ERROR_BODY),
+                ),
             });
         }
-
-        let result =
-            value
-                .get_mut("result")
-                .map(serde_json::Value::take)
-                .ok_or(RpcError::Missing {
-                    context: method,
-                    field: "result",
-                })?;
+        let result = reply.result.ok_or(RpcError::Missing {
+            context: method,
+            field: "result",
+        })?;
 
         // Several JSON-RPC results carry a `status` of their own in addition to
         // the envelope. An `error`-free response with `"status": "Failed"` is
         // still a failure.
-        Self::check_status(&result, method)?;
+        Self::check_status(result.get().as_bytes(), method)?;
 
-        serde_json::from_value(result).map_err(|source| RpcError::Decode {
-            context: method,
-            source,
-        })
+        serde_json::from_str(result.get()).map_err(|e| RpcError::decode(method, &e))
     }
 
     /// Call one of the bare (non-JSON-RPC) endpoints, e.g. `/get_transactions`.
@@ -312,23 +413,92 @@ impl Client {
         B: Serialize,
         R: DeserializeOwned,
     {
-        let value = self.post(endpoint, endpoint, body).await?;
-        Self::check_status(&value, endpoint)?;
-        serde_json::from_value(value).map_err(|source| RpcError::Decode {
-            context: endpoint,
-            source,
-        })
+        let bytes = self.post(endpoint, endpoint, body).await?;
+        Self::check_status(&bytes, endpoint)?;
+        serde_json::from_slice(&bytes).map_err(|e| RpcError::decode(endpoint, &e))
     }
 
-    /// Reject a payload whose `status` is present and not `OK`.
+    /// Call a binary endpoint, e.g. `/get_path_by_unified_id.bin`, and return
+    /// the root entries named in `wanted`.
+    ///
+    /// `endpoint` is given without a leading slash and with its `.bin`. The
+    /// answer is held to `max_bytes`, and to the client's general ceiling if
+    /// that is lower: each binary answer has a size its caller can bound,
+    /// and it is far smaller than the largest JSON one.
+    ///
+    /// Every binary answer monerod writes carries `status`, so the answer
+    /// must have one, it must be UTF-8 text, and it must be `OK`.
+    pub async fn binary(
+        &self,
+        endpoint: &'static str,
+        fields: &[(&str, crate::epee::Field<'_>)],
+        wanted: &[&str],
+        max_bytes: u64,
+    ) -> Result<crate::epee::Root, RpcError> {
+        let payload = crate::epee::encode(fields).map_err(|source| RpcError::BinaryEncode {
+            context: endpoint,
+            source,
+        })?;
+        let bytes = self
+            .exchange(
+                endpoint,
+                endpoint,
+                "application/octet-stream",
+                payload,
+                max_bytes.min(self.max_response_bytes),
+            )
+            .await?;
+        let mut keep: Vec<&str> = wanted.to_vec();
+        if !keep.contains(&"status") {
+            keep.push("status");
+        }
+        let root =
+            crate::epee::read_root(&bytes, &keep).map_err(|source| RpcError::BinaryDecode {
+                context: endpoint,
+                source,
+            })?;
+        Self::check_binary_status(&root, endpoint)?;
+        Ok(root)
+    }
+
+    /// The binary form of [`Self::check_status`], which requires `status`.
+    fn check_binary_status(
+        root: &crate::epee::Root,
+        endpoint: &'static str,
+    ) -> Result<(), RpcError> {
+        if root.get("status").is_none() {
+            return Err(RpcError::Missing {
+                context: endpoint,
+                field: "status",
+            });
+        }
+        let status = root
+            .text("status")
+            .map_or_else(|| Status::parse("<unreadable status>"), Status::parse);
+        if status.is_ok() {
+            Ok(())
+        } else {
+            Err(RpcError::Status { endpoint, status })
+        }
+    }
+
+    /// Reject a JSON object whose `status` is present and not `OK`.
     ///
     /// A missing `status` is tolerated: not every result carries one, and
-    /// absence is not failure.
-    fn check_status(value: &serde_json::Value, context: &'static str) -> Result<(), RpcError> {
-        let Some(raw) = value.get("status").and_then(serde_json::Value::as_str) else {
+    /// absence is not failure. Only `status` is read; the rest of the object
+    /// is walked past without being kept.
+    fn check_status(json: &[u8], context: &'static str) -> Result<(), RpcError> {
+        #[derive(Deserialize)]
+        struct WithStatus<'a> {
+            #[serde(borrow, default)]
+            status: Option<std::borrow::Cow<'a, str>>,
+        }
+        // Anything but an object with a string `status` has no status to
+        // fail on; whether it is the answer expected is for its own parse.
+        let Ok(WithStatus { status: Some(raw) }) = serde_json::from_slice(json) else {
             return Ok(());
         };
-        let status = Status::parse(raw);
+        let status = Status::parse(&raw);
         if status.is_ok() {
             Ok(())
         } else {
@@ -346,19 +516,90 @@ impl Client {
 /// deployment is a loopback daemon over plain HTTP, and requiring TLS there
 /// would break it. The scheme in the configured URL decides.
 #[cfg(feature = "tls")]
-fn connector() -> Connector {
+fn connector(pinned: Option<[u8; 32]>) -> Result<Connector, RpcError> {
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
     http.enforce_http(false);
-    hyper_rustls::HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .wrap_connector(http)
+    let builder = hyper_rustls::HttpsConnectorBuilder::new();
+    let builder = match pinned {
+        Some(sha256) => builder.with_tls_config(pinned_config(sha256)?),
+        None => builder.with_webpki_roots(),
+    };
+    Ok(builder.https_or_http().enable_http1().wrap_connector(http))
 }
 
 #[cfg(not(feature = "tls"))]
-fn connector() -> Connector {
-    hyper_util::client::legacy::connect::HttpConnector::new()
+#[allow(clippy::unnecessary_wraps, reason = "the same signature as with TLS")]
+fn connector(_pinned: Option<[u8; 32]>) -> Result<Connector, RpcError> {
+    Ok(hyper_util::client::legacy::connect::HttpConnector::new())
+}
+
+/// A TLS client trusting the one certificate whose SHA-256 is `sha256`.
+#[cfg(feature = "tls")]
+fn pinned_config(sha256: [u8; 32]) -> Result<rustls::ClientConfig, RpcError> {
+    use std::sync::Arc;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(Pinned {
+        sha256,
+        algorithms: provider.signature_verification_algorithms,
+    });
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| RpcError::Tls(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
+/// Accepts the server's certificate when it is the pinned one, whatever its
+/// name or issuer, and checks the handshake was signed with its key.
+#[cfg(feature = "tls")]
+#[derive(Debug)]
+struct Pinned {
+    sha256: [u8; 32],
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+#[cfg(feature = "tls")]
+impl rustls::client::danger::ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let seen = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+        if seen.as_ref() == self.sha256 {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "the daemon's certificate is not the pinned one".to_owned(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
 }
 
 #[cfg(test)]
@@ -374,6 +615,36 @@ mod tests {
 
     use super::*;
 
+    /// The pinned certificate is accepted whatever its name, and any other
+    /// refused.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn only_the_pinned_certificate_is_trusted() {
+        use rustls::client::danger::ServerCertVerifier as _;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let cert = CertificateDer::from(b"a certificate".to_vec());
+        let other = CertificateDer::from(b"another".to_vec());
+        let digest = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
+        let pin: [u8; 32] = digest.as_ref().try_into().unwrap();
+        let pinned = Pinned {
+            sha256: pin,
+            algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        };
+        let name = ServerName::try_from("node.example").unwrap();
+        let check =
+            |c: &CertificateDer<'_>| pinned.verify_server_cert(c, &[], &name, &[], UnixTime::now());
+        assert!(check(&cert).is_ok());
+        assert!(check(&other).is_err());
+        assert!(pinned_config(pin).is_ok());
+        assert!(
+            Client::builder("https://node.example:18081")
+                .pinned_certificate(pin)
+                .build()
+                .is_ok()
+        );
+    }
+
     /// A one-shot loopback server that cannot outlive the test.
     ///
     /// `TcpListener::accept` has no timeout, so a blocking server thread waits
@@ -382,7 +653,7 @@ mod tests {
     /// message. Everything here is bounded: accept, read and join.
     struct Peer {
         port: u16,
-        handle: std::thread::JoinHandle<String>,
+        handle: std::thread::JoinHandle<Vec<u8>>,
     }
 
     /// Serves `body` as a JSON 200, with the length computed rather than typed.
@@ -433,6 +704,10 @@ mod tests {
     }
 
     fn serve_owned(reply: String) -> Peer {
+        serve_bytes(reply.into_bytes())
+    }
+
+    fn serve_bytes(reply: Vec<u8>) -> Peer {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port is available");
         let port = listener.local_addr().expect("bound").port();
@@ -445,14 +720,14 @@ mod tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
                 if std::time::Instant::now() > deadline {
-                    return String::new();
+                    return Vec::new();
                 }
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    Err(_) => return String::new(),
+                    Err(_) => return Vec::new(),
                 }
             };
             socket
@@ -461,19 +736,21 @@ mod tests {
             let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
             let mut scratch = [0u8; 8192];
             let n = socket.read(&mut scratch).unwrap_or(0);
-            let stall_after_writing = reply.contains("Content-Length: 4096");
+            let stall_after_writing = reply
+                .windows(b"Content-Length: 4096".len())
+                .any(|w| w == b"Content-Length: 4096");
             if reply.is_empty() {
                 // Hold the connection open with no response, so the only thing
                 // that can end the exchange is the client giving up.
                 std::thread::sleep(Duration::from_secs(10));
             } else {
-                let _ = socket.write_all(reply.as_bytes());
+                let _ = socket.write_all(&reply);
                 let _ = socket.flush();
                 if stall_after_writing {
                     std::thread::sleep(Duration::from_secs(10));
                 }
             }
-            String::from_utf8_lossy(scratch.get(..n).unwrap_or_default()).into_owned()
+            scratch.get(..n).unwrap_or_default().to_vec()
         });
 
         Peer { port, handle }
@@ -483,6 +760,10 @@ mod tests {
         /// The request bytes the client actually sent, or empty if it never
         /// connected.
         fn request(self) -> String {
+            String::from_utf8_lossy(&self.request_bytes()).into_owned()
+        }
+
+        fn request_bytes(self) -> Vec<u8> {
             self.handle.join().expect("the server thread finished")
         }
     }
@@ -509,6 +790,76 @@ mod tests {
     /// matters is where the *request* ends up, and a redirect that was followed
     /// would show up here as a transport error against the unreachable port in
     /// the `Location` header instead of as the 302 itself.
+    /// A server that closes its first `dropped` connections as it accepts
+    /// them, as monerod does over its per-address limit, then answers every
+    /// later one with `{"ok":true}`. Returns its port and the connections it
+    /// accepted, and stops after five seconds.
+    fn refusing(dropped: usize) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                if seen.fetch_add(1, Ordering::SeqCst) < dropped {
+                    drop(socket);
+                    continue;
+                }
+                socket.set_nonblocking(false).unwrap();
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf);
+                let body = r#"{"ok":true}"#;
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (port, accepted)
+    }
+
+    /// A connection closed before any answer is asked again, twice, and then
+    /// the failure is the caller's.
+    #[tokio::test]
+    async fn a_request_dropped_unanswered_is_asked_again() {
+        use std::sync::atomic::Ordering;
+        #[derive(serde::Deserialize)]
+        struct Ok {
+            ok: bool,
+        }
+        let (port, accepted) = refusing(2);
+        let client = Client::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let answer: Ok = client
+            .endpoint("get_height", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(answer.ok);
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+
+        let (port, accepted) = refusing(3);
+        let client = Client::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let outcome = client
+            .endpoint::<_, Ok>("get_height", &serde_json::json!({}))
+            .await;
+        assert!(
+            matches!(outcome, Err(RpcError::Transport { .. })),
+            "{:?}",
+            outcome.err()
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 3, "three tries in all");
+    }
+
     #[tokio::test]
     async fn a_redirect_is_reported_rather_than_followed() {
         // Port 1 is not listening, so a followed redirect would fail loudly.
@@ -577,6 +928,41 @@ mod tests {
             .expect("the daemon answered");
         assert_eq!(got.get("height").and_then(|h| h.as_u64()), Some(7));
         assert!(!peer.request().is_empty(), "the client never connected");
+    }
+
+    /// An `error` is read for its code and message only: whatever else it
+    /// holds is skipped, an `error` of another shape still fails the call,
+    /// and a null one is no error.
+    #[tokio::test]
+    async fn an_error_is_read_for_its_code_and_message_only() {
+        let fault = |body: &'static str| async move {
+            let peer = serve_json(body);
+            let client = Client::new(format!("http://127.0.0.1:{}", peer.port)).expect("valid url");
+            client
+                .json_rpc::<(), serde_json::Value>("get_info", None)
+                .await
+        };
+
+        match fault(r#"{"error":{"code":-2,"message":"no\nway","data":[0,0,0,[0,[0]]]}}"#).await {
+            Err(RpcError::JsonRpc { code, message, .. }) => {
+                assert_eq!(code, -2);
+                assert!(
+                    message.starts_with("no") && !message.contains('\n'),
+                    "{message}"
+                );
+            }
+            other => panic!("expected the daemon's error, got {other:?}"),
+        }
+        match fault(r#"{"error":[0,0,0]}"#).await {
+            Err(RpcError::JsonRpc { code, message, .. }) => {
+                assert_eq!((code, message.as_str()), (0, "<no message>"));
+            }
+            other => panic!("expected an error without details, got {other:?}"),
+        }
+        let answered = fault(r#"{"error":null,"result":{"status":"OK"}}"#)
+            .await
+            .expect("a null error is no error");
+        assert_eq!(answered.get("status").and_then(|s| s.as_str()), Some("OK"));
     }
 
     /// The request monerod actually receives: a POST of JSON to the endpoint
@@ -698,8 +1084,6 @@ mod tests {
         }
     }
 
-    /// The same body, under the ceiling, is read normally -- so the test above
-    /// is measuring the limit rather than a transport that never works.
     /// A declared length over the ceiling is refused on the strength of the
     /// declaration, without reading the body it promises.
     ///
@@ -726,6 +1110,30 @@ mod tests {
         }
     }
 
+    /// A call whose answer is small whatever the chain holds is held to
+    /// SMALL_ANSWER_BYTES, and one whose answer grows with the chain is not.
+    #[tokio::test]
+    async fn a_small_answer_has_a_ceiling_of_its_own() {
+        let body = format!(
+            r#"{{"result":{{"status":"OK","pad":"{}"}}}}"#,
+            "x".repeat(usize::try_from(SMALL_ANSWER_BYTES).unwrap())
+        );
+        let peer = serve_json(&body);
+        let client = Client::new(format!("http://127.0.0.1:{}", peer.port)).expect("valid url");
+        let outcome: Result<serde_json::Value, _> = client.json_rpc("get_info", None::<()>).await;
+        assert!(
+            matches!(outcome, Err(RpcError::ResponseTooLarge { .. })),
+            "{outcome:?}"
+        );
+
+        let peer = serve_json(&body);
+        let client = Client::new(format!("http://127.0.0.1:{}", peer.port)).expect("valid url");
+        let outcome: Result<serde_json::Value, _> = client.json_rpc("get_block", None::<()>).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    /// The same body, under the ceiling, is read normally -- so the size tests
+    /// is measuring the limit rather than a transport that never works.
     #[tokio::test]
     async fn a_response_under_the_ceiling_is_read() {
         let peer = serve_json(r#"{"result":{"status":"OK","height":7}}"#);
@@ -750,17 +1158,176 @@ mod tests {
 
     #[test]
     fn non_ok_status_is_an_error_and_missing_status_is_not() {
-        let failed = serde_json::json!({ "status": "Failed" });
-        assert!(Client::check_status(&failed, "/get_outs").is_err());
-
-        let busy = serde_json::json!({ "status": "BUSY" });
-        let err = Client::check_status(&busy, "/get_outs").expect_err("BUSY is not OK");
+        let status = |json: &str| Client::check_status(json.as_bytes(), "/get_outs");
+        assert!(status(r#"{"status": "Failed"}"#).is_err());
+        let err = status(r#"{"status": "BUSY", "height": 1}"#).expect_err("BUSY is not OK");
         assert!(err.is_transient());
+        assert!(status(r#"{"height": 1, "status": "OK"}"#).is_ok());
+        assert!(status(r#"{"height": 1}"#).is_ok());
+        // No string status, nothing to fail on: the typed parse decides.
+        assert!(status(r#"{"status": 7}"#).is_ok());
+        assert!(status("[1, 2]").is_ok());
+        // A status carrying control characters reaches the error printable.
+        let err = status("{\"status\": \"bad\\nline\"}").expect_err("not OK");
+        assert!(!err.to_string().contains('\n'), "{err}");
 
-        let ok = serde_json::json!({ "status": "OK" });
-        assert!(Client::check_status(&ok, "/get_outs").is_ok());
+        // Binary: a status that is present but unreadable is a failure, not a
+        // missing field.
+        let root = |status: &[u8]| {
+            let mut b = vec![
+                0x01,
+                0x11,
+                0x01,
+                0x01,
+                0x01,
+                0x01,
+                0x02,
+                0x01,
+                0x01,
+                1 << 2,
+                6,
+            ];
+            b.extend_from_slice(b"status");
+            b.push(10);
+            b.push((status.len() as u8) << 2);
+            b.extend_from_slice(status);
+            crate::epee::read_root(&b, &["status"]).unwrap()
+        };
+        assert!(Client::check_binary_status(&root(b"OK"), "x.bin").is_ok());
+        assert!(Client::check_binary_status(&root(b"OK\xff"), "x.bin").is_err());
+    }
 
-        let absent = serde_json::json!({ "height": 1 });
-        assert!(Client::check_status(&absent, "/get_outs").is_ok());
+    /// A portable-storage root section holding `entries`, each a name, a type
+    /// byte and the value's bytes.
+    fn epee_doc(entries: &[(&str, u8, &[u8])]) -> Vec<u8> {
+        let mut b = vec![0x01, 0x11, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01, 0x01];
+        b.push((entries.len() as u8) << 2);
+        for (name, ty, value) in entries {
+            b.push(name.len() as u8);
+            b.extend_from_slice(name.as_bytes());
+            b.push(*ty);
+            b.extend_from_slice(value);
+        }
+        b
+    }
+
+    fn epee_text(text: &str) -> Vec<u8> {
+        let mut v = vec![(text.len() as u8) << 2];
+        v.extend_from_slice(text.as_bytes());
+        v
+    }
+
+    fn serve_binary(body: &[u8]) -> Peer {
+        let mut reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        reply.extend_from_slice(body);
+        serve_bytes(reply)
+    }
+
+    const PROBE: [(&str, crate::epee::Field<'static>); 2] = [
+        ("as_of_n_blocks", crate::epee::Field::U64(421)),
+        ("unified_ids", crate::epee::Field::U64s(&[7])),
+    ];
+
+    #[tokio::test]
+    async fn a_binary_call_posts_the_encoded_request_and_reads_the_answer() {
+        let answer = epee_doc(&[
+            ("n_leaf_tuples", 5, &62u64.to_le_bytes()),
+            ("status", 10, &epee_text("OK")),
+        ]);
+        let peer = serve_binary(&answer);
+        let client = Client::new(format!("http://127.0.0.1:{}", peer.port)).expect("valid url");
+        let root = client
+            .binary(
+                "get_path_by_unified_id.bin",
+                &PROBE,
+                &["n_leaf_tuples"],
+                1024,
+            )
+            .await
+            .expect("the answer is accepted");
+        assert_eq!(root.unsigned("n_leaf_tuples"), Some(62));
+
+        let sent = peer.request_bytes();
+        let head_end = sent
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("a complete head");
+        let head = String::from_utf8_lossy(sent.get(..head_end).unwrap()).to_ascii_lowercase();
+        assert!(
+            head.starts_with("post /get_path_by_unified_id.bin "),
+            "{head}"
+        );
+        assert!(
+            head.contains("content-type: application/octet-stream"),
+            "{head}"
+        );
+        assert_eq!(
+            sent.get(head_end + 4..).unwrap(),
+            crate::epee::encode(&PROBE).unwrap().as_slice(),
+            "the body is the encoded request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binary_answer_over_its_limit_is_refused() {
+        let peer = serve_binary(&vec![0u8; 2048]);
+        let client = Client::new(format!("http://127.0.0.1:{}", peer.port)).expect("valid url");
+        let outcome = client
+            .binary("get_path_by_unified_id.bin", &PROBE, &[], 1024)
+            .await;
+        let _ = peer.request();
+        assert!(
+            matches!(outcome, Err(RpcError::ResponseTooLarge { len: 2048, .. })),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binary_answer_that_failed_or_has_no_status_is_an_error() {
+        let failed = epee_doc(&[
+            ("n_leaf_tuples", 5, &0u64.to_le_bytes()),
+            ("status", 10, &epee_text("Failed")),
+        ]);
+        let silent = epee_doc(&[("n_leaf_tuples", 5, &62u64.to_le_bytes())]);
+        for (body, want_status) in [(failed, true), (silent, false)] {
+            let peer = serve_binary(&body);
+            let client = Client::new(format!("http://127.0.0.1:{}", peer.port)).expect("valid url");
+            let outcome = client
+                .binary(
+                    "get_path_by_unified_id.bin",
+                    &PROBE,
+                    &["n_leaf_tuples"],
+                    1024,
+                )
+                .await;
+            let _ = peer.request();
+            if want_status {
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(RpcError::Status {
+                            status: Status::Failed,
+                            ..
+                        })
+                    ),
+                    "{outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(RpcError::Missing {
+                            field: "status",
+                            ..
+                        })
+                    ),
+                    "{outcome:?}"
+                );
+            }
+        }
     }
 }

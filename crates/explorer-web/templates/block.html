@@ -3,11 +3,22 @@
 {% block title %}Block {{ height }} &mdash; oxblocks{% endblock %}
 {% block content %}
 <h1>Block {{ height }}<span class="sub">{{ timestamp_utc }} UTC</span></h1>
+{% if orphan %}
+<div class="notice">This block is not on the main chain. Another block with
+number {{ height }} won, and this one's transactions count only where that
+block's do too.{% if unlisted > 0 %} {{ unlisted }} of its transactions {% if unlisted == 1 %}is{% else %}are{% endif %} neither on
+the main chain nor in the mempool, so {% if unlisted == 1 %}it is{% else %}they are{% endif %} not listed below.{% endif %}</div>
+{% endif %}
+{% if unreadable > 0 %}
+<div class="notice">{{ unreadable }} of this block's transactions could not
+be read, so {% if unreadable == 1 %}it is{% else %}they are{% endif %} not
+listed below.</div>
+{% endif %}
 
 <dl class="kv">
   <dt>Hash</dt><dd class="hash">{{ hash }}</dd>
   <dt>Previous</dt><dd><a class="hash" href="/block/{{ prev_hash }}">{{ prev_hash }}</a></dd>
-  <dt>Height</dt><dd>{{ height }}{% if depth > 0 %} <span class="tag">{{ depth }} deep</span>{% endif %}</dd>
+  <dt>Block number</dt><dd>{{ height }}{% if orphan %} <span class="tag bad">orphaned</span>{% else if depth > 0 %} <span class="tag">{{ depth }} deep</span>{% endif %}</dd>
   <dt>Timestamp</dt><dd>{{ timestamp }} &mdash; {{ timestamp_utc }} UTC <span class="tag">{{ age }} ago</span></dd>
   <dt>Size</dt><dd>{{ size }} bytes{% if weight != size %} <span class="tag">weight {{ weight }}</span>{% endif %}</dd>
   <dt>Transactions</dt><dd>{{ tx_count }}</dd>
@@ -18,12 +29,42 @@
   <dd>{{ major_version }}.{{ minor_version }}
     <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
     <p>The rule set the block was mined under. Monero changes its rules only at a
-    network upgrade, and each upgrade raises the major version. Version 16
+    network upgrade, and each upgrade raises the major version. Version 15
     arrived in August 2022 and brought ring size 16, Bulletproofs+ and view
-    tags. The minor version is the version a miner signals it is ready for. It
+    tags, and version 16 followed a day later. Version 17 brings FCMP++, which replaces rings with a proof over
+    every spendable output, and Carrot, a new way to address outputs, and
+    version 18 followed a day later. The
+    minor version is the version a miner signals it is ready for. It
     tracks the major version once an upgrade is live. Neither number names
     the monerod build that mined the block.</p></details>
   </dd>
+  {% if let Some(root) = tree_root %}
+  <dt>Curve tree</dt>
+  <dd><span class="hash">{{ root }}</span>{% match tree_layers %}{% when Some(0) %} <span class="tag" title="No outputs have entered the tree yet">empty</span>{% when Some(layers) %} <span class="tag">{{ layers }} layer{% if *layers != 1 %}s{% endif %}</span>{% when None %}{% endmatch %}
+    <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+    <p>The root of the tree of spendable outputs that this block commits to.
+    An FCMP++ transaction proves that each of its inputs is somewhere in such
+    a tree without saying where, so its anonymity set is every output in it
+    rather than a ring of 16. The root here runs eight blocks ahead: it is the
+    tree as it will stand when the chain is eight blocks past this one, which
+    holds every output up to the previous block that has unlocked by then. A
+    transaction whose reference block is eight above this one was checked
+    against this root. The layer count grows as the tree does, and the proof
+    grows with it.</p></details>
+  </dd>
+  {% if let Some((outputs, added)) = tree_growth %}
+  <dt>Tree size</dt>
+  <dd>{% if outputs.as_str() == "0" %}No outputs yet{% else %}{{ outputs }} outputs, {{ added }} more than the block before{% endif %}
+    <details class="hint"><summary aria-label="What is this?"><svg class="icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="8" cy="8" r="7"/><circle class="dot" cx="8" cy="4.4" r="1.05"/><path class="stem" d="M8 7.1v5"/></svg></summary>
+    <p>How many outputs the tree under this block's root holds, and how many
+    it gained over the previous block's. An output joins the tree in the
+    block nine after the one that mined it, 59 after for a coinbase, the last
+    block before it can be spent. Each
+    one that joins adds to the anonymity set of every FCMP++ spend checked
+    against this root or a later one.</p></details>
+  </dd>
+  {% endif %}
+  {% endif %}
 </dl>
 
 <h2>Transactions</h2>
@@ -32,9 +73,10 @@
   <thead>
     <tr>
       <th>Hash</th>
+      <th class="num">Inputs</th>
       <th class="num">Outputs</th>
       <th class="num">{% call sort::header("Fee", fee_sort) %}{% endcall %}</th>
-      <th class="num">Ring</th>
+      <th class="num">{% if self.anon_set() %}Anon set{% else %}Ring{% endif %}</th>
       <th class="num">{% call sort::header("Size", size_sort) %}{% endcall %}</th>
     </tr>
   </thead>
@@ -46,9 +88,10 @@
         {% if t.coinbase %}<span class="tag coinbase">coinbase</span>{% endif %}
         {% if t.p2pool %}<span class="tag coinbase">p2pool</span>{% endif %}
       </td>
+      <td class="num">{% if t.coinbase %}&mdash;{% else %}{{ t.inputs }}{% endif %}</td>
       <td class="num">{{ t.outputs }}</td>
       <td class="num">{{ t.fee }}</td>
-      <td class="num">{% if t.coinbase %}&mdash;{% else %}{{ t.ring }}{% endif %}</td>
+      <td class="num">{% if t.coinbase %}&mdash;{% else if t.full_chain %}{% if let Some(n) = t.tree %}<span title="FCMP++: proves it spends one of the {{ n }} outputs in the curve tree as of its reference block, without saying which">{{ n }}</span>{% else %}<span title="FCMP++: proves it spends one of the outputs in the curve tree as of its reference block, without saying which">whole tree</span>{% endif %}{% else %}{{ t.ring }}{% if t.ring_max != t.ring %} to {{ t.ring_max }}{% endif %}{% endif %}</td>
       <td class="num">{{ t.size }}</td>
     </tr>
   {% endfor %}
@@ -57,7 +100,7 @@
 </div>
 
 <div class="pager">
-  {% if height > 0 %}<a href="/block/{{ height - 1 }}">&larr; {{ height - 1 }}</a>{% else %}<span>&larr;</span>{% endif %}
-  {% if depth > 0 %}<a href="/block/{{ height + 1 }}">{{ height + 1 }} &rarr;</a>{% else %}<span>&rarr;</span>{% endif %}
+  {% if orphan && height > 0 %}<a href="/block/{{ prev_hash }}">&larr; {{ height - 1 }}</a>{% else if height > 0 %}<a href="/block/{{ height - 1 }}">&larr; {{ height - 1 }}</a>{% else %}<span>&larr;</span>{% endif %}
+  {% if depth > 0 && !orphan %}<a href="/block/{{ height + 1 }}">{{ height + 1 }} &rarr;</a>{% else %}<span>&rarr;</span>{% endif %}
 </div>
 {% endblock %}

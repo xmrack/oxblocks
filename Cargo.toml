@@ -11,7 +11,9 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` lets the client read an answer straight into its type, keeping
+# the JSON-RPC envelope's `result` as unparsed text on the way.
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 tracing = "0.1"
 
@@ -41,3 +43,23 @@ cast_sign_loss = "warn"
 # Explorer arithmetic is all chain-derived u64s (amounts, offsets, heights).
 # A silent wrap here is a wrong number on a page, so pay for the checks.
 overflow-checks = true
+
+# monero-oxide's curve arithmetic is slow unoptimised: the tests hash real
+# curve-tree paths and decode the FCMP++ generators, which takes over a minute
+# in a plain debug build and a few seconds optimised. monerod builds its own
+# copy of these crates the same way (`src/fcmp_pp/fcmp_pp_rust/Cargo.toml`).
+[profile.dev.package]
+subtle = { opt-level = 3 }
+curve25519-dalek = { opt-level = 3 }
+ff = { opt-level = 3 }
+group = { opt-level = 3 }
+crypto-bigint = { opt-level = 3 }
+dalek-ff-group = { opt-level = 3 }
+helioselene = { opt-level = 3 }
+multiexp = { opt-level = 3 }
+ec-divisors = { opt-level = 3 }
+generalized-bulletproofs = { opt-level = 3 }
+full-chain-membership-proofs = { opt-level = 3 }
+monero-fcmp-plus-plus = { opt-level = 3 }
+monero-fcmp-plus-plus-generators = { opt-level = 3 }
+monero-ed25519 = { opt-level = 3 }

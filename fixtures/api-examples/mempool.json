@@ -2,27 +2,30 @@
   "data": {
     "limit": 1,
     "page": 0,
-    "total_page_no": 50,
+    "total_page_no": 1,
     "txs": [
       {
         "coinbase": false,
-        "extra": "01d3d0925db532a12b5d16eef8627f9aaf224aeaa5fdd7dc3f47d92616eb49c38e020901141684dabcbc8734",
-        "mixin": 16,
+        "extra": "01bb115658924c3a767e1bb074fee6161a9c247783600627436d1c1b6bffa73c66020901e5d40bd4e17b2e5a",
+        "fcmp_pp_proof_size": 6528,
+        "mixin": 0,
+        "n_tree_layers": 2,
         "payment_id": "",
-        "payment_id8": "141684dabcbc8734",
-        "rct_type": 6,
-        "timestamp": 1790092581,
-        "timestamp_utc": "2026-09-22 15:56:21",
-        "tx_fee": 30660000,
-        "tx_hash": "6eb969e26200f074001924129a1a00bf9894cc6e9877a89791c990b2a7dc7da7",
-        "tx_size": 1533,
+        "payment_id8": "e5d40bd4e17b2e5a",
+        "rct_type": 7,
+        "reference_block": 431,
+        "timestamp": 1790217891,
+        "timestamp_utc": "2026-09-24 02:44:51",
+        "tx_fee": 10911600000,
+        "tx_hash": "427967f4d11492c746a078e415acb501631699352a31426dec2a6392457f281e",
+        "tx_size": 7549,
         "tx_version": 2,
         "unlock_time": 0,
         "xmr_inputs": 0,
         "xmr_outputs": 0
       }
     ],
-    "txs_no": 50
+    "txs_no": 1
   },
   "status": "success"
 }

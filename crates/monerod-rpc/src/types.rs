@@ -26,6 +26,13 @@
 //! and need a second parse. See [`BlockJson`] and [`TxJson`], and note that the
 //! string can be empty: [`NestedJsonError::Absent`].
 //!
+//! The FCMP++ and Carrot hard fork (version 17) is described too, as the
+//! `fcmp++-beta-stressnet-v3` branch of monerod writes it. It adds a `carrot_v1`
+//! output target, RingCT type 7 with its proof in `rctsig_prunable`, inputs
+//! with no ring, two curve-tree fields on the block, and `unified_ids` beside
+//! `output_indices`. Every addition is optional on the Rust side, so the same
+//! types still read a daemon that has never heard of the fork.
+//!
 //! Request types live here too, and several of them hide their fields. That is
 //! deliberate: the traps in this protocol are almost all "a field you did not
 //! set defaulted to something that silently returns the wrong data" (see
@@ -99,61 +106,6 @@ pub fn parse_wide(s: &str) -> Option<u128> {
 #[must_use]
 pub fn default_quantization_mask() -> u64 {
     1
-}
-
-// ---------------------------------------------------------------------------
-// JSON-RPC envelope
-// ---------------------------------------------------------------------------
-
-/// The `/json_rpc` envelope.
-///
-/// monerod emits two disjoint shapes — one with `result` and no `error` member
-/// at all, one with `error` and no `result` — so both are modelled as options
-/// rather than as an enum.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct JsonRpcEnvelope<T> {
-    #[serde(default)]
-    pub jsonrpc: String,
-    /// monerod echoes the request's `id` verbatim, preserving its JSON type: an
-    /// `"id": 42` comes back as the number 42. Omitting `id` yields the number
-    /// 0 on every path except `-32601`, which yields `""`. A `String` here
-    /// fails to deserialize against a caller that used a number.
-    #[serde(default)]
-    pub id: serde_json::Value,
-    /// Present on the success shape only — the error shape has no `result`
-    /// member at all. No `#[serde(default)]`: serde already reads a missing
-    /// `Option` field as `None`, and the attribute would demand `T: Default`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<T>,
-    /// Present on the error shape only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
-}
-
-/// The JSON-RPC `error` member. epee emits exactly these two keys — there is no
-/// `data` field.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct JsonRpcError {
-    pub code: i64,
-    pub message: String,
-}
-
-impl JsonRpcError {
-    /// Whether this is the "method is not available on this daemon" shape.
-    ///
-    /// Covers both a genuinely unknown method and one gated off by
-    /// `--restricted-rpc`; monerod does not distinguish them.
-    #[must_use]
-    pub fn is_method_unavailable(&self) -> bool {
-        self.code == error_code::METHOD_NOT_FOUND
-    }
-
-    /// Whether monerod refused a *parameter* as beyond the restricted allowance
-    /// (code -19), e.g. a block-header range wider than 1000.
-    #[must_use]
-    pub fn is_restricted(&self) -> bool {
-        self.code == error_code::RESTRICTED
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +345,25 @@ impl GetBlock {
     pub fn parse_json(&self) -> Result<BlockJson, NestedJsonError> {
         parse_nested_json(&self.json)
     }
+
+    /// Parse only the curve-tree fields of the nested `json` string.
+    ///
+    /// [`GetBlock::parse_json`] builds the whole block, miner transaction and
+    /// every transaction hash included, which is a lot to build for two
+    /// scalars. This walks past the rest without keeping it.
+    pub fn parse_tree(&self) -> Result<BlockTreeJson, NestedJsonError> {
+        parse_nested_json(&self.json)
+    }
+}
+
+/// The curve-tree fields of [`BlockJson`], and nothing else. See
+/// [`BlockJson::fcmp_pp_tree_root`] for what they mean.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct BlockTreeJson {
+    #[serde(default)]
+    pub fcmp_pp_n_tree_layers: Option<u8>,
+    #[serde(default)]
+    pub fcmp_pp_tree_root: Option<String>,
 }
 
 /// The decoded contents of [`GetBlock::json`].
@@ -411,6 +382,17 @@ pub struct BlockJson {
     /// serializer keeps empty arrays, unlike epee.
     #[serde(default)]
     pub tx_hashes: Vec<String>,
+    /// From hard fork 17 only; absent below it, because the block format
+    /// itself gains the field at the fork. The curve tree's layer count, which
+    /// with the root below lets a light client check an FCMP++ proof without
+    /// the tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fcmp_pp_n_tree_layers: Option<u8>,
+    /// From hard fork 17 only. The root of the curve tree this block commits
+    /// to, hex. An output joins the tree when it unlocks rather than when it
+    /// is mined, so the root does not cover the outputs of this block itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fcmp_pp_tree_root: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -437,12 +419,35 @@ pub struct FeeEstimate {
     pub top_hash: String,
 }
 
+/// The hard fork that widens a wallet's fee estimate to 1000 grace blocks
+/// (monerod's `HF_VERSION_2026_SCALING`).
+pub const HF_VERSION_2026_SCALING: u8 = 17;
+
+/// The grace window wallet2 asks a fee estimate for at hard fork `hf`, its
+/// `FEE_ESTIMATE_GRACE_BLOCKS_2021` and `_2026`. Another window gives another
+/// fee from the one wallets pay, and monerod logs it as a possible wallet
+/// fingerprint.
+#[must_use]
+pub const fn wallet_grace_blocks(hf: u8) -> u64 {
+    if hf >= HF_VERSION_2026_SCALING {
+        1000
+    } else {
+        10
+    }
+}
+
+/// The widest grace window the daemon is asked for. monerod loops once per
+/// grace block with its chain lock held, so a window of `u64::MAX` stops the
+/// node.
+pub const MAX_GRACE_BLOCKS: u64 = 1000;
+
 /// One alternative chain. `difficulty` here is the **cumulative** difficulty of
 /// the alt chain's tip, not the per-block difficulty.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChainInfo {
     pub block_hash: String,
-    /// Height of the chain's first block.
+    /// Height of the chain's tip, the block `block_hash` names. Its first
+    /// block is `length - 1` below.
     pub height: u64,
     /// Number of blocks in the chain.
     pub length: u64,
@@ -472,10 +477,6 @@ pub struct GetAlternateChains {
     #[serde(default)]
     pub untrusted: bool,
 }
-
-// ---------------------------------------------------------------------------
-// /get_height
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // get_txids_loose
@@ -553,6 +554,24 @@ pub struct GetTxidsLooseResponse {
     pub credits: u64,
     #[serde(default)]
     pub top_hash: String,
+}
+
+// ---------------------------------------------------------------------------
+// /get_height
+// ---------------------------------------------------------------------------
+
+/// `hard_fork_info` request: the version to report on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct HardForkInfoRequest {
+    pub version: u8,
+}
+
+/// `hard_fork_info`. Only the field this explorer reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardForkInfo {
+    /// The height the version asked about begins at, by the network's fork
+    /// table, whether or not the chain has reached it.
+    pub earliest_height: u64,
 }
 
 /// `/get_height`. No `credits`/`top_hash`.
@@ -662,15 +681,69 @@ pub struct TxEntry {
     pub block_timestamp: u64,
     #[serde(default)]
     pub output_indices: Vec<u64>,
+    /// One per output, like `output_indices`, from a daemon built with FCMP++.
+    /// The output's index among every output on the chain, whatever its
+    /// amount, where `output_indices` counts within one denomination. It is
+    /// not the output's leaf in the curve tree: outputs join the tree in the
+    /// order they unlock. Absent from an older daemon, and absent (not empty)
+    /// whenever `output_indices` is.
+    #[serde(default)]
+    pub unified_ids: Vec<u64>,
 
     // Present only when `in_pool` is true.
     #[serde(default)]
     pub relayed: bool,
     #[serde(default)]
     pub received_timestamp: u64,
+
+    /// The hex fields' lengths, once [`TxEntry::drop_hex`] has emptied them.
+    #[serde(skip)]
+    pub dropped_hex: Option<HexLengths>,
+}
+
+/// How long each hex field of a [`TxEntry`] was, in characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HexLengths {
+    pub as_hex: usize,
+    pub pruned: usize,
+    pub prunable: usize,
 }
 
 impl TxEntry {
+    /// Empty the hex fields, keeping only how long they were.
+    ///
+    /// Nothing reads the blobs themselves, only their lengths: the size and
+    /// [`TxEntry::prunable_missing`]. The prunable half is most of a large
+    /// transaction, and its proof is in `as_json` again, so a 128-input
+    /// FCMP++ spend holds half as much without them. Once dropped,
+    /// [`TxEntry::raw_hex`] is `None` and the rest answers as before.
+    pub fn drop_hex(&mut self) {
+        if self.dropped_hex.is_none() {
+            self.dropped_hex = Some(self.hex_lengths());
+            self.as_hex = String::new();
+            self.pruned_as_hex = String::new();
+            self.prunable_as_hex = String::new();
+        }
+    }
+
+    /// The hex fields' lengths, whether or not they were dropped.
+    #[must_use]
+    pub fn hex_lengths(&self) -> HexLengths {
+        self.dropped_hex.unwrap_or(HexLengths {
+            as_hex: self.as_hex.len(),
+            pruned: self.pruned_as_hex.len(),
+            prunable: self.prunable_as_hex.len(),
+        })
+    }
+
+    /// The unified ids, one per output, or `None` when there is not exactly
+    /// one per output. They are matched to outputs by position, so a list of
+    /// any other length cannot say which output an id belongs to.
+    #[must_use]
+    pub fn unified_ids_per_output(&self, outputs: usize) -> Option<&[u64]> {
+        (outputs > 0 && self.unified_ids.len() == outputs).then_some(self.unified_ids.as_slice())
+    }
+
     /// Parse the nested `as_json` string.
     ///
     /// `as_json` is `""` on every request that did not set `decode_as_json`,
@@ -682,12 +755,16 @@ impl TxEntry {
 
     /// Whatever raw hex monerod gave us, reassembled.
     ///
-    /// Returns `None` when neither form was populated. Note this is *not*
+    /// Returns `None` when neither form was populated, or when
+    /// [`TxEntry::drop_hex`] dropped them. Note this is *not*
     /// necessarily the complete blob: when the daemon has pruned the
     /// transaction, only the pruned prefix exists. Ask
     /// [`TxEntry::prunable_missing`] before presenting it as the full blob.
     #[must_use]
     pub fn raw_hex(&self) -> Option<String> {
+        if self.dropped_hex.is_some() {
+            return None;
+        }
         if !self.as_hex.is_empty() {
             return Some(self.as_hex.clone());
         }
@@ -695,6 +772,19 @@ impl TxEntry {
             return None;
         }
         Some(format!("{}{}", self.pruned_as_hex, self.prunable_as_hex))
+    }
+
+    /// The length of [`Self::raw_hex`], without assembling it.
+    #[must_use]
+    pub fn raw_hex_len(&self) -> Option<usize> {
+        let n = self.hex_lengths();
+        if n.as_hex > 0 {
+            return Some(n.as_hex);
+        }
+        if n.pruned == 0 {
+            return None;
+        }
+        Some(n.pruned + n.prunable)
     }
 
     /// Whether *this node* no longer holds the transaction's prunable half.
@@ -711,10 +801,11 @@ impl TxEntry {
     #[must_use]
     pub fn prunable_missing(&self, decoded: &TxJson) -> bool {
         // Non-split form: everything is in as_hex, so nothing was withheld.
-        if !self.as_hex.is_empty() {
+        let n = self.hex_lengths();
+        if n.as_hex > 0 {
             return false;
         }
-        if !self.prunable_as_hex.is_empty() {
+        if n.prunable > 0 {
             return false;
         }
         if decoded.is_coinbase() {
@@ -725,6 +816,22 @@ impl TxEntry {
         }
         true
     }
+}
+
+// ---------------------------------------------------------------------------
+// /get_transaction_pool_hashes
+// ---------------------------------------------------------------------------
+
+/// `/get_transaction_pool_hashes`: the pool's hashes alone. An empty pool
+/// omits `tx_hashes`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetTransactionPoolHashes {
+    #[serde(default)]
+    pub tx_hashes: Vec<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub untrusted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -931,6 +1038,322 @@ pub struct OutKey {
     /// Present but **empty** when `get_txid` was false — not absent.
     #[serde(default)]
     pub txid: String,
+}
+
+// ---------------------------------------------------------------------------
+// /get_path_by_unified_id.bin
+// ---------------------------------------------------------------------------
+
+/// How many outputs the curve tree held as of a block: the size of an FCMP++
+/// transaction's anonymity set, when asked for its reference block.
+///
+/// monerod reports the figure as `n_leaf_tuples`, and only in binary: from
+/// `/get_path_by_unified_id.bin`, and from `/getblocks.bin` when asked to
+/// start a tree sync, beside a batch of whole blocks. The first is the cheap
+/// one. It exists to hand a wallet the tree paths of its own outputs, and it
+/// answers the tree size beside them. It answers 0 when asked about no
+/// outputs at all, so it has to be asked about one.
+///
+/// The one asked about is the **probe**, and choosing it well keeps the call
+/// cheap and safe. For an output that joins the tree only after the block
+/// asked about, monerod skips the leaf search and the path read, so the call
+/// cannot fail on a missing leaf. Every output of the transaction being looked
+/// at is such an output: it was created in a block after the reference block,
+/// and an output joins the tree only when it unlocks, some blocks after that.
+/// So the probe is the transaction's own first output, by its unified id.
+///
+/// What the call still costs the daemon, whatever the probe: reading the
+/// probe transaction's output data, and the tree's size and last path as of
+/// the block asked about. A few database reads, not a scan.
+///
+/// The fields are private so that the one-block offset cannot be dropped:
+/// monerod takes a block *count*, and treats a count of 0 as "now".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeSizeQuery {
+    as_of_n_blocks: u64,
+    probe: [u64; 1],
+}
+
+impl TreeSizeQuery {
+    pub const ENDPOINT: &'static str = "get_path_by_unified_id.bin";
+
+    /// The largest answer accepted.
+    ///
+    /// The answer is 115 bytes when the probe is not yet in the tree and about
+    /// 3 KB when it is, with a path that grows by one chunk per tree layer,
+    /// and monerod caps the tree at 12 layers.
+    pub const MAX_ANSWER_BYTES: u64 = 64 * 1024;
+
+    /// The root entries [`Self::answer`] reads. Everything else in the answer,
+    /// the paths included, is walked past without being kept.
+    pub const WANTED: &'static [&'static str] = &["n_leaf_tuples"];
+
+    /// The tree as of `reference_block`, probed with `probe_unified_id`.
+    ///
+    /// `None` only for a reference block of `u64::MAX`, which has no count.
+    #[must_use]
+    pub fn as_of_block(reference_block: u64, probe_unified_id: u64) -> Option<Self> {
+        Some(Self {
+            as_of_n_blocks: reference_block.checked_add(1)?,
+            probe: [probe_unified_id],
+        })
+    }
+
+    #[must_use]
+    pub fn fields(&self) -> [(&'static str, crate::epee::Field<'_>); 2] {
+        [
+            (
+                "as_of_n_blocks",
+                crate::epee::Field::U64(self.as_of_n_blocks),
+            ),
+            ("unified_ids", crate::epee::Field::U64s(&self.probe)),
+        ]
+    }
+
+    /// The tree size from the daemon's answer, `None` when it carries none.
+    /// 0 is a real answer: the tree is empty as of the first blocks after
+    /// FCMP++ activates.
+    #[must_use]
+    pub fn answer(root: &crate::epee::Root) -> Option<u64> {
+        root.unsigned("n_leaf_tuples")
+    }
+}
+
+/// Outputs' paths through the curve tree, from the same endpoint as
+/// [`TreeSizeQuery`], as of one block.
+///
+/// A path is what a wallet needs to prove it spends one of the tree's leaves
+/// without saying which: the group of up to [`SELENE_CHUNK_WIDTH`] leaves
+/// holding the output, then at each layer above the whole group holding that
+/// layer's ancestor of the output, up to the root. Each parent is a hash of
+/// its whole group, so every member of the group is needed to recompute it,
+/// not one sibling as in a binary tree.
+///
+/// A path belongs to one state of the tree. Outputs join the tree at its
+/// right edge, which changes the last group of every layer, so a path taken
+/// as of another block can differ from this one in those groups.
+///
+/// monerod answers every id it is asked about, in order: with an empty path
+/// for an output not yet in the tree as of the block asked about, because it
+/// has not unlocked, and with an error for an id it does not know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathQuery {
+    as_of_n_blocks: u64,
+    unified_ids: Vec<u64>,
+}
+
+impl PathQuery {
+    pub const ENDPOINT: &'static str = TreeSizeQuery::ENDPOINT;
+
+    /// The most ids one call asks about: `MAX_RESTRICTED_PATHS_COUNT` in
+    /// `src/rpc/core_rpc_server.cpp`, which a public node enforces.
+    pub const MAX_IDS: usize = 50;
+
+    /// The largest answer accepted: [`Self::MAX_IDS`] paths through a tree of
+    /// monerod's most layers, 12, with every group full, is about 700 KB.
+    pub const MAX_ANSWER_BYTES: u64 = 1024 * 1024;
+
+    pub const WANTED: &'static [&'static str] = &["n_leaf_tuples", "paths"];
+
+    /// The paths of `unified_ids` as of block `as_of_block`.
+    ///
+    /// `None` for no ids, for more than [`Self::MAX_IDS`], and for a block of
+    /// `u64::MAX`, which has no count.
+    #[must_use]
+    pub fn as_of_block(as_of_block: u64, unified_ids: &[u64]) -> Option<Self> {
+        if unified_ids.is_empty() || unified_ids.len() > Self::MAX_IDS {
+            return None;
+        }
+        Some(Self {
+            as_of_n_blocks: as_of_block.checked_add(1)?,
+            unified_ids: unified_ids.to_vec(),
+        })
+    }
+
+    #[must_use]
+    pub fn fields(&self) -> [(&'static str, crate::epee::Field<'_>); 2] {
+        [
+            (
+                "as_of_n_blocks",
+                crate::epee::Field::U64(self.as_of_n_blocks),
+            ),
+            ("unified_ids", crate::epee::Field::U64s(&self.unified_ids)),
+        ]
+    }
+
+    /// The paths from the daemon's answer, one per id asked about, in order.
+    pub fn answer(&self, root: &crate::epee::Root) -> Result<TreePaths, PathAnswerError> {
+        let n_leaf_tuples = root
+            .unsigned("n_leaf_tuples")
+            .ok_or(PathAnswerError::Missing("n_leaf_tuples"))?;
+        let entries = root
+            .array("paths")
+            .ok_or(PathAnswerError::Missing("paths"))?;
+        if entries.len() != self.unified_ids.len() {
+            return Err(PathAnswerError::Count {
+                asked: self.unified_ids.len(),
+                answered: entries.len(),
+            });
+        }
+        let paths = entries
+            .iter()
+            .map(TreePath::read)
+            .collect::<Result<_, _>>()?;
+        Ok(TreePaths {
+            n_leaf_tuples,
+            paths,
+        })
+    }
+}
+
+/// Why an answer to a [`PathQuery`] cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PathAnswerError {
+    #[error("the answer has no {0}")]
+    Missing(&'static str),
+    #[error("{answered} paths answer {asked} ids")]
+    Count { asked: usize, answered: usize },
+    #[error("a path's {0} is malformed")]
+    Malformed(&'static str),
+}
+
+/// The answer to a [`PathQuery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreePaths {
+    /// Leaves in the tree as of the block asked about.
+    pub n_leaf_tuples: u64,
+    /// One per id asked about, in order: `None` for an output not in the tree
+    /// as of that block.
+    pub paths: Vec<Option<TreePath>>,
+}
+
+/// One output's path. See [`PathQuery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreePath {
+    /// The output's position among the tree's leaves.
+    pub leaf_idx: u64,
+    /// The group of leaves holding the output, in the tree's order.
+    pub leaves: Vec<PathLeaf>,
+    /// From the leaves' parents up: at each layer the group holding the
+    /// output's ancestor, as compressed points. The last is the root alone.
+    /// The layers alternate curves, Selene first.
+    pub layers: Vec<Vec<[u8; 32]>>,
+}
+
+/// A leaf of the tree as a path carries it: the output as it is on chain,
+/// before the tree derives its leaf values from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathLeaf {
+    pub unified_id: u64,
+    pub kind: LeafKind,
+    /// The output's one-time key `O`, as on chain.
+    pub output_key: [u8; 32],
+    /// The output's amount commitment `C`, as on chain.
+    pub commitment: [u8; 32],
+}
+
+/// How the tree derives a leaf from an output: `OutputPairType` in
+/// `src/fcmp_pp/fcmp_pp_types.h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafKind {
+    /// An output from before Carrot. Its key and commitment may carry torsion,
+    /// which the tree clears, and its key image generator is the older,
+    /// biased hash of its key.
+    Legacy,
+    /// A Carrot output, checked for torsion when it was mined, whose key image
+    /// generator is the unbiased hash of its key.
+    Carrot,
+    /// A type this build does not know.
+    Other(u8),
+}
+
+impl LeafKind {
+    const fn from_byte(b: u8) -> Self {
+        match b {
+            0 => Self::Legacy,
+            1 => Self::Carrot,
+            other => Self::Other(other),
+        }
+    }
+}
+
+impl TreePath {
+    /// One entry of the answer's `paths`. Whether its leaf is the output
+    /// asked about is left to the check of the whole path.
+    fn read(entry: &crate::epee::Value) -> Result<Option<Self>, PathAnswerError> {
+        use crate::epee::Value;
+        let Value::Section(entry) = entry else {
+            return Err(PathAnswerError::Malformed("entry"));
+        };
+        let path = entry
+            .section("path")
+            .ok_or(PathAnswerError::Malformed("entry"))?;
+        let leaves = path
+            .section("leaves")
+            .ok_or(PathAnswerError::Malformed("leaves"))?;
+        // epee leaves an empty blob or list out, so an output with no path
+        // arrives as a path with empty leaves and no layers.
+        let blob = |name| leaves.bytes(name).unwrap_or_default();
+        let ids = blob("unified_ids");
+        let kinds = blob("output_types");
+        let keys = blob("output_pubkeys");
+        let commitments = blob("commitments");
+        let n = kinds.len();
+        if ids.len() != n * 8 || keys.len() != n * 32 || commitments.len() != n * 32 {
+            return Err(PathAnswerError::Malformed("leaves"));
+        }
+        let chunks = path.array("layer_chunks").unwrap_or_default();
+        if n == 0 {
+            return if chunks.is_empty() {
+                Ok(None)
+            } else {
+                Err(PathAnswerError::Malformed("leaves"))
+            };
+        }
+        // The lengths were checked above, so the chunks leave no remainder.
+        let leaves = ids
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(kinds)
+            .zip(
+                keys.as_chunks::<32>()
+                    .0
+                    .iter()
+                    .zip(commitments.as_chunks::<32>().0),
+            )
+            .map(|((id, &kind), (key, commitment))| PathLeaf {
+                unified_id: u64::from_le_bytes(*id),
+                kind: LeafKind::from_byte(kind),
+                output_key: *key,
+                commitment: *commitment,
+            })
+            .collect::<Vec<_>>();
+        let layers = chunks
+            .iter()
+            .map(|chunk| {
+                let elems = match chunk {
+                    Value::Section(c) => c.bytes("elems").unwrap_or_default(),
+                    _ => return Err(PathAnswerError::Malformed("layer_chunks")),
+                };
+                let (points, rest) = elems.as_chunks::<32>();
+                if points.is_empty() || !rest.is_empty() {
+                    return Err(PathAnswerError::Malformed("layer_chunks"));
+                }
+                Ok(points.to_vec())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if layers.is_empty() {
+            return Err(PathAnswerError::Malformed("layer_chunks"));
+        }
+        Ok(Some(Self {
+            leaf_idx: entry
+                .unsigned("leaf_idx")
+                .ok_or(PathAnswerError::Malformed("entry"))?,
+            leaves,
+            layers,
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,19 +1586,22 @@ pub enum NestedJsonError {
     /// error.
     #[error("monerod returned no decoded JSON for this object")]
     Absent,
+    /// The parser's reason, bounded and on one line, since it can quote the
+    /// document.
     #[error("monerod's decoded JSON did not parse: {0}")]
-    Malformed(#[from] serde_json::Error),
+    Malformed(String),
 }
 
 fn parse_nested_json<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T, NestedJsonError> {
     if raw.is_empty() {
         return Err(NestedJsonError::Absent);
     }
-    Ok(serde_json::from_str(raw)?)
+    serde_json::from_str(raw)
+        .map_err(|e| NestedJsonError::Malformed(crate::error::decode_detail(&e)))
 }
 
 /// A decoded transaction, total across every era of the chain: v1 pre-RingCT
-/// through BulletproofPlus, pruned and complete, coinbase and not.
+/// through BulletproofPlus and FCMP++, pruned and complete, coinbase and not.
 ///
 /// Modelled as one flat struct with optional halves rather than as an untagged
 /// enum. The variant is chosen by a *sibling scalar* (`version`, then `type`),
@@ -1224,6 +1650,37 @@ impl TxJson {
         self.version <= 1
     }
 
+    /// Whether this transaction spends with FCMP++ rather than with rings.
+    ///
+    /// Read from the RingCT type, not from empty `key_offsets`: a malformed
+    /// ring-era input with no offsets is not an FCMP++ spend, and an FCMP++
+    /// coinbase does not exist (a coinbase is type 0 in every era).
+    #[must_use]
+    pub fn is_fcmp_pp(&self) -> bool {
+        self.rct_type() == Some(RctType::FcmpPlusPlus)
+    }
+
+    /// The FCMP++ reference block, or `None` for a ring-era transaction and
+    /// for an FCMP++ one whose prunable half this node no longer holds: the
+    /// field is in `rctsig_prunable`, so pruning takes it.
+    #[must_use]
+    pub fn reference_block(&self) -> Option<u64> {
+        if !self.is_fcmp_pp() {
+            return None;
+        }
+        self.rctsig_prunable.as_ref()?.reference_block
+    }
+
+    /// The curve tree's layer count the FCMP++ proof was built for. `None` in
+    /// the same cases as [`TxJson::reference_block`].
+    #[must_use]
+    pub fn n_tree_layers(&self) -> Option<u8> {
+        if !self.is_fcmp_pp() {
+            return None;
+        }
+        self.rctsig_prunable.as_ref()?.n_tree_layers
+    }
+
     /// The RingCT type, or `None` for a v1 transaction.
     ///
     /// Returning `None` rather than `RctType::Null` keeps "pre-RingCT" and "a
@@ -1239,7 +1696,7 @@ impl TxJson {
     /// transaction's RingCT type.
     ///
     /// They live in `rct_signatures` for type 2 and in `rctsig_prunable` for
-    /// types 3 through 6, and do not exist at all for type 1. Looking in only
+    /// types 3 through 7, and do not exist at all for type 1. Looking in only
     /// one place silently yields nothing for half of the chain's history.
     #[must_use]
     pub fn pseudo_outs(&self) -> &[String] {
@@ -1254,7 +1711,8 @@ impl TxJson {
                 RctType::Bulletproof
                 | RctType::Bulletproof2
                 | RctType::Clsag
-                | RctType::BulletproofPlus,
+                | RctType::BulletproofPlus
+                | RctType::FcmpPlusPlus,
             ) => self
                 .rctsig_prunable
                 .as_ref()
@@ -1395,6 +1853,10 @@ pub struct TxInToKey {
     pub amount: u64,
     /// **Relative** offsets. Member `i` sits at `sum(key_offsets[0..=i])`; only
     /// the first is absolute. See [`TxInToKey::ring_members`].
+    ///
+    /// Present and **empty** for every input of an FCMP++ transaction (RingCT
+    /// type 7). Such an input spends one of the outputs in the curve tree, not one
+    /// of a ring, so there are no members to name.
     pub key_offsets: Vec<u64>,
     pub k_image: String,
 }
@@ -1442,17 +1904,23 @@ pub struct TxOut {
 
 /// An output target.
 ///
-/// The two live variants nest differently, which is the trap: `key`'s body is a
+/// The live variants nest differently, which is the trap: `key`'s body is a
 /// bare hex string because the C++ type is blob-serialized, while
-/// `tagged_key`'s body is an object. A `struct { key: String }` parses every
-/// pre-view-tag output and then fails on everything after mainnet height
-/// 2689608.
+/// `tagged_key`'s and `carrot_v1`'s bodies are objects. A `struct { key:
+/// String }` parses every pre-view-tag output and then fails on everything
+/// after mainnet height 2689608.
+///
+/// `carrot_v1` is the FCMP++ fork's output (hard fork 17), on wire tag `0x01`.
+/// A daemon without FCMP++ names that tag `scripthash`, which no output on any
+/// chain uses, and `ScriptHash` parses such a daemon's answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TxOutTarget {
     #[serde(rename = "key")]
     Key(String),
     #[serde(rename = "tagged_key")]
     TaggedKey(TaggedKey),
+    #[serde(rename = "carrot_v1")]
+    CarrotV1(CarrotV1),
     #[serde(rename = "script")]
     Script(serde_json::Value),
     #[serde(rename = "scripthash")]
@@ -1466,18 +1934,44 @@ impl TxOutTarget {
         match self {
             Self::Key(k) => Some(k),
             Self::TaggedKey(t) => Some(&t.key),
+            Self::CarrotV1(c) => Some(&c.key),
             _ => None,
         }
     }
 
-    /// The view tag, if this output has one.
+    /// The view tag, if this output has one. One byte before Carrot and three
+    /// bytes from it, so two or six hex characters; `None` for a tag of any
+    /// other form.
     #[must_use]
     pub fn view_tag(&self) -> Option<&str> {
         match self {
-            Self::TaggedKey(t) => Some(&t.view_tag),
+            Self::TaggedKey(t) => hex_of_len(&t.view_tag, 2),
+            Self::CarrotV1(c) => hex_of_len(&c.view_tag, 6),
             _ => None,
         }
     }
+
+    /// The encrypted Janus anchor, which only a Carrot output has: 32 hex
+    /// characters, and `None` for an anchor of any other form.
+    #[must_use]
+    pub fn encrypted_janus_anchor(&self) -> Option<&str> {
+        match self {
+            Self::CarrotV1(c) => hex_of_len(&c.encrypted_janus_anchor, 32),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a Carrot output.
+    #[must_use]
+    pub const fn is_carrot(&self) -> bool {
+        matches!(self, Self::CarrotV1(_))
+    }
+}
+
+/// `s` when it is exactly `len` hex characters.
+#[must_use]
+pub fn hex_of_len(s: &str, len: usize) -> Option<&str> {
+    (s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())).then_some(s)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1485,6 +1979,130 @@ pub struct TaggedKey {
     pub key: String,
     /// One byte, so exactly two hex characters.
     pub view_tag: String,
+}
+
+/// The hard fork that brings FCMP++ and Carrot, and with them the block's
+/// curve-tree fields. A block below it has no tree to report.
+pub const HF_VERSION_FCMP_PLUS_PLUS: u8 = 17;
+
+/// How far a block's own tree root runs ahead of its height.
+///
+/// A transaction's `reference_block` R and a block's `fcmp_pp_tree_root` count
+/// the tree differently. The proof is checked against the tree as it stood
+/// when R was the chain tip. Block H commits to the tree as of tip
+/// `get_default_last_locked_block_index(H - 1)`, which is `H - 1 + 9`: the
+/// default spendable age of 10 blocks, less one. So the root a proof naming R
+/// was checked against is the one block `R - 8` carries, not block R's. The
+/// root is in the block's body, after its transaction list, not in the header
+/// the header calls return; only `get_block` has it.
+///
+/// From the check in `Blockchain::handle_block_to_main_chain`
+/// (`src/cryptonote_core/blockchain.cpp`) and
+/// `CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE` in `src/cryptonote_config.h`.
+pub const TREE_ROOT_LAG: u64 = 8;
+
+/// The last block at which an output with `unlock_time`, mined in block
+/// `height`, is still locked. It joins the curve tree with that block: the
+/// tree as of that block and every later one holds it.
+///
+/// Never sooner than the default spendable age of 10 blocks allows. An
+/// `unlock_time` below 500,000,000 is a height, and above it a Unix time,
+/// converted at two minutes a block from hard fork 15's time and height, as
+/// monerod converts it.
+///
+/// `get_last_locked_block_index` in
+/// `src/cryptonote_basic/cryptonote_format_utils.cpp`.
+#[must_use]
+pub const fn last_locked_block(unlock_time: u64, height: u64) -> u64 {
+    const SPENDABLE_AGE: u64 = 10;
+    const MAX_BLOCK_NUMBER: u64 = 500_000_000;
+    const HF_V15_TIME: u64 = 1_656_629_118;
+    const HF_V15_HEIGHT: u64 = 2_689_608;
+    const TARGET: u64 = 120;
+
+    let default = height.saturating_add(SPENDABLE_AGE - 1);
+    let named = if unlock_time == 0 {
+        default
+    } else if unlock_time < MAX_BLOCK_NUMBER {
+        unlock_time - 1
+    } else if HF_V15_TIME > unlock_time {
+        let blocks_since = (HF_V15_TIME - unlock_time) / TARGET;
+        if HF_V15_HEIGHT > blocks_since {
+            HF_V15_HEIGHT - blocks_since
+        } else {
+            default
+        }
+    } else {
+        HF_V15_HEIGHT.saturating_add((unlock_time - HF_V15_TIME) / TARGET)
+    };
+    if named > default { named } else { default }
+}
+
+/// The height of the block that would carry the root an FCMP++ proof naming
+/// `reference_block` was checked against: `reference_block - 8`, or `None`
+/// below height 8.
+///
+/// Arithmetic only, so it answers for heights no block can serve. Consensus
+/// accepts a reference block from one block before the fork, and blocks carry
+/// a tree only from the fork on, so for the first reference blocks after the
+/// fork this names a block from before it, which has no root at all. A caller
+/// that shows the root has to check the block it names really carries one.
+#[must_use]
+pub const fn tree_root_block(reference_block: u64) -> Option<u64> {
+    reference_block.checked_sub(TREE_ROOT_LAG)
+}
+
+/// Children per parent in the curve tree. The leaves' parents are Selene
+/// nodes, theirs Helios, alternating up to the root.
+///
+/// `SELENE_CHUNK_WIDTH` and `HELIOS_CHUNK_WIDTH` in
+/// `src/fcmp_pp/curve_trees.h`.
+pub const SELENE_CHUNK_WIDTH: u64 = 38;
+pub const HELIOS_CHUNK_WIDTH: u64 = 18;
+
+/// The node count of each layer of a curve tree holding `leaves` outputs,
+/// from the leaves' parents up to the root. Its length is the tree's layer
+/// count.
+///
+/// `CurveTrees::n_elems_per_layer` in `src/fcmp_pp/curve_trees.cpp`.
+#[must_use]
+pub fn tree_layers(leaves: u64) -> Vec<u64> {
+    let mut layers = Vec::new();
+    if leaves == 0 {
+        return layers;
+    }
+    let (mut children, mut selene) = (leaves, true);
+    loop {
+        let width = if selene {
+            SELENE_CHUNK_WIDTH
+        } else {
+            HELIOS_CHUNK_WIDTH
+        };
+        children = children.div_ceil(width);
+        layers.push(children);
+        selene = !selene;
+        if children <= 1 {
+            return layers;
+        }
+    }
+}
+
+/// `txout_to_carrot_v1`.
+///
+/// The amount commitment and the encrypted amount are not here. They sit in
+/// `rct_signatures` (`outPk` and `ecdhInfo`), as they do for every RingCT
+/// output, which lets a coinbase and an ordinary transaction share this one
+/// output type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarrotV1 {
+    /// The one-time address `K_o`.
+    pub key: String,
+    /// Three bytes, so exactly six hex characters.
+    pub view_tag: String,
+    /// The Janus anchor, encrypted: 16 bytes, so 32 hex characters. The
+    /// recipient decrypts it to check that the sender did not build the output
+    /// against a different address of theirs.
+    pub encrypted_janus_anchor: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,6 +2125,11 @@ pub enum RctType {
     Bulletproof2,
     Clsag,
     BulletproofPlus,
+    /// FCMP++, from hard fork 17. Bulletproofs+ still prove the ranges; what
+    /// changes is the spend proof. Each input proves membership in the set of
+    /// every spendable output rather than in a ring of 16, so an input has
+    /// no `key_offsets` and there are no ring members to look up.
+    FcmpPlusPlus,
     /// A scheme this build does not know. Kept rather than rejected so that a
     /// future fork degrades instead of failing to parse.
     Unknown(u8),
@@ -1523,6 +2146,7 @@ impl RctType {
             4 => Self::Bulletproof2,
             5 => Self::Clsag,
             6 => Self::BulletproofPlus,
+            7 => Self::FcmpPlusPlus,
             other => Self::Unknown(other),
         }
     }
@@ -1537,6 +2161,7 @@ impl RctType {
             Self::Bulletproof2 => 4,
             Self::Clsag => 5,
             Self::BulletproofPlus => 6,
+            Self::FcmpPlusPlus => 7,
             Self::Unknown(other) => other,
         }
     }
@@ -1546,9 +2171,11 @@ impl RctType {
     pub const fn pseudo_outs_location(self) -> PseudoOutsLocation {
         match self {
             Self::Simple => PseudoOutsLocation::Base,
-            Self::Bulletproof | Self::Bulletproof2 | Self::Clsag | Self::BulletproofPlus => {
-                PseudoOutsLocation::Prunable
-            }
+            Self::Bulletproof
+            | Self::Bulletproof2
+            | Self::Clsag
+            | Self::BulletproofPlus
+            | Self::FcmpPlusPlus => PseudoOutsLocation::Prunable,
             Self::Null | Self::Full | Self::Unknown(_) => PseudoOutsLocation::Absent,
         }
     }
@@ -1559,7 +2186,9 @@ impl RctType {
     pub const fn ecdh_form(self) -> Option<EcdhForm> {
         match self {
             Self::Full | Self::Simple | Self::Bulletproof => Some(EcdhForm::Full),
-            Self::Bulletproof2 | Self::Clsag | Self::BulletproofPlus => Some(EcdhForm::Compact),
+            Self::Bulletproof2 | Self::Clsag | Self::BulletproofPlus | Self::FcmpPlusPlus => {
+                Some(EcdhForm::Compact)
+            }
             Self::Null | Self::Unknown(_) => None,
         }
     }
@@ -1584,7 +2213,7 @@ pub struct RctSigBase {
     pub rct_type: u8,
     #[serde(default, rename = "txnFee", skip_serializing_if = "Option::is_none")]
     pub txn_fee: Option<u64>,
-    /// Present here for type 2 only; types 3 to 6 put it in `rctsig_prunable`.
+    /// Present here for type 2 only; types 3 to 7 put it in `rctsig_prunable`.
     /// Use [`TxJson::pseudo_outs`] rather than reaching in.
     #[serde(
         default,
@@ -1611,14 +2240,14 @@ impl RctSigBase {
 pub enum EcdhForm {
     /// Types 1, 2, 3: `{"mask": <64 hex>, "amount": <64 hex>}`.
     Full,
-    /// Types 4, 5, 6: `{"amount": <16 hex>}`, with `mask` gone — the key is
+    /// Types 4 to 7: `{"amount": <16 hex>}`, with `mask` gone — the key is
     /// absent, not null, and the amount is 8 bytes rather than 32.
     Compact,
 }
 
 /// Hex width of a 32-byte `ecdhInfo` amount (types 1, 2, 3).
 pub const ECDH_FULL_HEX_LEN: usize = 64;
-/// Hex width of the truncated 8-byte `ecdhInfo` amount (types 4, 5, 6).
+/// Hex width of the truncated 8-byte `ecdhInfo` amount (types 4 to 7).
 pub const ECDH_COMPACT_HEX_LEN: usize = 16;
 
 /// One `ecdhInfo` element.
@@ -1665,7 +2294,7 @@ impl EcdhInfo {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RctSigPrunable {
     /// Number of bulletproofs. A **number**, not an array — present for types 3
-    /// to 6 and absent for types 1 and 2, which emit `rangeSigs` instead. It
+    /// to 7 and absent for types 1 and 2, which emit `rangeSigs` instead. It
     /// can exceed 1: pre-padding wallets emitted several proofs per
     /// transaction, so `bp[0]` is not necessarily the whole proof set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1676,7 +2305,7 @@ pub struct RctSigPrunable {
     /// Bulletproofs — types 3, 4, 5.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bp: Option<Vec<Bulletproof>>,
-    /// Bulletproof+ — type 6.
+    /// Bulletproof+ — types 6 and 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bpp: Option<Vec<BulletproofPlus>>,
     /// MLSAGs — types 1, 2, 3, 4.
@@ -1685,13 +2314,99 @@ pub struct RctSigPrunable {
     /// CLSAGs — types 5, 6.
     #[serde(default, rename = "CLSAGs", skip_serializing_if = "Option::is_none")]
     pub clsags: Option<Vec<Clsag>>,
-    /// Types 3 to 6 only. Use [`TxJson::pseudo_outs`].
+    /// FCMP++ — type 7. The block whose curve tree the proof was built
+    /// against: the transaction proves that each input spends one of the
+    /// outputs in that tree, and the verifier reads the tree root as of this
+    /// block. A height, not a hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_block: Option<u64>,
+    /// FCMP++ — type 7. The curve tree's layer count as of `reference_block`.
+    /// Stored although it could be derived, because the proof's length depends
+    /// on it and deserializing the proof must not need a database read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_tree_layers: Option<u8>,
+    /// FCMP++ — type 7. One flat hex blob: the membership proof for every
+    /// input at once, preceded by each input's re-randomized tuple and its
+    /// spend-authorization proof. Its length is fixed by the input count and
+    /// `n_tree_layers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fcmp_pp: Option<String>,
+    /// Types 3 to 7 only. Use [`TxJson::pseudo_outs`].
     #[serde(
         default,
         rename = "pseudoOuts",
         skip_serializing_if = "Option::is_none"
     )]
     pub pseudo_outs: Option<Vec<String>>,
+}
+
+impl RctSigPrunable {
+    /// Byte length of the FCMP++ proof, or `None` where there is none or its
+    /// hex is odd-length.
+    #[must_use]
+    pub fn fcmp_pp_len(&self) -> Option<usize> {
+        let hex = self.fcmp_pp.as_deref()?;
+        hex.len().is_multiple_of(2).then_some(hex.len() / 2)
+    }
+
+    /// The FCMP++ proof split into its parts, for a transaction with
+    /// `inputs` inputs. `None` where there is no proof, or it is too short to
+    /// hold them.
+    ///
+    /// Each input's tuple and spend-authorization proof in input order, then
+    /// the membership proof for all of them, ending in the root blind's proof
+    /// of knowledge: `FcmpPlusPlus::write` in monero-oxide's `ringct/fcmp++`,
+    /// and `Fcmp::write` in its `crypto/fcmps`.
+    #[must_use]
+    pub fn fcmp_pp_parts(&self, inputs: usize) -> Option<FcmpPpParts<'_>> {
+        let hex = self.fcmp_pp.as_deref()?;
+        let per_input = 2 * (FCMP_PP_TUPLE_LEN + FCMP_PP_SAL_LEN);
+        let own = per_input.checked_mul(inputs)?;
+        let membership = hex.len().checked_sub(own)?;
+        if !membership.is_multiple_of(2) || membership / 2 <= FCMP_PP_ROOT_POK_LEN {
+            return None;
+        }
+        let word = |at: usize| hex.get(at..at + 64);
+        let parts = (0..inputs)
+            .map(|i| {
+                let at = i * per_input;
+                Some(FcmpPpInput {
+                    o_tilde: word(at)?,
+                    i_tilde: word(at + 64)?,
+                    r: word(at + 128)?,
+                })
+            })
+            .collect::<Option<_>>()?;
+        Some(FcmpPpParts {
+            inputs: parts,
+            membership_len: membership / 2,
+        })
+    }
+}
+
+/// Bytes of an FCMP++ input tuple as serialized: O~, I~ and R. Its fourth
+/// member, C~, is the input's pseudo-out and is not repeated in the proof.
+pub const FCMP_PP_TUPLE_LEN: usize = 3 * 32;
+/// Bytes of one input's spend-authorization and linkability proof.
+pub const FCMP_PP_SAL_LEN: usize = 12 * 32;
+/// Bytes of the proof of knowledge of the root's blind, which ends the
+/// membership proof.
+pub const FCMP_PP_ROOT_POK_LEN: usize = 64;
+
+/// See [`RctSigPrunable::fcmp_pp_parts`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct FcmpPpParts<'a> {
+    pub inputs: Vec<FcmpPpInput<'a>>,
+    /// Bytes of the membership proof, [`FCMP_PP_ROOT_POK_LEN`] included.
+    pub membership_len: usize,
+}
+
+/// One input's re-randomized output, as hex.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FcmpPpInput<'a> {
+    pub o_tilde: &'a str,
+    pub i_tilde: &'a str,
+    pub r: &'a str,
 }
 
 /// A Borromean range proof. Both members are blob-serialized, so they are two
@@ -1857,6 +2572,7 @@ mod tests {
             RctType::Bulletproof2,
             RctType::Clsag,
             RctType::BulletproofPlus,
+            RctType::FcmpPlusPlus,
         ] {
             assert_eq!(t.pseudo_outs_location(), PseudoOutsLocation::Prunable);
         }
@@ -1880,16 +2596,17 @@ mod tests {
             RctType::BulletproofPlus.ecdh_form(),
             Some(EcdhForm::Compact)
         );
+        assert_eq!(RctType::FcmpPlusPlus.ecdh_form(), Some(EcdhForm::Compact));
         assert_eq!(RctType::Null.ecdh_form(), None);
     }
 
     #[test]
     fn unknown_rct_type_round_trips_rather_than_being_rejected() {
-        let t = RctType::from_raw(7);
-        assert_eq!(t, RctType::Unknown(7));
-        assert_eq!(t.to_raw(), 7);
+        let t = RctType::from_raw(8);
+        assert_eq!(t, RctType::Unknown(8));
+        assert_eq!(t.to_raw(), 8);
         assert_eq!(t.ecdh_form(), None);
-        for raw in 0u8..=6 {
+        for raw in 0u8..=7 {
             assert_eq!(RctType::from_raw(raw).to_raw(), raw);
         }
     }
@@ -2033,11 +2750,11 @@ mod tests {
         let raw = r#"{"version":2,"unlock_time":0,
              "vin":[{"key":{"amount":0,"key_offsets":[1,2],"k_image":"aa"}}],
              "vout":[],"extra":[],
-             "rct_signatures":{"type":7},
+             "rct_signatures":{"type":8},
              "rctsig_prunable":{"pseudoOuts":["a"]}}"#;
         let tx: TxJson = serde_json::from_str(raw).expect("parses");
 
-        assert_eq!(tx.rct_type(), Some(RctType::Unknown(7)));
+        assert_eq!(tx.rct_type(), Some(RctType::Unknown(8)));
         assert_eq!(
             tx.pseudo_outs(),
             ["a".to_owned()],
@@ -2051,7 +2768,7 @@ mod tests {
         let raw = r#"{"version":2,"unlock_time":0,
              "vin":[{"key":{"amount":0,"key_offsets":[1],"k_image":"aa"}}],
              "vout":[],"extra":[],
-             "rct_signatures":{"type":7},
+             "rct_signatures":{"type":8},
              "rctsig_prunable":{}}"#;
         let tx: TxJson = serde_json::from_str(raw).expect("parses");
         assert!(tx.pseudo_outs().is_empty());
@@ -2086,46 +2803,6 @@ mod tests {
 
         // std::vector<int> in C++, so negatives are representable.
         assert_eq!(SpentStatus::from_raw(-1), SpentStatus::Unknown(-1));
-    }
-
-    #[test]
-    fn json_rpc_id_survives_being_a_number() {
-        let env: JsonRpcEnvelope<GetBlockCount> = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":42,"result":{"count":1,"status":"OK","untrusted":false}}"#,
-        )
-        .unwrap();
-        assert_eq!(env.id, serde_json::json!(42));
-        assert!(env.error.is_none());
-        assert_eq!(env.result.unwrap().count, 1);
-
-        let env: JsonRpcEnvelope<GetBlockCount> = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":"0","result":{"count":1,"status":"OK","untrusted":false}}"#,
-        )
-        .unwrap();
-        assert_eq!(env.id, serde_json::json!("0"));
-    }
-
-    #[test]
-    fn restricted_errors_use_minus_nineteen_and_unavailable_methods_minus_32601() {
-        let restricted: JsonRpcEnvelope<serde_json::Value> = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":"0","error":{"code":-19,"message":"Too many block headers requested."}}"#,
-        )
-        .unwrap();
-        let err = restricted.error.unwrap();
-        assert!(err.is_restricted());
-        assert!(!err.is_method_unavailable());
-        assert!(
-            restricted.result.is_none(),
-            "an error envelope has no result member"
-        );
-
-        let gated: JsonRpcEnvelope<serde_json::Value> = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":"","error":{"code":-32601,"message":"Method not found"}}"#,
-        )
-        .unwrap();
-        let err = gated.error.unwrap();
-        assert!(err.is_method_unavailable());
-        assert!(!err.is_restricted());
     }
 
     #[test]
@@ -2255,6 +2932,168 @@ mod tests {
         .unwrap();
         assert_eq!(tagged.target.public_key(), Some("57048229"));
         assert_eq!(tagged.target.view_tag(), Some("9f"));
+        assert!(!tagged.target.is_carrot());
+    }
+
+    /// Block H carries the root of the tree as of H + 8, so the root a proof
+    /// naming R was checked against is block R - 8's. Heights with no such
+    /// block have none.
+    #[test]
+    fn a_proofs_root_is_eight_blocks_below_its_reference() {
+        assert_eq!(tree_root_block(120), Some(112));
+        assert_eq!(tree_root_block(8), Some(0));
+        assert_eq!(tree_root_block(7), None);
+    }
+
+    /// Every 32-byte word of the synthetic proof names its own place, so an
+    /// off-by-one in any offset reads back the wrong word.
+    #[test]
+    fn an_fcmp_pp_proof_splits_into_each_inputs_tuple_and_one_membership_proof() {
+        let word = |tag: &str| format!("{tag:0>64}");
+        let mut hex = String::new();
+        for i in 0..2 {
+            for part in ["o", "i", "r"] {
+                hex += &word(&format!("{part}{i}"));
+            }
+            for k in 0..12 {
+                hex += &word(&format!("s{i}{k:02}"));
+            }
+        }
+        for k in 0..5 {
+            hex += &word(&format!("m{k}"));
+        }
+        let prunable = RctSigPrunable {
+            fcmp_pp: Some(hex.clone()),
+            ..RctSigPrunable::default()
+        };
+
+        let parts = prunable.fcmp_pp_parts(2).expect("splits");
+        assert_eq!(parts.membership_len, 5 * 32);
+        assert_eq!(parts.inputs.len(), 2);
+        for (i, input) in parts.inputs.iter().enumerate() {
+            assert_eq!(input.o_tilde, word(&format!("o{i}")));
+            assert_eq!(input.i_tilde, word(&format!("i{i}")));
+            assert_eq!(input.r, word(&format!("r{i}")));
+        }
+
+        // A third input leaves no room for the membership proof, and a proof
+        // that is all root anchor has no membership proof before it.
+        assert_eq!(prunable.fcmp_pp_parts(3), None);
+        let bare = RctSigPrunable {
+            fcmp_pp: Some(hex.get(..hex.len() - 3 * 64).expect("shorter").to_owned()),
+            ..RctSigPrunable::default()
+        };
+        assert_eq!(bare.fcmp_pp_parts(2), None);
+        assert_eq!(RctSigPrunable::default().fcmp_pp_parts(1), None);
+    }
+
+    /// Each boundary where one more output adds a layer: past 38, one Selene
+    /// node is full; past 38 × 18, one Helios node is.
+    #[test]
+    fn a_layer_is_added_each_time_the_root_fills() {
+        assert_eq!(tree_layers(0), Vec::<u64>::new());
+        assert_eq!(tree_layers(1), [1]);
+        assert_eq!(tree_layers(38), [1]);
+        assert_eq!(tree_layers(39), [2, 1]);
+        assert_eq!(tree_layers(684), [18, 1]);
+        assert_eq!(tree_layers(685), [19, 2, 1]);
+        assert_eq!(
+            tree_layers(152_000_000),
+            [4_000_000, 222_223, 5_848, 325, 9, 1]
+        );
+    }
+
+    /// The count monerod takes is one past the block asked about, and the
+    /// probe travels as a one-element array.
+    #[test]
+    fn a_tree_size_query_asks_for_the_block_after_as_a_count() {
+        let q = TreeSizeQuery::as_of_block(420, 1234).unwrap();
+        let [(n, count), (u, ids)] = q.fields();
+        assert_eq!((n, count), ("as_of_n_blocks", crate::epee::Field::U64(421)));
+        assert_eq!((u, ids), ("unified_ids", crate::epee::Field::U64s(&[1234])));
+        assert!(TreeSizeQuery::as_of_block(u64::MAX, 0).is_none());
+
+        let answer = |n: u64| {
+            let bytes =
+                crate::epee::encode(&[("n_leaf_tuples", crate::epee::Field::U64(n))]).unwrap();
+            TreeSizeQuery::answer(&crate::epee::read_root(&bytes, TreeSizeQuery::WANTED).unwrap())
+        };
+        assert_eq!(answer(9_876), Some(9_876));
+        assert_eq!(answer(0), Some(0), "an empty tree");
+    }
+
+    #[test]
+    fn an_output_joins_the_tree_when_it_unlocks() {
+        // The default: ten blocks, the block it was mined in counting as one.
+        assert_eq!(last_locked_block(0, 801), 810);
+        // A coinbase's lock is a height 60 blocks on.
+        assert_eq!(last_locked_block(861, 801), 860);
+        // A lock shorter than the default does not shorten it.
+        assert_eq!(last_locked_block(803, 801), 810);
+        // A time a day after hard fork 15, at two minutes a block.
+        assert_eq!(
+            last_locked_block(1_656_629_118 + 86_400, 2_000_000),
+            2_689_608 + 720
+        );
+        // A time before it, counted back from the fork's height.
+        assert_eq!(
+            last_locked_block(1_656_629_118 - 86_400, 2_000_000),
+            2_689_608 - 720
+        );
+    }
+
+    #[test]
+    fn a_path_query_asks_about_one_to_fifty_ids_and_wants_one_path_each() {
+        assert!(PathQuery::as_of_block(9, &[]).is_none());
+        assert!(PathQuery::as_of_block(9, &[1; 51]).is_none());
+        assert!(PathQuery::as_of_block(u64::MAX, &[1]).is_none());
+        let q = PathQuery::as_of_block(9, &[1; 50]).unwrap();
+        assert_eq!(
+            q.fields()[0],
+            ("as_of_n_blocks", crate::epee::Field::U64(10))
+        );
+
+        let q = PathQuery::as_of_block(9, &[1, 2]).unwrap();
+        let bytes = crate::epee::encode(&[("n_leaf_tuples", crate::epee::Field::U64(5))]).unwrap();
+        let root = crate::epee::read_root(&bytes, PathQuery::WANTED).unwrap();
+        assert_eq!(q.answer(&root), Err(PathAnswerError::Missing("paths")));
+    }
+
+    /// Unified ids are positional, so a list that does not match the output
+    /// count is no list at all.
+    #[test]
+    fn unified_ids_count_only_when_there_is_one_per_output() {
+        let mut e: TxEntry = serde_json::from_value(serde_json::json!({
+            "tx_hash": "aa", "in_pool": false, "unified_ids": [7, 8],
+        }))
+        .unwrap();
+        assert_eq!(e.unified_ids_per_output(2), Some(&[7u64, 8][..]));
+        assert_eq!(e.unified_ids_per_output(3), None);
+        assert_eq!(e.unified_ids_per_output(1), None);
+        e.unified_ids.clear();
+        assert_eq!(e.unified_ids_per_output(0), None);
+    }
+
+    /// The FCMP++ fork's output parses, and its key and view tag come out
+    /// through the same accessors as the other targets'.
+    #[test]
+    fn a_carrot_output_parses_and_answers_like_the_others() {
+        let carrot: TxOut = serde_json::from_str(
+            r#"{"amount":0,"target":{"carrot_v1":{"key":"8f3b62c1","view_tag":"a1b2c3",
+                "encrypted_janus_anchor":"00112233445566778899aabbccddeeff"}}}"#,
+        )
+        .unwrap();
+        assert!(carrot.target.is_carrot());
+        assert_eq!(carrot.target.public_key(), Some("8f3b62c1"));
+        assert_eq!(carrot.target.view_tag(), Some("a1b2c3"));
+        assert_eq!(
+            carrot.target.encrypted_janus_anchor(),
+            Some("00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(
+            TxOutTarget::Key("aa".to_owned()).encrypted_janus_anchor(),
+            None
+        );
     }
 
     /// No fixture exists for a type 6 transaction — the local mainnet node has
@@ -2278,6 +3117,8 @@ mod tests {
         assert_eq!(tx.rct_type(), Some(RctType::BulletproofPlus));
         assert!(!tx.is_coinbase());
         assert!(!tx.looks_pruned());
+        assert!(!tx.is_fcmp_pp());
+        assert_eq!(tx.reference_block(), None);
 
         let prunable = tx.rctsig_prunable.as_ref().unwrap();
         assert_eq!(prunable.nbp, Some(1));
@@ -2329,11 +3170,20 @@ mod tests {
             confirmations: 1,
             block_timestamp: 0,
             output_indices: vec![24, 25],
+            unified_ids: vec![],
             relayed: false,
             received_timestamp: 0,
+            dropped_hex: None,
         };
         assert!(entry.prunable_missing(&tx));
         assert_eq!(entry.raw_hex().as_deref(), Some("0200"));
+        let mut slim = entry.clone();
+        slim.drop_hex();
+        assert!(
+            slim.prunable_missing(&tx),
+            "still pruned once the hex is gone"
+        );
+        assert_eq!(slim.raw_hex_len(), Some(4));
     }
 
     #[test]
@@ -2361,11 +3211,22 @@ mod tests {
             confirmations: 1,
             block_timestamp: 0,
             output_indices: vec![],
+            unified_ids: vec![],
             relayed: false,
             received_timestamp: 0,
+            dropped_hex: None,
         };
         assert!(!entry.prunable_missing(&tx));
         assert_eq!(entry.raw_hex().as_deref(), Some("0200deadbeef"));
+        let mut slim = entry.clone();
+        slim.drop_hex();
+        assert!(
+            !slim.prunable_missing(&tx),
+            "still whole once the hex is gone"
+        );
+        assert_eq!(slim.raw_hex_len(), Some(12));
+        assert_eq!(slim.raw_hex(), None);
+        assert!(slim.as_hex.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -2607,9 +3468,41 @@ mod tests {
             confirmations: 140,
             block_timestamp: 1_789_744_451,
             output_indices: vec![],
+            unified_ids: vec![],
             relayed: false,
             received_timestamp: 0,
+            dropped_hex: None,
         }
+    }
+
+    /// A split entry that holds its prunable half answers the same once its
+    /// hex is dropped, and dropping twice keeps the first lengths.
+    #[test]
+    fn dropping_the_hex_keeps_the_size_and_the_pruning_answer() {
+        let raw = r#"{"version":2,"unlock_time":0,
+            "vin":[{"key":{"amount":0,"key_offsets":[1,2],"k_image":"aa"}}],
+            "vout":[{"amount":0,"target":{"key":"bb"}}],
+            "extra":[1],
+            "rct_signatures":{"type":5,"txnFee":1,"ecdhInfo":[{"amount":"0011223344556677"}],
+                "outPk":["cc"]},
+            "rctsig_prunable":{"nbp":1,"bp":[],"CLSAGs":[],"pseudoOuts":[]}}"#;
+        let tx: TxJson = serde_json::from_str(raw).unwrap();
+        let mut entry = split_entry(raw);
+        entry.prunable_as_hex = "ab".repeat(1000);
+        assert!(!entry.prunable_missing(&tx));
+        entry.drop_hex();
+        entry.drop_hex();
+        assert!(entry.pruned_as_hex.is_empty() && entry.prunable_as_hex.is_empty());
+        assert!(!entry.prunable_missing(&tx));
+        assert_eq!(entry.raw_hex_len(), Some(2004));
+        assert_eq!(
+            entry.hex_lengths(),
+            HexLengths {
+                as_hex: 0,
+                pruned: 4,
+                prunable: 2000
+            }
+        );
     }
 
     /// "One input, and it is a gen" -- both halves. Consensus permits no such
@@ -2849,5 +3742,160 @@ mod tests {
             matches!(info.parse_json(), Err(NestedJsonError::Absent)),
             "an undecoded pool entry is absent, not malformed"
         );
+    }
+
+    /// Every way a path answer can be malformed is refused, not read short:
+    /// each case is the captured answer as of block 814 with one thing
+    /// wrong.
+    #[test]
+    fn a_malformed_path_answer_is_refused() {
+        use crate::epee::{Root, Value, encode_root, read_root};
+
+        const IDS: [u64; 4] = [802, 803, 804, 805];
+        let bin = include_bytes!("../../../fixtures/fcmp/paths/get_path_by_unified_id_later.bin");
+        let answer = read_root(bin, PathQuery::WANTED).unwrap();
+
+        /// `root` with `name` given `f` of its value, and left out where `f`
+        /// gives nothing.
+        fn with(root: &Root, name: &str, f: impl Fn(&Value) -> Option<Value>) -> Root {
+            Root::new(
+                root.entries()
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if k == name {
+                            f(v).map(|v| (k.clone(), v))
+                        } else {
+                            Some((k.clone(), v.clone()))
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        fn section(v: &Value) -> &Root {
+            let Value::Section(s) = v else {
+                panic!("a section")
+            };
+            s
+        }
+        // The answer with its first path's `path` section given `f`.
+        let first_path = |f: &dyn Fn(&Root) -> Root| -> Root {
+            with(&answer, "paths", |v| {
+                let Value::Array(paths) = v else {
+                    panic!("paths")
+                };
+                let mut paths = paths.clone();
+                paths[0] = Value::Section(with(section(&paths[0]), "path", |p| {
+                    Some(Value::Section(f(section(p))))
+                }));
+                Some(Value::Array(paths))
+            })
+        };
+        let leaves = |name: &'static str, f: fn(&mut Vec<u8>)| {
+            first_path(&move |p: &Root| {
+                with(p, "leaves", |l| {
+                    Some(Value::Section(with(section(l), name, |b| {
+                        let Value::Bytes(b) = b else { panic!("bytes") };
+                        let mut b = b.clone();
+                        f(&mut b);
+                        Some(Value::Bytes(b))
+                    })))
+                })
+            })
+        };
+        let chunk = |f: fn(&mut Vec<u8>)| {
+            first_path(&move |p: &Root| {
+                with(p, "layer_chunks", |c| {
+                    let Value::Array(chunks) = c else {
+                        panic!("chunks")
+                    };
+                    let mut chunks = chunks.clone();
+                    chunks[0] = Value::Section(with(section(&chunks[0]), "elems", |e| {
+                        let Value::Bytes(e) = e else { panic!("elems") };
+                        let mut e = e.clone();
+                        f(&mut e);
+                        Some(Value::Bytes(e))
+                    }));
+                    Some(Value::Array(chunks))
+                })
+            })
+        };
+        let read = |root: &Root, ids: &[u64]| {
+            let bytes = encode_root(root).unwrap();
+            PathQuery::as_of_block(814, ids)
+                .unwrap()
+                .answer(&read_root(&bytes, PathQuery::WANTED).unwrap())
+        };
+
+        // Unchanged, it reads, re-encoded as it is.
+        assert_eq!(read(&answer, &IDS).unwrap().paths.len(), 4);
+
+        let malformed = PathAnswerError::Malformed;
+        for (what, root, why) in [
+            (
+                "an id short",
+                leaves("unified_ids", |b| b.truncate(b.len() - 1)),
+                malformed("leaves"),
+            ),
+            (
+                "a key short",
+                leaves("output_pubkeys", |b| b.truncate(b.len() - 1)),
+                malformed("leaves"),
+            ),
+            (
+                "a commitment short",
+                leaves("commitments", |b| b.truncate(b.len() - 1)),
+                malformed("leaves"),
+            ),
+            (
+                "a type too many",
+                leaves("output_types", |b| b.push(0)),
+                malformed("leaves"),
+            ),
+            (
+                "an empty chunk",
+                chunk(Vec::clear),
+                malformed("layer_chunks"),
+            ),
+            (
+                "a byte past a point",
+                chunk(|e| e.push(0)),
+                malformed("layer_chunks"),
+            ),
+            (
+                "no layers",
+                first_path(&|p: &Root| with(p, "layer_chunks", |_| None)),
+                malformed("layer_chunks"),
+            ),
+            (
+                "layers with no leaves",
+                first_path(&|p: &Root| {
+                    with(p, "leaves", |_| Some(Value::Section(Root::default())))
+                }),
+                malformed("leaves"),
+            ),
+            (
+                "no n_leaf_tuples",
+                with(&answer, "n_leaf_tuples", |_| None),
+                PathAnswerError::Missing("n_leaf_tuples"),
+            ),
+        ] {
+            assert_eq!(read(&root, &IDS), Err(why), "{what}");
+        }
+        // Paths that are not sections.
+        let not_a_section = with(&answer, "paths", |_| {
+            Some(Value::Array(vec![Value::Unsigned(1); 4]))
+        });
+        assert_eq!(read(&not_a_section, &IDS), Err(malformed("entry")));
+
+        // As many paths as ids, neither more nor fewer.
+        for ids in [&IDS[..3], &[802, 803, 804, 805, 806][..]] {
+            assert_eq!(
+                read(&answer, ids),
+                Err(PathAnswerError::Count {
+                    asked: ids.len(),
+                    answered: 4
+                })
+            );
+        }
     }
 }
