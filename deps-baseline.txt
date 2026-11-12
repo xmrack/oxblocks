@@ -10,7 +10,6 @@ async-compression
 atomic-waker
 axum
 axum-core
-basic-toml
 bitflags
 bitvec
 blake2
@@ -57,7 +56,6 @@ generalized-bulletproofs-circuit-abstraction
 generalized-bulletproofs-ec-gadgets
 generic-array
 getrandom
-glob
 group
 hashbrown
 heck

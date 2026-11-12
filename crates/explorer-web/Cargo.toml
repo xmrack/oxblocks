@@ -24,7 +24,7 @@ tower = { version = "0.5", features = ["limit", "timeout"] }
 tower-http = { version = "0.6", features = ["trace", "limit", "set-header", "timeout", "catch-panic", "compression-gzip", "compression-deflate", "compression-br"] }
 clap = { version = "4", default-features = false, features = ["derive", "env", "std", "help", "usage", "error-context"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-askama = "0.16"
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 
 [dev-dependencies]
 explorer-core = { path = "../explorer-core", version = "0.1.0", features = ["fake-daemon"] }

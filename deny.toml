@@ -10,6 +10,11 @@ yanked = "deny"
 # An unmaintained crate has no one to report a vulnerability to. This caught
 # `hex`, last released in 2021 and since replaced by explorer-core::hex.
 unmaintained = "all"
+ignore = [
+    # crypto-bigint 0.5 via monero-oxide's dalek-ff-group; the fix is only in
+    # 0.7. The explorer verifies public proofs and holds no secret operands.
+    "RUSTSEC-2026-0387",
+]
 
 [bans]
 # Two versions of the same crate means two copies of its bugs, and it is
