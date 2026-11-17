@@ -21,7 +21,7 @@ tracing.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tower = { version = "0.5", features = ["limit", "timeout"] }
-tower-http = { version = "0.6", features = ["trace", "limit", "set-header", "timeout", "catch-panic", "compression-gzip", "compression-deflate", "compression-br"] }
+tower-http = { version = "0.7", features = ["trace", "limit", "set-header", "timeout", "catch-panic", "compression-gzip", "compression-deflate", "compression-br"] }
 clap = { version = "4", default-features = false, features = ["derive", "env", "std", "help", "usage", "error-context"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
